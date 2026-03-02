@@ -238,6 +238,11 @@ fn build_tasks(
     }
     let mut tasks = Vec::<Task>::new();
     let mut next_id = 0usize;
+    let active_carrier_exists = state.bots.iter().any(|bot| {
+        bot.carrying
+            .iter()
+            .any(|item| team.active_order_items_set.contains(item))
+    });
 
     let mut active_missing = HashMap::<String, u16>::new();
     let mut preview_missing = HashMap::<String, u16>::new();
@@ -282,26 +287,28 @@ fn build_tasks(
         }
     }
 
-    let mut dropoffs = map.dropoff_cells.clone();
-    dropoffs.sort_unstable();
-    for drop in dropoffs {
-        let (x, y) = map.xy(drop);
-        let order_id = state
-            .orders
-            .iter()
-            .filter(|order| matches!(order.status, OrderStatus::InProgress))
-            .map(|order| order.id.clone())
-            .min()
-            .unwrap_or_else(|| format!("dropoff@{x}:{y}"));
-        tasks.push(Task {
-            task_id: next_id,
-            sort_key: (1, order_id.clone(), drop),
-            target_cell: drop,
-            shareable: true,
-            kind: TaskKind::CarryToDropoff,
-            intent: Intent::MoveTo { cell: drop },
-        });
-        next_id += 1;
+    if active_carrier_exists {
+        let mut dropoffs = map.dropoff_cells.clone();
+        dropoffs.sort_unstable();
+        for drop in dropoffs {
+            let (x, y) = map.xy(drop);
+            let order_id = state
+                .orders
+                .iter()
+                .filter(|order| matches!(order.status, OrderStatus::InProgress))
+                .map(|order| order.id.clone())
+                .min()
+                .unwrap_or_else(|| format!("dropoff@{x}:{y}"));
+            tasks.push(Task {
+                task_id: next_id,
+                sort_key: (1, order_id.clone(), drop),
+                target_cell: drop,
+                shareable: true,
+                kind: TaskKind::CarryToDropoff,
+                intent: Intent::MoveTo { cell: drop },
+            });
+            next_id += 1;
+        }
     }
 
     let mut item_order = state.items.iter().collect::<Vec<_>>();
@@ -354,7 +361,10 @@ fn build_tasks(
         }
     }
 
-    if let Some(drop) = map.dropoff_cells.first().copied() {
+    if active_carrier_exists {
+        let Some(drop) = map.dropoff_cells.first().copied() else {
+            return Some(tasks);
+        };
         for bot in &state.bots {
             let role = team.role_for(&bot.id);
             if !matches!(role, BotRole::LeadCourier | BotRole::QueueCourier) {
@@ -397,30 +407,31 @@ fn task_cost(
     lambda_density: f64,
     lambda_choke: f64,
 ) -> i32 {
-    match &task.intent {
-        Intent::DropOff { .. } => i32::from(dist_to(bot_cell, task.target_cell, dist)),
-        Intent::MoveTo { cell } => {
-            let d0 = f64::from(dist_to(bot_cell, *cell, dist));
-            let nearest_drop = map
-                .dropoff_cells
-                .iter()
-                .copied()
-                .map(|drop| f64::from(dist_to(*cell, drop, dist)))
-                .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-                .unwrap_or(0.0);
-            let density = local_density(*cell, state) as f64;
-            let choke = choke_penalty(*cell, map) as f64;
-            (d0 + nearest_drop + lambda_density * density + lambda_choke * choke).round() as i32
+    match task.kind {
+        TaskKind::ImmediateDropOff => i32::from(dist_to(bot_cell, task.target_cell, dist)),
+        TaskKind::CarryToDropoff => {
+            let d = f64::from(dist_to(bot_cell, task.target_cell, dist));
+            let density = local_density(task.target_cell, state) as f64;
+            let choke = choke_penalty(task.target_cell, map) as f64;
+            (d + 0.5 * lambda_density * density + lambda_choke * choke).round() as i32
         }
-        Intent::PickUp { .. } => {
+        TaskKind::PickupStand => {
+            let d = f64::from(dist_to(bot_cell, task.target_cell, dist));
+            let density = local_density(task.target_cell, state) as f64;
+            let choke = choke_penalty(task.target_cell, map) as f64;
+            (d + lambda_density * density + lambda_choke * choke).round() as i32
+        }
+        TaskKind::ImmediatePickup => {
             if bot_cell != task.target_cell {
                 return 9_000;
             }
-            let d = f64::from(dist_to(bot_cell, task.target_cell, dist));
-            let density = local_density(task.target_cell, state) as f64;
-            (d + lambda_density * density).round() as i32
+            0
         }
-        Intent::Wait => 10_000,
+        TaskKind::QueuePosition => {
+            let d = f64::from(dist_to(bot_cell, task.target_cell, dist));
+            let choke = choke_penalty(task.target_cell, map) as f64;
+            (d + lambda_choke * choke).round() as i32
+        }
     }
 }
 

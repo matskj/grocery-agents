@@ -36,13 +36,13 @@ rustup target add x86_64-pc-windows-msvc
 ## Build and run
 
 ```bash
-RUST_LOG=info cargo run -- --token <jwt>
+RUST_LOG=info cargo run --bin grocery-agents -- --token <jwt>
 ```
 
 You can also paste the full websocket URL directly (token auto-extracted):
 
 ```bash
-cargo run -- 'wss://game.ainm.no/ws?token=eyJ...'
+cargo run --bin grocery-agents -- 'wss://game.ainm.no/ws?token=eyJ...'
 ```
 
 Windows ARM64 helper (uses VS `vcvars64` + x64 Rust toolchain):
@@ -84,6 +84,12 @@ Profiles:
 # wider search / longer horizon
 .\cargo-x64.cmd run --bin eval -- --episodes 10 --profile aggressive --ws-url ws://localhost:8765/ws --token <jwt>
 ```
+
+Profile behavior:
+
+- `safe`: `legacy_only` assignment mode
+- `default`: `hybrid` assignment mode
+- `aggressive`: `global_only` assignment mode
 
 The eval summary prints score mean/p50/p90, wait ratio, move/pickup/dropoff counts,
 blocked events, and near-dropoff congestion events.
@@ -254,7 +260,7 @@ POLICY_ARTIFACT_PATH=models/policy_artifacts.json
 Set `BOT_DEBUG=1` (or `true`/`yes`) to enable additional operational logs.
 
 ```bash
-BOT_DEBUG=1 RUST_LOG=info cargo run -- --token <jwt>
+BOT_DEBUG=1 RUST_LOG=info cargo run --bin grocery-agents -- --token <jwt>
 ```
 
 When enabled, logs include:
@@ -272,6 +278,7 @@ Coordination knobs:
 - `GROCERY_HORIZON=16`
 - `GROCERY_CANDIDATE_K=8`
 - `GROCERY_ASSIGNMENT_ENABLED=true`
+- `GROCERY_ASSIGNMENT_MODE=hybrid` (`hybrid`, `global-only`, `legacy-only`)
 - `GROCERY_DROPOFF_SCHEDULING_ENABLED=true`
 - `GROCERY_DROPOFF_WINDOW=12`
 - `GROCERY_DROPOFF_CAPACITY=1`

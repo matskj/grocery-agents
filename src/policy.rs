@@ -205,6 +205,7 @@ impl Policy {
         let mut assignment_source = "legacy_dispatcher";
         let mut assignment_task_count = 0usize;
         let mut assignment_edge_count = 0usize;
+        let mut assignment_guard_trigger_reason: Option<&'static str> = None;
         let intents = if self.config.assignment_enabled {
             let remaining = soft_budget.saturating_sub(tick_started.elapsed());
             match self.assigner.build_intents(
@@ -218,10 +219,19 @@ impl Policy {
                 remaining,
             ) {
                 Some(result) => {
-                    assignment_source = "global_assignment";
-                    assignment_task_count = result.task_count;
-                    assignment_edge_count = result.edge_count;
-                    result.intents
+                    if let Some(reason) =
+                        assignment_guard_reason(state, map, &team_ctx, &result.intents)
+                    {
+                        assignment_guard_trigger_reason = Some(reason);
+                        assignment_source = "legacy_dispatcher_guard";
+                        self.dispatcher
+                            .build_intents(state, map, &dist, &blocked_snapshot, &team_ctx)
+                    } else {
+                        assignment_source = "global_assignment";
+                        assignment_task_count = result.task_count;
+                        assignment_edge_count = result.edge_count;
+                        result.intents
+                    }
                 }
                 None => self
                     .dispatcher
@@ -945,6 +955,16 @@ impl Policy {
                 serde_json::Value::Number(serde_json::Number::from(assignment_edge_count as i64)),
             );
             obj.insert(
+                "assignment_guard_triggered".to_owned(),
+                serde_json::Value::Bool(assignment_guard_trigger_reason.is_some()),
+            );
+            obj.insert(
+                "assignment_guard_reason".to_owned(),
+                serde_json::Value::String(
+                    assignment_guard_trigger_reason.unwrap_or("none").to_owned(),
+                ),
+            );
+            obj.insert(
                 "dropoff_schedule_status_by_bot".to_owned(),
                 serde_json::Value::Object(dropoff_schedule_status_by_bot),
             );
@@ -1224,6 +1244,80 @@ fn pick_staging_cell(
     candidates
         .into_iter()
         .find(|cell| !reserved_staging.contains(cell))
+}
+
+fn assignment_guard_reason(
+    state: &GameState,
+    map: &crate::world::MapCache,
+    team: &TeamContext,
+    intents: &[BotIntent],
+) -> Option<&'static str> {
+    let active_orders_exist = state
+        .orders
+        .iter()
+        .any(|order| matches!(order.status, crate::model::OrderStatus::InProgress));
+    if !active_orders_exist {
+        return None;
+    }
+
+    let mut stand_cells = HashSet::<u16>::new();
+    for item in &state.items {
+        for &stand in map.stand_cells_for_item(&item.id) {
+            stand_cells.insert(stand);
+        }
+    }
+
+    let bot_by_id = state
+        .bots
+        .iter()
+        .map(|bot| (bot.id.as_str(), bot))
+        .collect::<HashMap<_, _>>();
+
+    let mut pickup_progress_intents = 0usize;
+    let mut empty_dropoff_seek_count = 0usize;
+    let mut carrying_dropoff_seek_count = 0usize;
+    for BotIntent { bot_id, intent } in intents {
+        let Some(bot) = bot_by_id.get(bot_id.as_str()).copied() else {
+            continue;
+        };
+        let carrying_active = bot
+            .carrying
+            .iter()
+            .any(|item| team.active_order_items_set.contains(item));
+        match intent {
+            Intent::PickUp { .. } => {
+                pickup_progress_intents += 1;
+            }
+            Intent::MoveTo { cell } => {
+                if stand_cells.contains(cell) {
+                    pickup_progress_intents += 1;
+                }
+                if map.dropoff_cells.contains(cell) {
+                    if carrying_active {
+                        carrying_dropoff_seek_count += 1;
+                    } else if bot.carrying.is_empty() {
+                        empty_dropoff_seek_count += 1;
+                    }
+                }
+            }
+            Intent::DropOff { .. } | Intent::Wait => {}
+        }
+    }
+
+    let empty_capacity_bots = state
+        .bots
+        .iter()
+        .filter(|bot| bot.carrying.len() < bot.capacity)
+        .count();
+    let crowd_threshold = state.bots.len().saturating_sub(1).max(2);
+
+    if carrying_dropoff_seek_count == 0 && empty_dropoff_seek_count >= crowd_threshold {
+        return Some("empty_dropoff_cluster");
+    }
+    if empty_capacity_bots > 0 && pickup_progress_intents == 0 {
+        return Some("no_pickup_progress");
+    }
+    None
 }
 
 fn apply_yield_actions(
@@ -1581,13 +1675,16 @@ mod tests {
     use std::collections::{HashMap, HashSet};
 
     use crate::{
+        dispatcher::{BotIntent, Intent},
         dist::DistanceMap,
-        model::{GameState, Grid},
+        model::{BotState, GameState, Grid, Item, Order, OrderStatus},
+        team_context::{TeamContext, TeamContextConfig},
         world::World,
     };
 
     use super::{
-        build_dropoff_staging_cells, pick_staging_cell, should_trigger_dropoff_watchdog,
+        assignment_guard_reason, build_dropoff_staging_cells, pick_staging_cell,
+        should_trigger_dropoff_watchdog,
     };
 
     #[test]
@@ -1644,6 +1741,90 @@ mod tests {
         let chosen = pick_staging_cell("0", drop, drop, &by_drop, &reserved, map, &dist)
             .expect("staging cell");
         assert_ne!(chosen, staging[0], "reserved staging cell must be skipped");
+    }
+
+    #[test]
+    fn assignment_guard_detects_empty_dropoff_cluster() {
+        let state = GameState {
+            grid: Grid {
+                width: 8,
+                height: 6,
+                drop_off_tiles: vec![[1, 4]],
+                ..Grid::default()
+            },
+            bots: vec![
+                BotState {
+                    id: "0".to_owned(),
+                    x: 6,
+                    y: 4,
+                    carrying: vec![],
+                    capacity: 3,
+                },
+                BotState {
+                    id: "1".to_owned(),
+                    x: 6,
+                    y: 4,
+                    carrying: vec![],
+                    capacity: 3,
+                },
+                BotState {
+                    id: "2".to_owned(),
+                    x: 6,
+                    y: 4,
+                    carrying: vec![],
+                    capacity: 3,
+                },
+            ],
+            items: vec![Item {
+                id: "item_1".to_owned(),
+                kind: "milk".to_owned(),
+                x: 5,
+                y: 3,
+            }],
+            orders: vec![Order {
+                id: "o1".to_owned(),
+                item_id: "milk".to_owned(),
+                status: OrderStatus::InProgress,
+            }],
+            ..GameState::default()
+        };
+        let world = World::new(state.clone());
+        let map = world.map();
+        let dist = DistanceMap::build(map);
+        let ctx = TeamContext::build(
+            &state,
+            map,
+            &dist,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            TeamContextConfig::default(),
+        );
+        let drop = map.idx(1, 4).expect("drop");
+        let intents = vec![
+            BotIntent {
+                bot_id: "0".to_owned(),
+                intent: Intent::MoveTo { cell: drop },
+            },
+            BotIntent {
+                bot_id: "1".to_owned(),
+                intent: Intent::MoveTo { cell: drop },
+            },
+            BotIntent {
+                bot_id: "2".to_owned(),
+                intent: Intent::MoveTo { cell: drop },
+            },
+        ];
+        let reason = assignment_guard_reason(&state, map, &ctx, &intents);
+        assert_eq!(reason, Some("empty_dropoff_cluster"));
     }
 }
 

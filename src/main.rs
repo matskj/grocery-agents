@@ -1,3 +1,4 @@
+mod assign;
 mod config;
 mod dispatcher;
 mod dist;

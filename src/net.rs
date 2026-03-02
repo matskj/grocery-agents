@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{sync::OnceLock, time::Duration};
 
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
@@ -70,6 +70,14 @@ pub async fn run_game_loop(
                                 tick = game_state.tick,
                                 "planning timeout, falling back to wait actions"
                             );
+                            if bot_debug_enabled() {
+                                warn!(
+                                    tick = game_state.tick,
+                                    budget_ms = ROUND_PLANNING_BUDGET.as_millis(),
+                                    bot_count = game_state.bots.len(),
+                                    "time-budget event: fallback wait envelope emitted"
+                                );
+                            }
                             fallback_wait_actions(&game_state)
                         });
 
@@ -126,6 +134,13 @@ async fn plan_round_actions(
 }
 
 fn fallback_wait_actions(state: &GameState) -> Vec<Action> {
+    if bot_debug_enabled() {
+        warn!(
+            tick = state.tick,
+            bot_count = state.bots.len(),
+            "safety fallback activated: forcing wait actions"
+        );
+    }
     state
         .bots
         .iter()
@@ -135,6 +150,9 @@ fn fallback_wait_actions(state: &GameState) -> Vec<Action> {
 
 fn validate_action(action: Action, state: &GameState, bot: &BotState) -> Action {
     if action.bot_id() != bot.id {
+        if bot_debug_enabled() {
+            warn!(tick = state.tick, bot_id = %bot.id, "fallback event: action bot_id mismatch; waiting");
+        }
         return Action::wait(bot.id.clone());
     }
 
@@ -151,6 +169,9 @@ fn validate_action(action: Action, state: &GameState, bot: &BotState) -> Action 
             if in_bounds && !blocked {
                 Action::Move { bot_id, dx, dy }
             } else {
+                if bot_debug_enabled() {
+                    warn!(tick = state.tick, bot_id = %bot.id, nx, ny, in_bounds, blocked, "safety fallback: invalid move converted to wait");
+                }
                 Action::wait(bot.id.clone())
             }
         }
@@ -163,6 +184,9 @@ fn validate_action(action: Action, state: &GameState, bot: &BotState) -> Action 
             if has_capacity && adjacent {
                 Action::PickUp { bot_id, item_id }
             } else {
+                if bot_debug_enabled() {
+                    warn!(tick = state.tick, bot_id = %bot.id, has_capacity, adjacent, "safety fallback: invalid pickup converted to wait");
+                }
                 Action::wait(bot.id.clone())
             }
         }
@@ -175,9 +199,21 @@ fn validate_action(action: Action, state: &GameState, bot: &BotState) -> Action 
             if on_drop_off {
                 Action::DropOff { bot_id, order_id }
             } else {
+                if bot_debug_enabled() {
+                    warn!(tick = state.tick, bot_id = %bot.id, "safety fallback: invalid dropoff converted to wait");
+                }
                 Action::wait(bot.id.clone())
             }
         }
         Action::Wait { bot_id } => Action::Wait { bot_id },
     }
+}
+
+fn bot_debug_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("BOT_DEBUG")
+            .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+            .unwrap_or(false)
+    })
 }

@@ -20,7 +20,17 @@ struct Task {
     sort_key: (u8, String, u16),
     target_cell: u16,
     shareable: bool,
+    kind: TaskKind,
     intent: Intent,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TaskKind {
+    ImmediateDropOff,
+    CarryToDropoff,
+    PickupStand,
+    ImmediatePickup,
+    QueuePosition,
 }
 
 #[derive(Debug, Clone)]
@@ -82,10 +92,50 @@ impl AssignmentEngine {
                 .carrying
                 .iter()
                 .any(|item| team.active_order_items_set.contains(item));
+            let bot_has_capacity = bot.carrying.len() < bot.capacity;
             let role = team.role_for(&bot.id);
             let queue_goal = team.queue_goal_for(&bot.id);
+            let on_dropoff = map
+                .idx(bot.x, bot.y)
+                .map(|cell| map.dropoff_cells.contains(&cell))
+                .unwrap_or(false);
             let mut ranked = tasks
                 .iter()
+                .filter(|task| {
+                    if matches!(task.kind, TaskKind::CarryToDropoff) && !carrying_active {
+                        return false;
+                    }
+                    if matches!(task.kind, TaskKind::PickupStand | TaskKind::ImmediatePickup)
+                        && !bot_has_capacity
+                    {
+                        return false;
+                    }
+                    if matches!(task.kind, TaskKind::QueuePosition)
+                        && !matches!(role, BotRole::LeadCourier | BotRole::QueueCourier)
+                    {
+                        return false;
+                    }
+                    if matches!(task.kind, TaskKind::ImmediateDropOff) {
+                        let Intent::DropOff { order_id } = &task.intent else {
+                            return false;
+                        };
+                        let required_item = state
+                            .orders
+                            .iter()
+                            .find(|order| order.id == *order_id)
+                            .map(|order| order.item_id.clone());
+                        if !on_dropoff {
+                            return false;
+                        }
+                        let Some(required_item) = required_item else {
+                            return false;
+                        };
+                        if !bot.carrying.iter().any(|item| item == &required_item) {
+                            return false;
+                        }
+                    }
+                    true
+                })
                 .map(|task| {
                     let base = task_cost(
                         bot_cell,
@@ -97,11 +147,14 @@ impl AssignmentEngine {
                         lambda_choke,
                     );
                     let mut adjusted = base;
-                    if carrying_active && matches!(task.intent, Intent::MoveTo { .. }) {
+                    if carrying_active && matches!(task.kind, TaskKind::CarryToDropoff) {
                         adjusted -= 20;
                     }
-                    if matches!(task.intent, Intent::DropOff { .. }) {
+                    if matches!(task.kind, TaskKind::ImmediateDropOff) {
                         adjusted -= 50;
+                    }
+                    if !carrying_active && matches!(task.kind, TaskKind::PickupStand) {
+                        adjusted -= 30;
                     }
                     if matches!(role, BotRole::LeadCourier | BotRole::QueueCourier)
                         && matches!(task.intent, Intent::MoveTo { .. })
@@ -219,6 +272,7 @@ fn build_tasks(
                     sort_key: (0, order.item_id.clone(), 0),
                     target_cell: map.idx(bot.x, bot.y).unwrap_or(0),
                     shareable: true,
+                    kind: TaskKind::ImmediateDropOff,
                     intent: Intent::DropOff {
                         order_id: order.id.clone(),
                     },
@@ -244,6 +298,7 @@ fn build_tasks(
             sort_key: (1, order_id.clone(), drop),
             target_cell: drop,
             shareable: true,
+            kind: TaskKind::CarryToDropoff,
             intent: Intent::MoveTo { cell: drop },
         });
         next_id += 1;
@@ -280,6 +335,7 @@ fn build_tasks(
                 sort_key: (tier, item.kind.clone(), stand),
                 target_cell: stand,
                 shareable: false,
+                kind: TaskKind::PickupStand,
                 intent,
             });
             next_id += 1;
@@ -291,6 +347,7 @@ fn build_tasks(
                 sort_key: (tier, item.kind.clone(), nearest_drop),
                 target_cell: stand,
                 shareable: false,
+                kind: TaskKind::ImmediatePickup,
                 intent: pickup_intent,
             });
             next_id += 1;
@@ -309,6 +366,7 @@ fn build_tasks(
                     sort_key: (4, bot.id.clone(), goal),
                     target_cell: goal,
                     shareable: true,
+                    kind: TaskKind::QueuePosition,
                     intent: Intent::MoveTo { cell: goal },
                 });
                 next_id += 1;
@@ -318,6 +376,7 @@ fn build_tasks(
                     sort_key: (4, bot.id.clone(), drop),
                     target_cell: drop,
                     shareable: true,
+                    kind: TaskKind::QueuePosition,
                     intent: Intent::MoveTo { cell: drop },
                 });
                 next_id += 1;
@@ -483,5 +542,110 @@ mod tests {
             )
             .expect("assignment");
         assert_eq!(format!("{:?}", first.intents), format!("{:?}", second.intents));
+    }
+
+    #[test]
+    fn empty_bots_do_not_all_target_dropoff() {
+        let state = GameState {
+            grid: Grid {
+                width: 16,
+                height: 12,
+                drop_off_tiles: vec![[1, 10]],
+                ..Grid::default()
+            },
+            bots: vec![
+                BotState {
+                    id: "0".to_owned(),
+                    x: 14,
+                    y: 10,
+                    carrying: vec![],
+                    capacity: 3,
+                },
+                BotState {
+                    id: "1".to_owned(),
+                    x: 14,
+                    y: 10,
+                    carrying: vec![],
+                    capacity: 3,
+                },
+                BotState {
+                    id: "2".to_owned(),
+                    x: 14,
+                    y: 10,
+                    carrying: vec![],
+                    capacity: 3,
+                },
+            ],
+            items: vec![
+                Item {
+                    id: "item_a".to_owned(),
+                    kind: "milk".to_owned(),
+                    x: 13,
+                    y: 8,
+                },
+                Item {
+                    id: "item_b".to_owned(),
+                    kind: "bread".to_owned(),
+                    x: 13,
+                    y: 2,
+                },
+            ],
+            orders: vec![
+                Order {
+                    id: "o1".to_owned(),
+                    item_id: "milk".to_owned(),
+                    status: OrderStatus::InProgress,
+                },
+                Order {
+                    id: "o2".to_owned(),
+                    item_id: "bread".to_owned(),
+                    status: OrderStatus::InProgress,
+                },
+            ],
+            ..GameState::default()
+        };
+        let world = World::new(state.clone());
+        let map = world.map();
+        let dist = DistanceMap::build(map);
+        let team = TeamContext::build(
+            &state,
+            map,
+            &dist,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            TeamContextConfig::default(),
+        );
+        let engine = AssignmentEngine::new();
+        let result = engine
+            .build_intents(
+                &state,
+                map,
+                &dist,
+                &team,
+                8,
+                1.0,
+                1.5,
+                Duration::from_millis(200),
+            )
+            .expect("assignment");
+        let all_dropoff = result.intents.iter().all(|intent| {
+            matches!(
+                intent.intent,
+                crate::dispatcher::Intent::MoveTo { cell } if map.dropoff_cells.contains(&cell)
+            )
+        });
+        assert!(
+            !all_dropoff,
+            "empty bots should not all be assigned to dropoff"
+        );
     }
 }

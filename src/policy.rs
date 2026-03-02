@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     sync::{Arc, OnceLock},
+    time::{Duration, Instant},
 };
 
 use tracing::info;
@@ -59,7 +60,8 @@ impl Policy {
         }
     }
 
-    pub fn decide_round(&mut self, state: &GameState) -> Vec<Action> {
+    pub fn decide_round(&mut self, state: &GameState, soft_budget: Duration) -> Vec<Action> {
+        let tick_started = Instant::now();
         let world = World::new(state.clone());
         let map = world.map();
         let dist = DistanceMap::build(map);
@@ -196,9 +198,11 @@ impl Policy {
         }
         self.sticky_roles = team_ctx.queue.next_sticky.clone();
 
+        let assign_started = Instant::now();
         let intents =
             self.dispatcher
                 .build_intents(state, map, &dist, &blocked_snapshot, &team_ctx);
+        let assign_ms = assign_started.elapsed().as_millis() as u64;
         let mut goals = HashMap::new();
         let mut immediate = HashMap::new();
         let mut intent_labels = serde_json::Map::new();
@@ -476,6 +480,7 @@ impl Policy {
             &goals,
             &team_ctx.movement,
             &ordering_sequence,
+            Some(Instant::now() + soft_budget.saturating_sub(tick_started.elapsed())),
         );
         let mut planned = plan_result.actions;
         for (bot_id, action) in immediate {
@@ -753,7 +758,7 @@ impl Policy {
             );
             obj.insert(
                 "assign_ms".to_owned(),
-                serde_json::Value::Number(serde_json::Number::from(0)),
+                serde_json::Value::Number(serde_json::Number::from(assign_ms)),
             );
         }
         self.last_team_telemetry = telemetry;

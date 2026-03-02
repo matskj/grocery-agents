@@ -918,10 +918,13 @@ async fn plan_round_actions(
     policy: &mut Policy,
     dispatcher: &Dispatcher,
     state: &GameState,
-    _config: &Config,
+    config: &Config,
 ) -> PlanRoundResult {
     let plan_started = Instant::now();
-    let proposed = policy.decide_round(state);
+    let proposed = policy.decide_round(
+        state,
+        Duration::from_millis(config.planner_soft_budget_ms),
+    );
     let team_telemetry = policy.last_team_telemetry();
     let assign_ms = team_telemetry
         .get("assign_ms")

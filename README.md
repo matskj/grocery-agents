@@ -61,6 +61,33 @@ Install offline training dependencies:
 python -m pip install -r requirements.txt
 ```
 
+## Local evaluation runner (Rust)
+
+Run quick metric summaries from existing logs:
+
+```powershell
+.\cargo-x64.cmd run --bin eval -- --from-logs --episodes 10
+```
+
+Run fresh episodes against local websocket simulator:
+
+```powershell
+.\cargo-x64.cmd run --bin eval -- --episodes 10 --ws-url ws://localhost:8765/ws --token <jwt>
+```
+
+Profiles:
+
+```powershell
+# conservative planning budget
+.\cargo-x64.cmd run --bin eval -- --episodes 10 --profile safe --ws-url ws://localhost:8765/ws --token <jwt>
+
+# wider search / longer horizon
+.\cargo-x64.cmd run --bin eval -- --episodes 10 --profile aggressive --ws-url ws://localhost:8765/ws --token <jwt>
+```
+
+The eval summary prints score mean/p50/p90, wait ratio, move/pickup/dropoff counts,
+blocked events, and near-dropoff congestion events.
+
 ## Local Replay UI
 
 You can inspect run behavior visually with a local browser replay tool.
@@ -242,6 +269,18 @@ Coordination knobs:
 - `QUEUE_STRICT_MODE=1` (default on in medium/hard/expert)
 - `QUEUE_MAX_RING_ENTRANTS=1` (strict queue default)
 - `DEADLOCK_ESCAPE_TICKS=3`
+- `GROCERY_HORIZON=16`
+- `GROCERY_CANDIDATE_K=8`
+- `GROCERY_ASSIGNMENT_ENABLED=true`
+- `GROCERY_DROPOFF_SCHEDULING_ENABLED=true`
+- `GROCERY_DROPOFF_WINDOW=12`
+- `GROCERY_DROPOFF_CAPACITY=1`
+- `GROCERY_LAMBDA_DENSITY=1.0`
+- `GROCERY_LAMBDA_CHOKE=1.5`
+- `GROCERY_PLANNER_SOFT_BUDGET_MS=1200`
+- `GROCERY_STRUCTURED_BOT_LOG=1`
+- `GROCERY_ASCII_RENDER=1`
+- `GROCERY_REPLAY_DUMP_PATH=logs/replay_dump.jsonl`
 
 ## Safety fallback behavior (`wait`)
 

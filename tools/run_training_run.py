@@ -25,6 +25,8 @@ def build_cmd(target: str, cargo_args: list[str]) -> list[str]:
         "run",
         "--target",
         target,
+        "--bin",
+        "grocery-agents",
         "--",
         *cargo_args,
     ]

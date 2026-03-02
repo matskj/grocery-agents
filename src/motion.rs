@@ -29,6 +29,7 @@ pub struct MotionPlanDiagnostics {
     pub cbs_timeout: bool,
     pub cbs_expanded_nodes: u16,
     pub budget_cutoff_waits: u16,
+    pub reserved_cells_by_t: HashMap<u8, Vec<u16>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -284,6 +285,16 @@ impl MotionPlanner {
             diagnostics.cbs_timeout = cbs_result.timeout;
             diagnostics.cbs_expanded_nodes = cbs_result.expanded_nodes;
         }
+
+        let mut reserved_cells_by_t = HashMap::<u8, Vec<u16>>::new();
+        for &(t, cell) in &res_table.vertex_res {
+            reserved_cells_by_t.entry(t).or_default().push(cell);
+        }
+        for cells in reserved_cells_by_t.values_mut() {
+            cells.sort_unstable();
+            cells.dedup();
+        }
+        diagnostics.reserved_cells_by_t = reserved_cells_by_t;
 
         MotionPlanResult {
             actions: out,

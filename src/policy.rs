@@ -866,6 +866,28 @@ impl Policy {
                 "local_conflict_count_by_bot".to_owned(),
                 serde_json::Value::Object(local_conflict_count),
             );
+            let reserved_cells_by_t = plan_result
+                .diagnostics
+                .reserved_cells_by_t
+                .iter()
+                .map(|(t, cells)| {
+                    (
+                        t.to_string(),
+                        serde_json::Value::Array(
+                            cells.iter()
+                                .map(|idx| {
+                                    let (x, y) = map.xy(*idx);
+                                    serde_json::json!([x, y])
+                                })
+                                .collect::<Vec<_>>(),
+                        ),
+                    )
+                })
+                .collect::<serde_json::Map<_, _>>();
+            obj.insert(
+                "reserved_cells_by_t".to_owned(),
+                serde_json::Value::Object(reserved_cells_by_t),
+            );
             obj.insert(
                 "dropoff_target_status_by_bot".to_owned(),
                 serde_json::Value::Object(dropoff_target_status_by_bot),

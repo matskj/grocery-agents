@@ -248,6 +248,22 @@ impl Policy {
             .collect::<HashMap<_, _>>();
         let mut dropoff_target_status_by_bot = serde_json::Map::new();
         let mut serviceable_dropoff_by_bot = serde_json::Map::new();
+        let mut dropoff_schedule_status_by_bot = serde_json::Map::new();
+        let mut dropoff_slot_reserved_by_bot = serde_json::Map::new();
+        let mut dropoff_staging_cell_by_bot = serde_json::Map::new();
+        let mut dropoff_slot_usage: HashMap<(u8, u16), u8> = HashMap::new();
+        let mut reserved_staging_cells = HashSet::<u16>::new();
+        let dropoff_staging_cells = map
+            .dropoff_cells
+            .iter()
+            .copied()
+            .map(|drop| {
+                (
+                    drop,
+                    build_dropoff_staging_cells(drop, map, &dist, &team_ctx.traffic.conflict_hotspots),
+                )
+            })
+            .collect::<HashMap<_, _>>();
 
         for BotIntent { bot_id, intent } in intents {
             let bot = match state.bots.iter().find(|b| b.id == bot_id) {
@@ -346,11 +362,15 @@ impl Policy {
                     dropoff_attempt_streak_snapshot
                         .insert(bot.id.clone(), mem.same_dropoff_order_streak);
                     let watchdog_trigger = banned
-                        || should_trigger_dropoff_watchdog(
-                            in_progress,
-                            carrying_required,
-                            mem.same_dropoff_order_streak,
-                        );
+                        || if self.config.dropoff_scheduling_enabled {
+                            !in_progress || !carrying_required
+                        } else {
+                            should_trigger_dropoff_watchdog(
+                                in_progress,
+                                carrying_required,
+                                mem.same_dropoff_order_streak,
+                            )
+                        };
                     if watchdog_trigger {
                         mem.dropoff_watchdog_triggered = true;
                         dropoff_watchdog_snapshot.insert(bot.id.clone(), true);
@@ -444,6 +464,93 @@ impl Policy {
                             goal = escape;
                         }
                     }
+                    let carrying_active = bot
+                        .carrying
+                        .iter()
+                        .any(|item| active_items.contains(item.as_str()));
+                    if self.config.dropoff_scheduling_enabled
+                        && carrying_active
+                        && map.dropoff_cells.contains(&goal)
+                    {
+                        let eta = dist.dist(cell, goal).min(u16::from(u8::MAX)) as u8;
+                        let window = self.config.dropoff_window.max(2);
+                        let mut reserved_slot = None::<u8>;
+                        for t in eta..=eta.saturating_add(window) {
+                            let used = dropoff_slot_usage.get(&(t, goal)).copied().unwrap_or(0);
+                            if used < self.config.dropoff_capacity {
+                                dropoff_slot_usage.insert((t, goal), used.saturating_add(1));
+                                reserved_slot = Some(t);
+                                break;
+                            }
+                        }
+                        if let Some(slot_t) = reserved_slot {
+                            dropoff_slot_reserved_by_bot.insert(
+                                bot.id.clone(),
+                                serde_json::Value::Number(serde_json::Number::from(slot_t as i64)),
+                            );
+                            if slot_t > eta.saturating_add(1) {
+                                if let Some(stage) = pick_staging_cell(
+                                    bot.id.as_str(),
+                                    cell,
+                                    goal,
+                                    &dropoff_staging_cells,
+                                    &reserved_staging_cells,
+                                    map,
+                                    &dist,
+                                ) {
+                                    reserved_staging_cells.insert(stage);
+                                    goal = stage;
+                                    let (sx, sy) = map.xy(stage);
+                                    dropoff_staging_cell_by_bot.insert(
+                                        bot.id.clone(),
+                                        serde_json::json!([sx, sy]),
+                                    );
+                                    dropoff_schedule_status_by_bot.insert(
+                                        bot.id.clone(),
+                                        serde_json::Value::String("staging_wait_slot".to_owned()),
+                                    );
+                                } else {
+                                    dropoff_schedule_status_by_bot.insert(
+                                        bot.id.clone(),
+                                        serde_json::Value::String("slot_reserved_direct".to_owned()),
+                                    );
+                                }
+                            } else {
+                                dropoff_schedule_status_by_bot.insert(
+                                    bot.id.clone(),
+                                    serde_json::Value::String("slot_reserved_direct".to_owned()),
+                                );
+                            }
+                        } else if let Some(stage) = pick_staging_cell(
+                            bot.id.as_str(),
+                            cell,
+                            goal,
+                            &dropoff_staging_cells,
+                            &reserved_staging_cells,
+                            map,
+                            &dist,
+                        ) {
+                            reserved_staging_cells.insert(stage);
+                            goal = stage;
+                            let (sx, sy) = map.xy(stage);
+                            dropoff_staging_cell_by_bot
+                                .insert(bot.id.clone(), serde_json::json!([sx, sy]));
+                            dropoff_schedule_status_by_bot.insert(
+                                bot.id.clone(),
+                                serde_json::Value::String("staging_no_slot".to_owned()),
+                            );
+                        } else {
+                            dropoff_schedule_status_by_bot.insert(
+                                bot.id.clone(),
+                                serde_json::Value::String("no_slot_wait".to_owned()),
+                            );
+                        }
+                    } else {
+                        dropoff_schedule_status_by_bot.insert(
+                            bot.id.clone(),
+                            serde_json::Value::String("not_scheduled".to_owned()),
+                        );
+                    }
                     goals.insert(bot.id.clone(), goal);
                 }
                 Intent::Wait => {
@@ -510,6 +617,7 @@ impl Policy {
             &team_ctx.movement,
             &ordering_sequence,
             Some(Instant::now() + soft_budget.saturating_sub(tick_started.elapsed())),
+            self.config.dropoff_capacity,
         );
         let mut planned = plan_result.actions;
         for (bot_id, action) in immediate {
@@ -700,6 +808,15 @@ impl Policy {
             dropoff_target_status_by_bot
                 .entry(bot.id.clone())
                 .or_insert_with(|| serde_json::Value::String("none".to_owned()));
+            dropoff_schedule_status_by_bot
+                .entry(bot.id.clone())
+                .or_insert_with(|| serde_json::Value::String("not_scheduled".to_owned()));
+            dropoff_slot_reserved_by_bot
+                .entry(bot.id.clone())
+                .or_insert(serde_json::Value::Null);
+            dropoff_staging_cell_by_bot
+                .entry(bot.id.clone())
+                .or_insert(serde_json::Value::Null);
         }
 
         let mut telemetry = team_ctx.telemetry(map);
@@ -804,6 +921,18 @@ impl Policy {
             obj.insert(
                 "assignment_edge_count".to_owned(),
                 serde_json::Value::Number(serde_json::Number::from(assignment_edge_count as i64)),
+            );
+            obj.insert(
+                "dropoff_schedule_status_by_bot".to_owned(),
+                serde_json::Value::Object(dropoff_schedule_status_by_bot),
+            );
+            obj.insert(
+                "dropoff_slot_reserved_by_bot".to_owned(),
+                serde_json::Value::Object(dropoff_slot_reserved_by_bot),
+            );
+            obj.insert(
+                "dropoff_staging_cell_by_bot".to_owned(),
+                serde_json::Value::Object(dropoff_staging_cell_by_bot),
             );
         }
         self.last_team_telemetry = telemetry;
@@ -1008,6 +1137,71 @@ fn pick_deadlock_escape(
                 .unwrap_or(0);
             (i32::from(near_drop.min(64)) - ring_penalty - lane_penalty - congestion as i32) as i16
         })
+}
+
+fn build_dropoff_staging_cells(
+    dropoff: u16,
+    map: &crate::world::MapCache,
+    dist: &DistanceMap,
+    conflict_hotspots: &[(u16, u16)],
+) -> Vec<u16> {
+    let mut out = Vec::<u16>::new();
+    let hotspot_penalty = conflict_hotspots
+        .iter()
+        .copied()
+        .collect::<HashMap<u16, u16>>();
+    for idx in 0..map.neighbors.len() as u16 {
+        if map.wall_mask[idx as usize] || idx == dropoff {
+            continue;
+        }
+        let d = dist.dist(idx, dropoff);
+        if d == u16::MAX || !(1..=2).contains(&d) {
+            continue;
+        }
+        out.push(idx);
+    }
+    out.sort_by(|a, b| {
+        dist.dist(*a, dropoff)
+            .cmp(&dist.dist(*b, dropoff))
+            .then_with(|| {
+                let ah = hotspot_penalty.get(a).copied().unwrap_or(0);
+                let bh = hotspot_penalty.get(b).copied().unwrap_or(0);
+                ah.cmp(&bh)
+            })
+            .then_with(|| {
+                map.neighbors[*b as usize]
+                    .len()
+                    .cmp(&map.neighbors[*a as usize].len())
+            })
+            .then_with(|| a.cmp(b))
+    });
+    out
+}
+
+fn pick_staging_cell(
+    bot_id: &str,
+    from_cell: u16,
+    dropoff: u16,
+    staging_by_dropoff: &HashMap<u16, Vec<u16>>,
+    reserved_staging: &HashSet<u16>,
+    map: &crate::world::MapCache,
+    dist: &DistanceMap,
+) -> Option<u16> {
+    let mut candidates = staging_by_dropoff.get(&dropoff)?.clone();
+    candidates.sort_by(|a, b| {
+        dist.dist(from_cell, *a)
+            .cmp(&dist.dist(from_cell, *b))
+            .then_with(|| {
+                map.neighbors[*b as usize]
+                    .len()
+                    .cmp(&map.neighbors[*a as usize].len())
+            })
+            .then_with(|| a.cmp(b))
+    });
+    let _ = bot_id;
+    candidates
+        .into_iter()
+        .find(|cell| !reserved_staging.contains(cell))
 }
 
 fn apply_yield_actions(
@@ -1362,7 +1556,17 @@ fn should_trigger_dropoff_watchdog(in_progress: bool, carrying_required: bool, s
 
 #[cfg(test)]
 mod tests {
-    use super::should_trigger_dropoff_watchdog;
+    use std::collections::{HashMap, HashSet};
+
+    use crate::{
+        dist::DistanceMap,
+        model::{GameState, Grid},
+        world::World,
+    };
+
+    use super::{
+        build_dropoff_staging_cells, pick_staging_cell, should_trigger_dropoff_watchdog,
+    };
 
     #[test]
     fn watchdog_triggers_for_pending_or_streak() {
@@ -1370,6 +1574,54 @@ mod tests {
         assert!(should_trigger_dropoff_watchdog(true, false, 1));
         assert!(should_trigger_dropoff_watchdog(true, true, 4));
         assert!(!should_trigger_dropoff_watchdog(true, true, 2));
+    }
+
+    #[test]
+    fn staging_cells_stay_within_ring() {
+        let state = GameState {
+            grid: Grid {
+                width: 7,
+                height: 7,
+                drop_off_tiles: vec![[3, 3]],
+                ..Grid::default()
+            },
+            ..GameState::default()
+        };
+        let world = World::new(state);
+        let map = world.map();
+        let dist = DistanceMap::build(map);
+        let drop = map.idx(3, 3).expect("dropoff");
+        let cells = build_dropoff_staging_cells(drop, map, &dist, &[]);
+        assert!(!cells.is_empty(), "staging cells should be available");
+        for cell in &cells {
+            let d = dist.dist(*cell, drop);
+            assert!((1..=2).contains(&d), "staging cell distance must be 1..2");
+        }
+    }
+
+    #[test]
+    fn pick_staging_respects_reserved_cells() {
+        let state = GameState {
+            grid: Grid {
+                width: 7,
+                height: 7,
+                drop_off_tiles: vec![[3, 3]],
+                ..Grid::default()
+            },
+            ..GameState::default()
+        };
+        let world = World::new(state);
+        let map = world.map();
+        let dist = DistanceMap::build(map);
+        let drop = map.idx(3, 3).expect("dropoff");
+        let staging = build_dropoff_staging_cells(drop, map, &dist, &[]);
+        let mut by_drop = HashMap::new();
+        by_drop.insert(drop, staging.clone());
+        let mut reserved = HashSet::new();
+        reserved.insert(staging[0]);
+        let chosen = pick_staging_cell("0", drop, drop, &by_drop, &reserved, map, &dist)
+            .expect("staging cell");
+        assert_ne!(chosen, staging[0], "reserved staging cell must be skipped");
     }
 }
 

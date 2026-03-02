@@ -226,6 +226,8 @@ impl Policy {
         let mut assignment_preview_task_count = 0usize;
         let mut assignment_stand_task_count = 0usize;
         let mut assignment_dropoff_task_count = 0usize;
+        let mut assignment_active_gap_total = 0usize;
+        let mut assignment_preview_enabled = true;
         let mut assignment_guard_trigger_reason: Option<&'static str> = None;
         let assignment_mode = if self.config.assignment_enabled {
             self.config.assignment_mode
@@ -260,6 +262,8 @@ impl Policy {
             assignment_preview_task_count = result.preview_task_count;
             assignment_stand_task_count = result.stand_task_count;
             assignment_dropoff_task_count = result.dropoff_task_count;
+            assignment_active_gap_total = result.active_gap_total;
+            assignment_preview_enabled = result.preview_enabled;
         }
 
         let mut intents = if forced_legacy_active {
@@ -341,6 +345,7 @@ impl Policy {
         } else {
             self.global_no_progress_streak = 0;
         };
+        rebalance_pickup_goal_crowding(state, map, &dist, &team_ctx, &active_items, &mut intents);
         let assign_ms = assign_started.elapsed().as_millis() as u64;
         let mut goals = HashMap::new();
         let mut immediate = HashMap::new();
@@ -1093,6 +1098,16 @@ impl Policy {
                 )),
             );
             obj.insert(
+                "assignment_active_gap_total".to_owned(),
+                serde_json::Value::Number(serde_json::Number::from(
+                    assignment_active_gap_total as i64
+                )),
+            );
+            obj.insert(
+                "assignment_preview_enabled".to_owned(),
+                serde_json::Value::Bool(assignment_preview_enabled),
+            );
+            obj.insert(
                 "assignment_guard_triggered".to_owned(),
                 serde_json::Value::Bool(assignment_guard_trigger_reason.is_some()),
             );
@@ -1370,6 +1385,149 @@ fn merge_hybrid_intents(
             }
         })
         .collect()
+}
+
+fn rebalance_pickup_goal_crowding(
+    state: &GameState,
+    map: &crate::world::MapCache,
+    dist: &DistanceMap,
+    team_ctx: &TeamContext,
+    active_items: &HashSet<&str>,
+    intents: &mut [BotIntent],
+) {
+    if intents.is_empty() || active_items.is_empty() {
+        return;
+    }
+    let mut active_stands = HashSet::<u16>::new();
+    for item in &state.items {
+        if !active_items.contains(item.kind.as_str()) {
+            continue;
+        }
+        for &stand in map.stand_cells_for_item(&item.id) {
+            active_stands.insert(stand);
+        }
+    }
+    if active_stands.len() < 2 {
+        return;
+    }
+    let mut active_stand_list = active_stands.into_iter().collect::<Vec<_>>();
+    active_stand_list.sort_unstable();
+
+    let bot_by_id = state
+        .bots
+        .iter()
+        .map(|bot| (bot.id.as_str(), bot))
+        .collect::<HashMap<_, _>>();
+    let mut idx_by_bot = HashMap::<String, usize>::new();
+    for (idx, entry) in intents.iter().enumerate() {
+        idx_by_bot.insert(entry.bot_id.clone(), idx);
+    }
+
+    let mut crowd_by_goal = HashMap::<u16, Vec<String>>::new();
+    for intent in intents.iter() {
+        let Intent::MoveTo { cell } = intent.intent else {
+            continue;
+        };
+        if !active_stand_list.contains(&cell) {
+            continue;
+        }
+        let Some(bot) = bot_by_id.get(intent.bot_id.as_str()).copied() else {
+            continue;
+        };
+        let carrying_active = bot
+            .carrying
+            .iter()
+            .any(|item| active_items.contains(item.as_str()));
+        if carrying_active {
+            continue;
+        }
+        if matches!(
+            team_ctx.role_for(&bot.id),
+            BotRole::LeadCourier | BotRole::QueueCourier
+        ) {
+            continue;
+        }
+        crowd_by_goal
+            .entry(cell)
+            .or_default()
+            .push(bot.id.clone());
+    }
+
+    let mut crowd_load = crowd_by_goal
+        .iter()
+        .map(|(cell, bots)| (*cell, bots.len() as u16))
+        .collect::<HashMap<_, _>>();
+    let mut reserved = HashSet::<u16>::new();
+    for (goal, bots) in crowd_by_goal {
+        if bots.len() <= 1 {
+            reserved.insert(goal);
+            continue;
+        }
+        let mut ordered = bots;
+        ordered.sort_by(|a, b| {
+            let da = bot_by_id
+                .get(a.as_str())
+                .and_then(|bot| map.idx(bot.x, bot.y))
+                .map(|start| dist.dist(start, goal))
+                .unwrap_or(u16::MAX);
+            let db = bot_by_id
+                .get(b.as_str())
+                .and_then(|bot| map.idx(bot.x, bot.y))
+                .map(|start| dist.dist(start, goal))
+                .unwrap_or(u16::MAX);
+            da.cmp(&db).then_with(|| a.cmp(b))
+        });
+        let keep = ordered.first().cloned();
+        if let Some(keep_bot) = keep {
+            reserved.insert(goal);
+            for bot_id in ordered.into_iter().skip(1) {
+                let Some(bot) = bot_by_id.get(bot_id.as_str()).copied() else {
+                    continue;
+                };
+                let Some(start) = map.idx(bot.x, bot.y) else {
+                    continue;
+                };
+                let mut candidates = active_stand_list.clone();
+                candidates.sort_by(|a, b| {
+                    let load_a = crowd_load.get(a).copied().unwrap_or(0);
+                    let load_b = crowd_load.get(b).copied().unwrap_or(0);
+                    load_a
+                        .cmp(&load_b)
+                        .then_with(|| dist.dist(start, *a).cmp(&dist.dist(start, *b)))
+                        .then_with(|| a.cmp(b))
+                });
+                let mut chosen = None::<u16>;
+                for candidate in &candidates {
+                    if *candidate == goal || reserved.contains(candidate) {
+                        continue;
+                    }
+                    chosen = Some(*candidate);
+                    break;
+                }
+                if chosen.is_none() {
+                    for candidate in &candidates {
+                        if *candidate == goal {
+                            continue;
+                        }
+                        chosen = Some(*candidate);
+                        break;
+                    }
+                }
+                let Some(new_goal) = chosen else {
+                    continue;
+                };
+                if let Some(&intent_idx) = idx_by_bot.get(&bot_id) {
+                    intents[intent_idx].intent = Intent::MoveTo { cell: new_goal };
+                    let load = crowd_load.get(&new_goal).copied().unwrap_or(0);
+                    crowd_load.insert(new_goal, load.saturating_add(1));
+                    reserved.insert(new_goal);
+                }
+            }
+            let keep_load = crowd_load.get(&goal).copied().unwrap_or(1);
+            crowd_load.insert(goal, keep_load.min(1));
+            let _ = keep_bot;
+        }
+    }
 }
 
 fn should_trigger_assignment_move_loop_watchdog(
@@ -1986,7 +2144,8 @@ mod tests {
 
     use super::{
         assignment_guard_reason, build_dropoff_staging_cells, merge_hybrid_intents,
-        pick_staging_cell, should_trigger_assignment_move_loop_watchdog,
+        pick_staging_cell, rebalance_pickup_goal_crowding,
+        should_trigger_assignment_move_loop_watchdog,
         should_trigger_dropoff_watchdog,
     };
 
@@ -2248,6 +2407,114 @@ mod tests {
         ];
         assert!(should_trigger_assignment_move_loop_watchdog(&intents, 12, 20));
         assert!(!should_trigger_assignment_move_loop_watchdog(&intents, 2, 20));
+    }
+
+    #[test]
+    fn crowd_rebalance_spreads_collectors_across_active_stands() {
+        let state = GameState {
+            grid: Grid {
+                width: 7,
+                height: 5,
+                drop_off_tiles: vec![[0, 4]],
+                ..Grid::default()
+            },
+            bots: vec![
+                BotState {
+                    id: "0".to_owned(),
+                    x: 5,
+                    y: 4,
+                    carrying: vec![],
+                    capacity: 3,
+                },
+                BotState {
+                    id: "1".to_owned(),
+                    x: 5,
+                    y: 4,
+                    carrying: vec![],
+                    capacity: 3,
+                },
+                BotState {
+                    id: "2".to_owned(),
+                    x: 5,
+                    y: 4,
+                    carrying: vec![],
+                    capacity: 3,
+                },
+            ],
+            items: vec![
+                Item {
+                    id: "item_1".to_owned(),
+                    kind: "milk".to_owned(),
+                    x: 4,
+                    y: 2,
+                },
+                Item {
+                    id: "item_2".to_owned(),
+                    kind: "milk".to_owned(),
+                    x: 2,
+                    y: 2,
+                },
+            ],
+            orders: vec![Order {
+                id: "o1".to_owned(),
+                item_id: "milk".to_owned(),
+                status: OrderStatus::InProgress,
+            }],
+            ..GameState::default()
+        };
+        let world = World::new(state.clone());
+        let map = world.map();
+        let dist = DistanceMap::build(map);
+        let team = TeamContext::build(
+            &state,
+            map,
+            &dist,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            TeamContextConfig::default(),
+        );
+        let target = map.idx(5, 2).expect("stand");
+        let mut intents = vec![
+            BotIntent {
+                bot_id: "0".to_owned(),
+                intent: Intent::MoveTo { cell: target },
+            },
+            BotIntent {
+                bot_id: "1".to_owned(),
+                intent: Intent::MoveTo { cell: target },
+            },
+            BotIntent {
+                bot_id: "2".to_owned(),
+                intent: Intent::MoveTo { cell: target },
+            },
+        ];
+        let active_items = HashSet::from(["milk"]);
+        rebalance_pickup_goal_crowding(
+            &state,
+            map,
+            &dist,
+            &team,
+            &active_items,
+            &mut intents,
+        );
+        let goals = intents
+            .iter()
+            .filter_map(|entry| match entry.intent {
+                Intent::MoveTo { cell } => Some(cell),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let distinct = goals.iter().copied().collect::<HashSet<_>>();
+        assert!(distinct.len() >= 2, "collectors should be diversified");
     }
 }
 

@@ -75,13 +75,7 @@ impl Dispatcher {
         let (active_missing, preview_missing) = self.compute_missing(state);
         let mode = detect_mode_label(state);
         let order_urgency = active_missing.values().copied().map(f64::from).sum::<f64>();
-        let mut carried_supply: HashMap<u16, u16> = HashMap::new();
-        for bot in &state.bots {
-            for item in &bot.carrying {
-                let item_id = self.intern(item);
-                *carried_supply.entry(item_id).or_insert(0) += 1;
-            }
-        }
+        let carried_supply = self.build_effective_carried_supply(state, map, dist, team);
 
         let mut bot_order = state.bots.iter().collect::<Vec<_>>();
         bot_order.sort_by(|a, b| {
@@ -551,6 +545,45 @@ impl Dispatcher {
         self.item_rev.push(item_id.to_owned());
         self.item_intern.insert(item_id.to_owned(), id);
         id
+    }
+
+    fn build_effective_carried_supply(
+        &mut self,
+        state: &GameState,
+        map: &MapCache,
+        dist: &DistanceMap,
+        team: &TeamContext,
+    ) -> HashMap<u16, u16> {
+        const ACTIVE_SUPPLY_NEAR_DROP_MAX: u16 = 10;
+        const ACTIVE_SUPPLY_COURIER_DROP_MAX: u16 = 16;
+        let mut out: HashMap<u16, u16> = HashMap::new();
+        for bot in &state.bots {
+            if bot.carrying.is_empty() {
+                continue;
+            }
+            let Some(cell) = map.idx(bot.x, bot.y) else {
+                continue;
+            };
+            let near_drop = map
+                .dropoff_cells
+                .iter()
+                .copied()
+                .map(|drop| dist.dist(cell, drop))
+                .min()
+                .unwrap_or(u16::MAX);
+            let role = team.role_for(&bot.id);
+            let courier_role = matches!(role, BotRole::LeadCourier | BotRole::QueueCourier);
+            let serviceable = near_drop <= ACTIVE_SUPPLY_NEAR_DROP_MAX
+                || (courier_role && near_drop <= ACTIVE_SUPPLY_COURIER_DROP_MAX);
+            if !serviceable {
+                continue;
+            }
+            for item in &bot.carrying {
+                let item_id = self.intern(item);
+                *out.entry(item_id).or_insert(0) += 1;
+            }
+        }
+        out
     }
 }
 

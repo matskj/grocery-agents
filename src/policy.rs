@@ -1,11 +1,12 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    sync::OnceLock,
+    sync::{Arc, OnceLock},
 };
 
 use tracing::info;
 
 use crate::{
+    config::Config,
     dispatcher::{BotIntent, Dispatcher, Intent},
     dist::DistanceMap,
     model::{Action, GameState},
@@ -38,6 +39,7 @@ struct BotMemory {
 
 #[derive(Debug)]
 pub struct Policy {
+    config: Arc<Config>,
     dispatcher: Dispatcher,
     planner: MotionPlanner,
     memory: HashMap<String, BotMemory>,
@@ -46,10 +48,11 @@ pub struct Policy {
 }
 
 impl Policy {
-    pub fn new() -> Self {
+    pub fn new(config: Arc<Config>) -> Self {
         Self {
+            planner: MotionPlanner::new(config.horizon),
+            config,
             dispatcher: Dispatcher::new(),
-            planner: MotionPlanner::new(16),
             memory: HashMap::new(),
             sticky_roles: HashMap::new(),
             last_team_telemetry: serde_json::json!({}),
@@ -193,9 +196,9 @@ impl Policy {
         }
         self.sticky_roles = team_ctx.queue.next_sticky.clone();
 
-        let intents = self
-            .dispatcher
-            .build_intents(state, map, &dist, &blocked_snapshot, &team_ctx);
+        let intents =
+            self.dispatcher
+                .build_intents(state, map, &dist, &blocked_snapshot, &team_ctx);
         let mut goals = HashMap::new();
         let mut immediate = HashMap::new();
         let mut intent_labels = serde_json::Map::new();
@@ -301,7 +304,8 @@ impl Policy {
                         .unwrap_or(0)
                         > 0;
                     if mem.last_dropoff_order_id.as_deref() == Some(order_id.as_str()) {
-                        mem.same_dropoff_order_streak = mem.same_dropoff_order_streak.saturating_add(1);
+                        mem.same_dropoff_order_streak =
+                            mem.same_dropoff_order_streak.saturating_add(1);
                     } else {
                         mem.last_dropoff_order_id = Some(order_id.clone());
                         mem.same_dropoff_order_streak = 1;
@@ -317,10 +321,8 @@ impl Policy {
                     if watchdog_trigger {
                         mem.dropoff_watchdog_triggered = true;
                         dropoff_watchdog_snapshot.insert(bot.id.clone(), true);
-                        mem.dropoff_ban_ticks_by_order.insert(
-                            order_id.clone(),
-                            dropoff_watchdog_ban_ticks(),
-                        );
+                        mem.dropoff_ban_ticks_by_order
+                            .insert(order_id.clone(), dropoff_watchdog_ban_ticks());
                         if let Some(escape) =
                             pick_deadlock_escape(bot.id.as_str(), state, map, &dist, &team_ctx)
                         {
@@ -354,10 +356,8 @@ impl Policy {
                     );
                 }
                 Intent::PickUp { item_id } => {
-                    dropoff_target_status_by_bot.insert(
-                        bot.id.clone(),
-                        serde_json::Value::String("none".to_owned()),
-                    );
+                    dropoff_target_status_by_bot
+                        .insert(bot.id.clone(), serde_json::Value::String("none".to_owned()));
                     if bot
                         .carrying
                         .iter()
@@ -397,10 +397,8 @@ impl Policy {
                     }
                 }
                 Intent::MoveTo { cell: mut goal } => {
-                    dropoff_target_status_by_bot.insert(
-                        bot.id.clone(),
-                        serde_json::Value::String("none".to_owned()),
-                    );
+                    dropoff_target_status_by_bot
+                        .insert(bot.id.clone(), serde_json::Value::String("none".to_owned()));
                     if let Some(queue_target) = queue_goal {
                         if matches!(role, BotRole::LeadCourier | BotRole::QueueCourier) {
                             goal = queue_target;
@@ -416,10 +414,8 @@ impl Policy {
                     goals.insert(bot.id.clone(), goal);
                 }
                 Intent::Wait => {
-                    dropoff_target_status_by_bot.insert(
-                        bot.id.clone(),
-                        serde_json::Value::String("none".to_owned()),
-                    );
+                    dropoff_target_status_by_bot
+                        .insert(bot.id.clone(), serde_json::Value::String("none".to_owned()));
                     if let Some(goal) = queue_goal {
                         if goal != cell {
                             goals.insert(bot.id.clone(), goal);
@@ -470,19 +466,17 @@ impl Policy {
             }
         }
 
-        let (ordering_sequence, ordering_scores, ordering_ranks) = compute_ordering_sequence(
+        let (ordering_sequence, ordering_scores, ordering_ranks) =
+            compute_ordering_sequence(state, map, &dist, &goals, &team_ctx, &self.memory, mode);
+
+        let plan_result = self.planner.plan(
             state,
             map,
             &dist,
             &goals,
-            &team_ctx,
-            &self.memory,
-            mode,
+            &team_ctx.movement,
+            &ordering_sequence,
         );
-
-        let plan_result = self
-            .planner
-            .plan(state, map, &dist, &goals, &team_ctx.movement, &ordering_sequence);
         let mut planned = plan_result.actions;
         for (bot_id, action) in immediate {
             planned.insert(bot_id, action);
@@ -522,9 +516,8 @@ impl Policy {
             state_entry.escape_macro_ticks_remaining =
                 mem.map(|m| m.escape_macro_ticks_remaining).unwrap_or(0);
             state_entry.escape_macro_active = state_entry.escape_macro_ticks_remaining > 0;
-            state_entry.constraint_relax_ticks_remaining = mem
-                .map(|m| m.constraint_relax_ticks_remaining)
-                .unwrap_or(0);
+            state_entry.constraint_relax_ticks_remaining =
+                mem.map(|m| m.constraint_relax_ticks_remaining).unwrap_or(0);
         }
 
         let wait_reason_by_bot = state
@@ -654,6 +647,21 @@ impl Policy {
                 )
             })
             .collect::<serde_json::Map<_, _>>();
+        let blocked_ticks_by_bot = state
+            .bots
+            .iter()
+            .map(|bot| {
+                let blocked = self
+                    .memory
+                    .get(&bot.id)
+                    .map(|m| m.blocked_ticks)
+                    .unwrap_or(0);
+                (
+                    bot.id.clone(),
+                    serde_json::Value::Number(serde_json::Number::from(blocked as i64)),
+                )
+            })
+            .collect::<serde_json::Map<_, _>>();
         for bot in &state.bots {
             dropoff_target_status_by_bot
                 .entry(bot.id.clone())
@@ -662,7 +670,10 @@ impl Policy {
 
         let mut telemetry = team_ctx.telemetry(map);
         if let Some(obj) = telemetry.as_object_mut() {
-            obj.insert("selected_intents".to_owned(), serde_json::Value::Object(intent_labels));
+            obj.insert(
+                "selected_intents".to_owned(),
+                serde_json::Value::Object(intent_labels),
+            );
             obj.insert(
                 "wait_reason_by_bot".to_owned(),
                 serde_json::Value::Object(wait_reason_by_bot),
@@ -736,6 +747,14 @@ impl Policy {
                 "ordering_score_by_bot".to_owned(),
                 serde_json::Value::Object(ordering_score_by_bot),
             );
+            obj.insert(
+                "blocked_ticks_by_bot".to_owned(),
+                serde_json::Value::Object(blocked_ticks_by_bot),
+            );
+            obj.insert(
+                "assign_ms".to_owned(),
+                serde_json::Value::Number(serde_json::Number::from(0)),
+            );
         }
         self.last_team_telemetry = telemetry;
 
@@ -769,7 +788,8 @@ impl Policy {
         for bot in &state.bots {
             let cell = map.idx(bot.x, bot.y).unwrap_or(0);
             let mem = self.memory.entry(bot.id.clone()).or_default();
-            mem.constraint_relax_ticks_remaining = mem.constraint_relax_ticks_remaining.saturating_sub(1);
+            mem.constraint_relax_ticks_remaining =
+                mem.constraint_relax_ticks_remaining.saturating_sub(1);
             mem.escape_macro_ticks_remaining = mem.escape_macro_ticks_remaining.saturating_sub(1);
             mem.dropoff_watchdog_triggered = false;
             if mem.escape_macro_ticks_remaining == 0 {
@@ -815,7 +835,8 @@ impl Policy {
             }
 
             mem.failed_move_history.retain(|_, count| *count > 0);
-            mem.repeated_failed_moves = mem.failed_move_history.values().copied().max().unwrap_or(0);
+            mem.repeated_failed_moves =
+                mem.failed_move_history.values().copied().max().unwrap_or(0);
             mem.prev_cell = Some(cell);
             mem.prev_carrying = bot.carrying.clone();
         }
@@ -838,7 +859,9 @@ impl Policy {
     }
 }
 
-fn build_prohibited_move_map(memory: &HashMap<String, BotMemory>) -> HashMap<String, Vec<BlockedMove>> {
+fn build_prohibited_move_map(
+    memory: &HashMap<String, BotMemory>,
+) -> HashMap<String, Vec<BlockedMove>> {
     let mut out = HashMap::new();
     for (bot_id, mem) in memory {
         let mut entries = mem
@@ -1283,11 +1306,7 @@ fn dropoff_watchdog_ban_ticks() -> u8 {
     8
 }
 
-fn should_trigger_dropoff_watchdog(
-    in_progress: bool,
-    carrying_required: bool,
-    streak: u8,
-) -> bool {
+fn should_trigger_dropoff_watchdog(in_progress: bool, carrying_required: bool, streak: u8) -> bool {
     !in_progress || !carrying_required || streak >= dropoff_watchdog_streak()
 }
 

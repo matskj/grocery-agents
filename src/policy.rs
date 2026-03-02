@@ -1,4 +1,4 @@
-use crate::model::{Action, GameState};
+use crate::model::{Action, BotState, GameState};
 
 #[derive(Debug, Default)]
 pub struct Policy;
@@ -8,7 +8,7 @@ impl Policy {
         Self
     }
 
-    pub fn decide(&self, _state: &GameState) -> Action {
-        Action::idle()
+    pub fn decide(&self, _state: &GameState, bot: &BotState) -> Action {
+        Action::wait(bot.id.clone())
     }
 }

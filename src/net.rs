@@ -39,7 +39,7 @@ pub async fn connect(token: &str) -> Result<WsStream, tungstenite::Error> {
 
 pub async fn run_game_loop(
     ctx: RuntimeContext,
-    policy: Policy,
+    mut policy: Policy,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut socket = connect(&ctx.token).await?;
     let dispatcher = Dispatcher::new();
@@ -62,7 +62,7 @@ pub async fn run_game_loop(
                     | ServerMessage::GameState(game_state) => {
                         let planned = timeout(
                             ROUND_PLANNING_BUDGET,
-                            plan_round_actions(&policy, &dispatcher, &game_state),
+                            plan_round_actions(&mut policy, &dispatcher, &game_state),
                         )
                         .await
                         .unwrap_or_else(|_| {
@@ -109,16 +109,17 @@ pub async fn run_game_loop(
 }
 
 async fn plan_round_actions(
-    policy: &Policy,
+    policy: &mut Policy,
     dispatcher: &Dispatcher,
     state: &GameState,
 ) -> Vec<Action> {
+    let proposed = policy.decide_round(state);
     state
         .bots
         .iter()
-        .map(|bot| {
-            let proposed = policy.decide(state, bot);
-            let dispatched = dispatcher.dispatch(proposed);
+        .zip(proposed.into_iter())
+        .map(|(bot, action)| {
+            let dispatched = dispatcher.dispatch(action);
             validate_action(dispatched, state, bot)
         })
         .collect()

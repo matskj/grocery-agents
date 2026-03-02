@@ -154,7 +154,10 @@ impl AssignmentEngine {
                         adjusted -= 50;
                     }
                     if !carrying_active && matches!(task.kind, TaskKind::PickupStand) {
-                        adjusted -= 30;
+                        adjusted -= if task.target_cell == bot_cell { 0 } else { 30 };
+                    }
+                    if matches!(task.kind, TaskKind::ImmediatePickup) {
+                        adjusted -= 80;
                     }
                     if matches!(role, BotRole::LeadCourier | BotRole::QueueCourier)
                         && matches!(task.intent, Intent::MoveTo { .. })
@@ -192,6 +195,7 @@ impl AssignmentEngine {
             .collect::<HashMap<_, _>>();
         let mut bot_taken = HashSet::<String>::new();
         let mut task_taken = HashSet::<usize>::new();
+        let mut target_cell_taken = HashSet::<u16>::new();
         let mut assigned = HashMap::<String, Intent>::new();
         for edge in &all_edges {
             if bot_taken.contains(&edge.bot_id) {
@@ -203,9 +207,13 @@ impl AssignmentEngine {
             if !task.shareable && task_taken.contains(&edge.task_id) {
                 continue;
             }
+            if !task.shareable && target_cell_taken.contains(&task.target_cell) {
+                continue;
+            }
             bot_taken.insert(edge.bot_id.clone());
             if !task.shareable {
                 task_taken.insert(edge.task_id);
+                target_cell_taken.insert(task.target_cell);
             }
             assigned.insert(edge.bot_id.clone(), task.intent.clone());
         }
@@ -419,7 +427,9 @@ fn task_cost(
             let d = f64::from(dist_to(bot_cell, task.target_cell, dist));
             let density = local_density(task.target_cell, state) as f64;
             let choke = choke_penalty(task.target_cell, map) as f64;
-            (d + lambda_density * density + lambda_choke * choke).round() as i32
+            let already_on_stand_penalty = if bot_cell == task.target_cell { 40.0 } else { 0.0 };
+            (d + lambda_density * density + lambda_choke * choke + already_on_stand_penalty)
+                .round() as i32
         }
         TaskKind::ImmediatePickup => {
             if bot_cell != task.target_cell {

@@ -1765,7 +1765,11 @@ fn assignment_guard_reason(
     if carrying_dropoff_seek_count == 0 && empty_dropoff_seek_count >= crowd_threshold {
         return Some("empty_dropoff_cluster");
     }
-    if empty_capacity_bots > 0 && pickup_progress_intents == 0 && ticks_since_pickup >= 8 {
+    if empty_capacity_bots > 0
+        && pickup_progress_intents == 0
+        && stand_move_intents == 0
+        && ticks_since_pickup >= 8
+    {
         return Some("no_pickup_progress");
     }
     if pickup_progress_intents == 0
@@ -2287,6 +2291,79 @@ mod tests {
         ];
         let reason = assignment_guard_reason(&state, map, &ctx, &intents, 0, 0, 8);
         assert_eq!(reason, Some("empty_dropoff_cluster"));
+    }
+
+    #[test]
+    fn assignment_guard_does_not_trigger_when_bots_are_stand_seeking() {
+        let state = GameState {
+            grid: Grid {
+                width: 8,
+                height: 6,
+                drop_off_tiles: vec![[1, 4]],
+                ..Grid::default()
+            },
+            bots: vec![
+                BotState {
+                    id: "0".to_owned(),
+                    x: 6,
+                    y: 4,
+                    carrying: vec![],
+                    capacity: 3,
+                },
+                BotState {
+                    id: "1".to_owned(),
+                    x: 6,
+                    y: 4,
+                    carrying: vec![],
+                    capacity: 3,
+                },
+            ],
+            items: vec![Item {
+                id: "item_1".to_owned(),
+                kind: "milk".to_owned(),
+                x: 5,
+                y: 3,
+            }],
+            orders: vec![Order {
+                id: "o1".to_owned(),
+                item_id: "milk".to_owned(),
+                status: OrderStatus::InProgress,
+            }],
+            ..GameState::default()
+        };
+        let world = World::new(state.clone());
+        let map = world.map();
+        let dist = DistanceMap::build(map);
+        let ctx = TeamContext::build(
+            &state,
+            map,
+            &dist,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            TeamContextConfig::default(),
+        );
+        let stand = map.idx(5, 2).expect("stand");
+        let intents = vec![
+            BotIntent {
+                bot_id: "0".to_owned(),
+                intent: Intent::MoveTo { cell: stand },
+            },
+            BotIntent {
+                bot_id: "1".to_owned(),
+                intent: Intent::MoveTo { cell: stand },
+            },
+        ];
+        let reason = assignment_guard_reason(&state, map, &ctx, &intents, 20, 20, 3);
+        assert_ne!(reason, Some("no_pickup_progress"));
     }
 
     #[test]

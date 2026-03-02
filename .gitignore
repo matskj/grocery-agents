@@ -1,0 +1,11 @@
+target/
+logs/
+data/
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+models/metrics-*.json
+models/batch_state.json
+.DS_Store
+Thumbs.db

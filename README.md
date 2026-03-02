@@ -2,10 +2,118 @@
 
 A Rust bot client for the Norwegian AI Championship warm-up grocery game.
 
+## Prerequisites
+
+- Rust toolchain (install with rustup): https://rustup.rs/
+- `cargo` available on your `PATH`
+- Python 3.10+ (for offline training pipeline)
+
+Quick verify:
+
+```bash
+cargo --version
+rustc --version
+```
+
+### Windows setup notes (PowerShell)
+
+If `cargo`/`rustc` are not found after install, close and reopen PowerShell.
+
+Install required tooling:
+
+```powershell
+winget install -e --id Rustlang.Rustup --source winget --accept-source-agreements --accept-package-agreements
+winget install -e --id Microsoft.VisualStudio.2022.BuildTools --source winget --accept-source-agreements --accept-package-agreements --override "--quiet --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"
+```
+
+On Windows ARM64, use the x64 Rust toolchain for this repo:
+
+```powershell
+rustup toolchain install stable-x86_64-pc-windows-msvc --force-non-host
+rustup target add x86_64-pc-windows-msvc
+```
+
 ## Build and run
 
 ```bash
 RUST_LOG=info cargo run -- --token <jwt>
+```
+
+You can also paste the full websocket URL directly (token auto-extracted):
+
+```bash
+cargo run -- 'wss://game.ainm.no/ws?token=eyJ...'
+```
+
+Windows ARM64 helper (uses VS `vcvars64` + x64 Rust toolchain):
+
+```powershell
+.\cargo-x64.cmd check --target x86_64-pc-windows-msvc
+.\cargo-x64.cmd run --target x86_64-pc-windows-msvc -- --token eyJ...
+.\cargo-x64.cmd run --target x86_64-pc-windows-msvc -- "wss://game.ainm.no/ws?token=eyJ..."
+```
+
+## Optional Python training setup
+
+Install offline training dependencies:
+
+```bash
+python -m pip install -r requirements.txt
+```
+
+## Local Replay UI
+
+You can inspect run behavior visually with a local browser replay tool.
+
+Start server:
+
+```bash
+python tools/replay_server.py --port 8085
+```
+
+Open:
+
+```text
+http://127.0.0.1:8085
+```
+
+Features:
+
+- run selector for `logs/run-*.jsonl`
+- board rendering with walls, shelf/item cells, dropoff tile, and bot positions
+- queue/ring overlays, conflict hotspots, failed-move arrows, and role badges (`L/Q/C/Y`)
+- tick playback controls (play/pause, prev/next, speed, slider)
+- live refresh while a run file is still being written
+- side panel with active/preview order counts, queue congestion metrics, and per-tick actions
+
+### Training-run wrapper (auto-starts UI)
+
+For training games, use the wrapper below so replay UI is always available:
+
+```powershell
+.\run-training.cmd -- "wss://game.ainm.no/ws?token=eyJ..."
+```
+
+Equivalent Python entrypoint:
+
+```powershell
+python tools/run_training_run.py -- "wss://game.ainm.no/ws?token=eyJ..."
+```
+
+This does two things each run:
+
+1. Ensures replay server is running on `http://127.0.0.1:8085`
+2. Starts bot run via `cargo-x64.cmd run --target x86_64-pc-windows-msvc`
+3. Triggers batch retraining whenever at least 10 new completed runs are available
+
+Optional flags:
+
+```powershell
+# disable post-run batch retraining for a single run
+python tools/run_training_run.py --no-batch-train -- "wss://game.ainm.no/ws?token=eyJ..."
+
+# custom batch size / mode subset
+python tools/run_training_run.py --batch-size 10 --train-modes "easy,expert" -- "wss://game.ainm.no/ws?token=eyJ..."
 ```
 
 ### Token input behavior (CLI + env fallback)
@@ -14,7 +122,8 @@ The token is configured with Clap as `--token` plus an environment fallback:
 
 - `--token <jwt>` has highest precedence.
 - If `--token` is omitted, `GROCERY_TOKEN` is used.
-- If neither is provided, startup fails with a CLI argument error.
+- If still missing, token can be read from a full websocket URL passed as positional argument or `--ws-url`.
+- If no token source is provided, startup fails with a CLI argument error.
 
 Examples:
 
@@ -25,6 +134,19 @@ RUST_LOG=info cargo run -- --token eyJ...
 # Environment fallback
 export GROCERY_TOKEN=eyJ...
 RUST_LOG=info cargo run
+```
+
+PowerShell equivalents:
+
+```powershell
+# Explicit CLI token
+$env:RUST_LOG="info"
+cargo run -- --token eyJ...
+
+# Environment fallback
+$env:GROCERY_TOKEN="eyJ..."
+$env:RUST_LOG="info"
+cargo run
 ```
 
 ## Runtime message flow and timeout strategy
@@ -38,6 +160,28 @@ RUST_LOG=info cargo run
    - Send one `ActionEnvelope` back to server.
 4. On `game_over`, log final score/reason and exit loop.
 
+### Per-run game logs (JSONL)
+
+The client writes a run log automatically to `logs/run-<timestamp>.jsonl`.
+
+Each line is a JSON event with top-level `schema_version` and `run_id`, including:
+
+- `session_start` (ws url preview + metadata)
+- `game_mode` (detected mode label + bots/grid dimensions)
+- `tick` (full `game_state`, chosen `actions`, team summary, and `tick_outcome`)
+- `tick_outcome` (`delta_score`, `items_delivered_delta`, `order_completed_delta`, `invalid_action_count`)
+- `game_over` (final score + reason)
+
+`team_summary` now also includes coordination telemetry (queue role/slot/distance by bot, queue violations,
+near-dropoff blocking flags, repeated failed-move counts, conflict degrees/hotspots, and failed-move arrows).
+
+You can override the output directory with `GAME_LOG_DIR`:
+
+```powershell
+$env:GAME_LOG_DIR="my-logs"
+.\cargo-x64.cmd run --target x86_64-pc-windows-msvc -- --token eyJ...
+```
+
 ### Planning timeout strategy
 
 Per tick, round planning runs under a fixed budget (`1400ms`). If planning times out:
@@ -45,6 +189,27 @@ Per tick, round planning runs under a fixed budget (`1400ms`). If planning times
 - The client logs a warning.
 - It emits a full fallback envelope where every bot executes `wait`.
 - Normal planning resumes on the next received tick.
+
+## Training pipeline (per-mode specialists)
+
+The repository includes a Python pipeline under `training/` for log-based training:
+
+```bash
+python -m training.extract --logs-dir logs --out data/runs.parquet
+python -m training.featurize --data data/runs.parquet --out data/runs_features.parquet --n-step 5
+python -m training.train --mode medium --data data/runs_features.parquet --out models/medium.json
+python -m training.evaluate --data data/runs_features.parquet --model models/medium.json
+python -m training.export --models-dir models --out models/policy_artifacts.json
+python -m training.batch_train --logs-dir logs --models-dir models --batch-size 10
+```
+
+Train one model per mode (`easy`, `medium`, `hard`, `expert`) and export a combined artifact.
+
+At runtime, the Rust bot can consume that artifact by setting:
+
+```bash
+POLICY_ARTIFACT_PATH=models/policy_artifacts.json
+```
 
 ## Architecture by module
 
@@ -54,6 +219,7 @@ Per tick, round planning runs under a fixed budget (`1400ms`). If planning times
 - `dispatcher`: Converts state into per-bot intents (pickup/dropoff/move/wait).
 - `motion`: Time-expanded path planning with reservation tables to avoid conflicts.
 - `policy`: High-level round decision logic that combines dispatcher + motion and short-term bot memory.
+- `team_context`: Shared per-tick blackboard (roles, strict queue lanes, conflict/deadlock context, movement reservations).
 - `net`: Websocket networking loop, message parsing, timeout enforcement, action validation.
 
 ## Debug logging toggle
@@ -70,6 +236,12 @@ When enabled, logs include:
 - congestion/jam detection (blocked bot memory and drop-off crowding)
 - evacuation trigger events
 - fallback/time-budget events (timeout fallback, validation fallback-to-wait)
+
+Coordination knobs:
+
+- `QUEUE_STRICT_MODE=1` (default on in medium/hard/expert)
+- `QUEUE_MAX_RING_ENTRANTS=1` (strict queue default)
+- `DEADLOCK_ESCAPE_TICKS=3`
 
 ## Safety fallback behavior (`wait`)
 

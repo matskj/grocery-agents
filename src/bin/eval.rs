@@ -50,6 +50,9 @@ struct EpisodeMetrics {
     dropoffs: u64,
     blocked_events: u64,
     near_dropoff_congestion_events: u64,
+    assignment_ms_sum: u64,
+    assignment_ticks: u64,
+    repeated_goal_concentration: f64,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -122,6 +125,7 @@ fn apply_profile_env(cmd: &mut Command, profile: EvalProfile) {
             cmd.env("GROCERY_PLANNER_SOFT_BUDGET_MS", "900");
             cmd.env("GROCERY_DROPOFF_WINDOW", "10");
             cmd.env("GROCERY_ASSIGNMENT_ENABLED", "true");
+            cmd.env("GROCERY_ASSIGNMENT_MODE", "legacy-only");
             cmd.env("GROCERY_DROPOFF_SCHEDULING_ENABLED", "true");
         }
         EvalProfile::Aggressive => {
@@ -130,9 +134,13 @@ fn apply_profile_env(cmd: &mut Command, profile: EvalProfile) {
             cmd.env("GROCERY_PLANNER_SOFT_BUDGET_MS", "1300");
             cmd.env("GROCERY_DROPOFF_WINDOW", "16");
             cmd.env("GROCERY_ASSIGNMENT_ENABLED", "true");
+            cmd.env("GROCERY_ASSIGNMENT_MODE", "global-only");
             cmd.env("GROCERY_DROPOFF_SCHEDULING_ENABLED", "true");
         }
-        EvalProfile::Default => {}
+        EvalProfile::Default => {
+            cmd.env("GROCERY_ASSIGNMENT_ENABLED", "true");
+            cmd.env("GROCERY_ASSIGNMENT_MODE", "hybrid");
+        }
     }
 }
 
@@ -230,6 +238,8 @@ fn parse_metrics(path: &Path) -> Result<EpisodeMetrics, Box<dyn std::error::Erro
         run_file: file_name,
         ..EpisodeMetrics::default()
     };
+    let mut goal_counts = HashMap::<(i64, i64), u64>::new();
+    let mut total_goal_observations = 0u64;
     for line in content.lines() {
         if line.trim().is_empty() {
             continue;
@@ -277,6 +287,36 @@ fn parse_metrics(path: &Path) -> Result<EpisodeMetrics, Box<dyn std::error::Erro
                 .and_then(Value::as_u64)
                 .unwrap_or(0);
             metrics.blocked_events = metrics.blocked_events.saturating_add(blocked);
+            if let Some(assign_ms) = data
+                .get("team_summary")
+                .and_then(|s| s.get("assign_ms"))
+                .and_then(Value::as_u64)
+            {
+                metrics.assignment_ms_sum = metrics.assignment_ms_sum.saturating_add(assign_ms);
+                metrics.assignment_ticks = metrics.assignment_ticks.saturating_add(1);
+            }
+            if let Some(goal_map) = data
+                .get("team_summary")
+                .and_then(|s| s.get("goal_cell_by_bot"))
+                .and_then(Value::as_object)
+            {
+                for value in goal_map.values() {
+                    let Some(arr) = value.as_array() else {
+                        continue;
+                    };
+                    if arr.len() != 2 {
+                        continue;
+                    }
+                    let Some(x) = arr[0].as_i64() else {
+                        continue;
+                    };
+                    let Some(y) = arr[1].as_i64() else {
+                        continue;
+                    };
+                    *goal_counts.entry((x, y)).or_insert(0) += 1;
+                    total_goal_observations = total_goal_observations.saturating_add(1);
+                }
+            }
             let congestion = data
                 .get("team_summary")
                 .and_then(|s| s.get("dropoff_congestion"))
@@ -287,6 +327,10 @@ fn parse_metrics(path: &Path) -> Result<EpisodeMetrics, Box<dyn std::error::Erro
                     metrics.near_dropoff_congestion_events.saturating_add(1);
             }
         }
+    }
+    if total_goal_observations > 0 {
+        let max_goal = goal_counts.values().copied().max().unwrap_or(0);
+        metrics.repeated_goal_concentration = max_goal as f64 / total_goal_observations as f64;
     }
     Ok(metrics)
 }
@@ -305,6 +349,9 @@ fn print_summary(metrics: &[EpisodeMetrics]) {
         acc.dropoffs += item.dropoffs;
         acc.blocked_events += item.blocked_events;
         acc.near_dropoff_congestion_events += item.near_dropoff_congestion_events;
+        acc.assignment_ms_sum += item.assignment_ms_sum;
+        acc.assignment_ticks += item.assignment_ticks;
+        acc.repeated_goal_concentration += item.repeated_goal_concentration;
         acc
     });
     let total_actions = totals.waits + totals.moves + totals.pickups + totals.dropoffs;
@@ -323,6 +370,16 @@ fn print_summary(metrics: &[EpisodeMetrics]) {
     println!(
         "blocked_events={} near_dropoff_congestion_events={}",
         totals.blocked_events, totals.near_dropoff_congestion_events
+    );
+    let avg_assign_ms = if totals.assignment_ticks == 0 {
+        0.0
+    } else {
+        totals.assignment_ms_sum as f64 / totals.assignment_ticks as f64
+    };
+    let avg_goal_concentration = totals.repeated_goal_concentration / metrics.len() as f64;
+    println!(
+        "avg_assign_ms={:.2} repeated_goal_concentration={:.3}",
+        avg_assign_ms, avg_goal_concentration
     );
 }
 

@@ -8,7 +8,7 @@ use tracing::info;
 
 use crate::{
     assign::AssignmentEngine,
-    config::Config,
+    config::{AssignmentMode, Config},
     dispatcher::{BotIntent, Dispatcher, Intent},
     dist::DistanceMap,
     model::{Action, GameState},
@@ -48,6 +48,11 @@ pub struct Policy {
     memory: HashMap<String, BotMemory>,
     sticky_roles: HashMap<String, StickyQueueRole>,
     last_team_telemetry: serde_json::Value,
+    ticks_since_pickup: u16,
+    ticks_since_dropoff: u16,
+    recent_goal_cells: VecDeque<u16>,
+    global_no_progress_streak: u8,
+    forced_legacy_ticks_remaining: u8,
 }
 
 impl Policy {
@@ -60,6 +65,11 @@ impl Policy {
             memory: HashMap::new(),
             sticky_roles: HashMap::new(),
             last_team_telemetry: serde_json::json!({}),
+            ticks_since_pickup: 0,
+            ticks_since_dropoff: 0,
+            recent_goal_cells: VecDeque::new(),
+            global_no_progress_streak: 0,
+            forced_legacy_ticks_remaining: 0,
         }
     }
 
@@ -69,6 +79,13 @@ impl Policy {
         let map = world.map();
         let dist = DistanceMap::build(map);
         let active_items = active_item_set(state);
+        let (pickup_events, dropoff_events) = self.detect_inventory_events(state);
+        self.update_progress_watchdog(pickup_events, dropoff_events);
+        let forced_legacy_active = self.forced_legacy_ticks_remaining > 0;
+        if forced_legacy_active {
+            self.forced_legacy_ticks_remaining =
+                self.forced_legacy_ticks_remaining.saturating_sub(1);
+        }
 
         self.update_memory(state, map);
         let blocked_snapshot = self
@@ -205,10 +222,23 @@ impl Policy {
         let mut assignment_source = "legacy_dispatcher";
         let mut assignment_task_count = 0usize;
         let mut assignment_edge_count = 0usize;
+        let mut assignment_active_task_count = 0usize;
+        let mut assignment_preview_task_count = 0usize;
+        let mut assignment_stand_task_count = 0usize;
+        let mut assignment_dropoff_task_count = 0usize;
         let mut assignment_guard_trigger_reason: Option<&'static str> = None;
-        let intents = if self.config.assignment_enabled {
+        let assignment_mode = if self.config.assignment_enabled {
+            self.config.assignment_mode
+        } else {
+            AssignmentMode::LegacyOnly
+        };
+        let global_result = if matches!(assignment_mode, AssignmentMode::LegacyOnly)
+            || forced_legacy_active
+        {
+            None
+        } else {
             let remaining = soft_budget.saturating_sub(tick_started.elapsed());
-            match self.assigner.build_intents(
+            self.assigner.build_intents(
                 state,
                 map,
                 &dist,
@@ -217,29 +247,99 @@ impl Policy {
                 self.config.lambda_density,
                 self.config.lambda_choke,
                 remaining,
-            ) {
-                Some(result) => {
-                    if let Some(reason) =
-                        assignment_guard_reason(state, map, &team_ctx, &result.intents)
-                    {
-                        assignment_guard_trigger_reason = Some(reason);
-                        assignment_source = "legacy_dispatcher_guard";
-                        self.dispatcher
-                            .build_intents(state, map, &dist, &blocked_snapshot, &team_ctx)
+            )
+        };
+        let legacy_intents =
+            self.dispatcher
+                .build_intents(state, map, &dist, &blocked_snapshot, &team_ctx);
+
+        if let Some(result) = &global_result {
+            assignment_task_count = result.task_count;
+            assignment_edge_count = result.edge_count;
+            assignment_active_task_count = result.active_task_count;
+            assignment_preview_task_count = result.preview_task_count;
+            assignment_stand_task_count = result.stand_task_count;
+            assignment_dropoff_task_count = result.dropoff_task_count;
+        }
+
+        let mut intents = if forced_legacy_active {
+            assignment_source = "legacy_forced_watchdog";
+            legacy_intents.clone()
+        } else {
+            match assignment_mode {
+                AssignmentMode::LegacyOnly => {
+                    assignment_source = "legacy_dispatcher";
+                    legacy_intents.clone()
+                }
+                AssignmentMode::GlobalOnly => {
+                    if let Some(result) = global_result {
+                        if let Some(reason) = assignment_guard_reason(
+                            state,
+                            map,
+                            &team_ctx,
+                            &result.intents,
+                            self.ticks_since_pickup,
+                            self.ticks_since_dropoff,
+                            self.unique_goal_cells_recent(),
+                        ) {
+                            assignment_guard_trigger_reason = Some(reason);
+                            assignment_source = "legacy_dispatcher_guard";
+                            legacy_intents.clone()
+                        } else {
+                            assignment_source = "global_assignment";
+                            result.intents
+                        }
                     } else {
-                        assignment_source = "global_assignment";
-                        assignment_task_count = result.task_count;
-                        assignment_edge_count = result.edge_count;
-                        result.intents
+                        assignment_source = "legacy_dispatcher_timeout_fallback";
+                        assignment_guard_trigger_reason = Some("global_timeout_fallback");
+                        legacy_intents.clone()
                     }
                 }
-                None => self
-                    .dispatcher
-                    .build_intents(state, map, &dist, &blocked_snapshot, &team_ctx),
+                AssignmentMode::Hybrid => {
+                    if let Some(result) = global_result {
+                        if let Some(reason) = assignment_guard_reason(
+                            state,
+                            map,
+                            &team_ctx,
+                            &result.intents,
+                            self.ticks_since_pickup,
+                            self.ticks_since_dropoff,
+                            self.unique_goal_cells_recent(),
+                        ) {
+                            assignment_guard_trigger_reason = Some(reason);
+                            assignment_source = "legacy_dispatcher_guard";
+                            legacy_intents.clone()
+                        } else {
+                            assignment_source = "hybrid_assignment";
+                            merge_hybrid_intents(state, &team_ctx, result.intents, &legacy_intents)
+                        }
+                    } else {
+                        assignment_source = "legacy_dispatcher_timeout_fallback";
+                        assignment_guard_trigger_reason = Some("global_timeout_fallback");
+                        legacy_intents.clone()
+                    }
+                }
+            }
+        };
+        if assignment_source == "global_assignment" || assignment_source == "hybrid_assignment" {
+            if should_trigger_assignment_move_loop_watchdog(
+                &intents,
+                self.ticks_since_pickup,
+                self.ticks_since_dropoff,
+            ) {
+                self.global_no_progress_streak = self.global_no_progress_streak.saturating_add(1);
+            } else {
+                self.global_no_progress_streak = 0;
+            }
+            if self.global_no_progress_streak >= assignment_no_progress_trigger_ticks() {
+                self.global_no_progress_streak = 0;
+                self.forced_legacy_ticks_remaining = assignment_forced_legacy_ticks();
+                intents = legacy_intents.clone();
+                assignment_source = "legacy_forced_watchdog_trigger";
+                assignment_guard_trigger_reason = Some("global_move_loop_watchdog");
             }
         } else {
-            self.dispatcher
-                .build_intents(state, map, &dist, &blocked_snapshot, &team_ctx)
+            self.global_no_progress_streak = 0;
         };
         let assign_ms = assign_started.elapsed().as_millis() as u64;
         let mut goals = HashMap::new();
@@ -462,8 +562,14 @@ impl Policy {
                 Intent::MoveTo { cell: mut goal } => {
                     dropoff_target_status_by_bot
                         .insert(bot.id.clone(), serde_json::Value::String("none".to_owned()));
+                    let carrying_active = bot
+                        .carrying
+                        .iter()
+                        .any(|item| active_items.contains(item.as_str()));
                     if let Some(queue_target) = queue_goal {
-                        if matches!(role, BotRole::LeadCourier | BotRole::QueueCourier) {
+                        if carrying_active
+                            && matches!(role, BotRole::LeadCourier | BotRole::QueueCourier)
+                        {
                             goal = queue_target;
                         }
                     }
@@ -474,10 +580,6 @@ impl Policy {
                             goal = escape;
                         }
                     }
-                    let carrying_active = bot
-                        .carrying
-                        .iter()
-                        .any(|item| active_items.contains(item.as_str()));
                     if self.config.dropoff_scheduling_enabled
                         && carrying_active
                         && map.dropoff_cells.contains(&goal)
@@ -615,6 +717,7 @@ impl Policy {
                 }
             }
         }
+        self.update_recent_goal_cells(&goals);
 
         let (ordering_sequence, ordering_scores, ordering_ranks) =
             compute_ordering_sequence(state, map, &dist, &goals, &team_ctx, &self.memory, mode);
@@ -943,6 +1046,17 @@ impl Policy {
                 serde_json::Value::String(assignment_source.to_owned()),
             );
             obj.insert(
+                "assignment_mode".to_owned(),
+                serde_json::Value::String(
+                    match assignment_mode {
+                        AssignmentMode::Hybrid => "hybrid",
+                        AssignmentMode::GlobalOnly => "global_only",
+                        AssignmentMode::LegacyOnly => "legacy_only",
+                    }
+                    .to_owned(),
+                ),
+            );
+            obj.insert(
                 "assignment_enabled".to_owned(),
                 serde_json::Value::Bool(self.config.assignment_enabled),
             );
@@ -953,6 +1067,30 @@ impl Policy {
             obj.insert(
                 "assignment_edge_count".to_owned(),
                 serde_json::Value::Number(serde_json::Number::from(assignment_edge_count as i64)),
+            );
+            obj.insert(
+                "assignment_active_task_count".to_owned(),
+                serde_json::Value::Number(serde_json::Number::from(
+                    assignment_active_task_count as i64
+                )),
+            );
+            obj.insert(
+                "assignment_preview_task_count".to_owned(),
+                serde_json::Value::Number(serde_json::Number::from(
+                    assignment_preview_task_count as i64
+                )),
+            );
+            obj.insert(
+                "assignment_stand_task_count".to_owned(),
+                serde_json::Value::Number(serde_json::Number::from(
+                    assignment_stand_task_count as i64
+                )),
+            );
+            obj.insert(
+                "assignment_dropoff_task_count".to_owned(),
+                serde_json::Value::Number(serde_json::Number::from(
+                    assignment_dropoff_task_count as i64
+                )),
             );
             obj.insert(
                 "assignment_guard_triggered".to_owned(),
@@ -975,6 +1113,32 @@ impl Policy {
             obj.insert(
                 "dropoff_staging_cell_by_bot".to_owned(),
                 serde_json::Value::Object(dropoff_staging_cell_by_bot),
+            );
+            obj.insert(
+                "ticks_since_pickup".to_owned(),
+                serde_json::Value::Number(serde_json::Number::from(self.ticks_since_pickup as i64)),
+            );
+            obj.insert(
+                "ticks_since_dropoff".to_owned(),
+                serde_json::Value::Number(serde_json::Number::from(self.ticks_since_dropoff as i64)),
+            );
+            obj.insert(
+                "unique_goal_cells_last_n".to_owned(),
+                serde_json::Value::Number(serde_json::Number::from(
+                    self.unique_goal_cells_recent() as i64
+                )),
+            );
+            obj.insert(
+                "forced_legacy_ticks_remaining".to_owned(),
+                serde_json::Value::Number(serde_json::Number::from(
+                    self.forced_legacy_ticks_remaining as i64
+                )),
+            );
+            obj.insert(
+                "global_no_progress_streak".to_owned(),
+                serde_json::Value::Number(serde_json::Number::from(
+                    self.global_no_progress_streak as i64
+                )),
             );
         }
         self.last_team_telemetry = telemetry;
@@ -1003,6 +1167,58 @@ impl Policy {
             }
         }
         heat
+    }
+
+    fn detect_inventory_events(&self, state: &GameState) -> (u16, u16) {
+        let mut pickups = 0u16;
+        let mut dropoffs = 0u16;
+        for bot in &state.bots {
+            let current = bot.carrying.len() as i32;
+            let previous = self
+                .memory
+                .get(&bot.id)
+                .map(|m| m.prev_carrying.len() as i32)
+                .unwrap_or(current);
+            if current > previous {
+                pickups = pickups.saturating_add((current - previous) as u16);
+            } else if previous > current {
+                dropoffs = dropoffs.saturating_add((previous - current) as u16);
+            }
+        }
+        (pickups, dropoffs)
+    }
+
+    fn update_progress_watchdog(&mut self, pickup_events: u16, dropoff_events: u16) {
+        if pickup_events > 0 {
+            self.ticks_since_pickup = 0;
+        } else {
+            self.ticks_since_pickup = self.ticks_since_pickup.saturating_add(1);
+        }
+        if dropoff_events > 0 {
+            self.ticks_since_dropoff = 0;
+        } else {
+            self.ticks_since_dropoff = self.ticks_since_dropoff.saturating_add(1);
+        }
+    }
+
+    fn update_recent_goal_cells(&mut self, goals: &HashMap<String, u16>) {
+        let mut cells = goals.values().copied().collect::<Vec<_>>();
+        cells.sort_unstable();
+        cells.dedup();
+        for cell in cells {
+            self.recent_goal_cells.push_back(cell);
+            while self.recent_goal_cells.len() > assignment_goal_history_window() {
+                self.recent_goal_cells.pop_front();
+            }
+        }
+    }
+
+    fn unique_goal_cells_recent(&self) -> usize {
+        self.recent_goal_cells
+            .iter()
+            .copied()
+            .collect::<HashSet<_>>()
+            .len()
     }
 
     fn update_memory(&mut self, state: &GameState, map: &crate::world::MapCache) {
@@ -1111,6 +1327,75 @@ fn active_item_set(state: &GameState) -> HashSet<&str> {
         .filter(|order| matches!(order.status, crate::model::OrderStatus::InProgress))
         .map(|order| order.item_id.as_str())
         .collect()
+}
+
+fn merge_hybrid_intents(
+    state: &GameState,
+    team_ctx: &TeamContext,
+    global: Vec<BotIntent>,
+    legacy: &[BotIntent],
+) -> Vec<BotIntent> {
+    let global_by_bot = global
+        .into_iter()
+        .map(|intent| (intent.bot_id.clone(), intent.intent))
+        .collect::<HashMap<_, _>>();
+    let legacy_by_bot = legacy
+        .iter()
+        .map(|intent| (intent.bot_id.clone(), intent.intent.clone()))
+        .collect::<HashMap<_, _>>();
+    let mut bots = state.bots.iter().collect::<Vec<_>>();
+    bots.sort_by(|a, b| a.id.cmp(&b.id));
+    bots.into_iter()
+        .map(|bot| {
+            let carrying_active = bot
+                .carrying
+                .iter()
+                .any(|item| team_ctx.active_order_items_set.contains(item));
+            let intent = if carrying_active {
+                global_by_bot
+                    .get(&bot.id)
+                    .cloned()
+                    .or_else(|| legacy_by_bot.get(&bot.id).cloned())
+                    .unwrap_or(Intent::Wait)
+            } else {
+                legacy_by_bot
+                    .get(&bot.id)
+                    .cloned()
+                    .or_else(|| global_by_bot.get(&bot.id).cloned())
+                    .unwrap_or(Intent::Wait)
+            };
+            BotIntent {
+                bot_id: bot.id.clone(),
+                intent,
+            }
+        })
+        .collect()
+}
+
+fn should_trigger_assignment_move_loop_watchdog(
+    intents: &[BotIntent],
+    ticks_since_pickup: u16,
+    ticks_since_dropoff: u16,
+) -> bool {
+    let considered = intents
+        .iter()
+        .filter(|entry| !matches!(entry.intent, Intent::Wait))
+        .count();
+    if considered == 0 {
+        return false;
+    }
+    let move_count = intents
+        .iter()
+        .filter(|entry| matches!(entry.intent, Intent::MoveTo { .. }))
+        .count();
+    let progress_count = intents
+        .iter()
+        .filter(|entry| matches!(entry.intent, Intent::PickUp { .. } | Intent::DropOff { .. }))
+        .count();
+    move_count * 100 >= considered * 80
+        && progress_count == 0
+        && ticks_since_pickup >= 10
+        && ticks_since_dropoff >= 14
 }
 
 fn nearest_junction(
@@ -1251,6 +1536,9 @@ fn assignment_guard_reason(
     map: &crate::world::MapCache,
     team: &TeamContext,
     intents: &[BotIntent],
+    ticks_since_pickup: u16,
+    ticks_since_dropoff: u16,
+    unique_goal_cells_last_n: usize,
 ) -> Option<&'static str> {
     let active_orders_exist = state
         .orders
@@ -1274,6 +1562,8 @@ fn assignment_guard_reason(
         .collect::<HashMap<_, _>>();
 
     let mut pickup_progress_intents = 0usize;
+    let mut dropoff_progress_intents = 0usize;
+    let mut stand_move_intents = 0usize;
     let mut empty_dropoff_seek_count = 0usize;
     let mut carrying_dropoff_seek_count = 0usize;
     for BotIntent { bot_id, intent } in intents {
@@ -1288,9 +1578,12 @@ fn assignment_guard_reason(
             Intent::PickUp { .. } => {
                 pickup_progress_intents += 1;
             }
+            Intent::DropOff { .. } => {
+                dropoff_progress_intents += 1;
+            }
             Intent::MoveTo { cell } => {
                 if stand_cells.contains(cell) {
-                    pickup_progress_intents += 1;
+                    stand_move_intents += 1;
                 }
                 if map.dropoff_cells.contains(cell) {
                     if carrying_active {
@@ -1300,7 +1593,7 @@ fn assignment_guard_reason(
                     }
                 }
             }
-            Intent::DropOff { .. } | Intent::Wait => {}
+            Intent::Wait => {}
         }
     }
 
@@ -1314,8 +1607,17 @@ fn assignment_guard_reason(
     if carrying_dropoff_seek_count == 0 && empty_dropoff_seek_count >= crowd_threshold {
         return Some("empty_dropoff_cluster");
     }
-    if empty_capacity_bots > 0 && pickup_progress_intents == 0 {
+    if empty_capacity_bots > 0 && pickup_progress_intents == 0 && ticks_since_pickup >= 8 {
         return Some("no_pickup_progress");
+    }
+    if pickup_progress_intents == 0
+        && dropoff_progress_intents == 0
+        && stand_move_intents > 0
+        && ticks_since_pickup >= 12
+        && ticks_since_dropoff >= 16
+        && unique_goal_cells_last_n <= 4
+    {
+        return Some("move_loop_no_conversion");
     }
     None
 }
@@ -1683,7 +1985,8 @@ mod tests {
     };
 
     use super::{
-        assignment_guard_reason, build_dropoff_staging_cells, pick_staging_cell,
+        assignment_guard_reason, build_dropoff_staging_cells, merge_hybrid_intents,
+        pick_staging_cell, should_trigger_assignment_move_loop_watchdog,
         should_trigger_dropoff_watchdog,
     };
 
@@ -1823,8 +2126,128 @@ mod tests {
                 intent: Intent::MoveTo { cell: drop },
             },
         ];
-        let reason = assignment_guard_reason(&state, map, &ctx, &intents);
+        let reason = assignment_guard_reason(&state, map, &ctx, &intents, 0, 0, 8);
         assert_eq!(reason, Some("empty_dropoff_cluster"));
+    }
+
+    #[test]
+    fn hybrid_merge_prefers_legacy_for_empty_and_global_for_carrier() {
+        let state = GameState {
+            grid: Grid {
+                width: 8,
+                height: 6,
+                drop_off_tiles: vec![[1, 4]],
+                ..Grid::default()
+            },
+            bots: vec![
+                BotState {
+                    id: "0".to_owned(),
+                    x: 5,
+                    y: 4,
+                    carrying: vec!["milk".to_owned()],
+                    capacity: 3,
+                },
+                BotState {
+                    id: "1".to_owned(),
+                    x: 6,
+                    y: 4,
+                    carrying: vec![],
+                    capacity: 3,
+                },
+            ],
+            items: vec![Item {
+                id: "item_1".to_owned(),
+                kind: "milk".to_owned(),
+                x: 4,
+                y: 3,
+            }],
+            orders: vec![Order {
+                id: "o1".to_owned(),
+                item_id: "milk".to_owned(),
+                status: OrderStatus::InProgress,
+            }],
+            ..GameState::default()
+        };
+        let world = World::new(state.clone());
+        let map = world.map();
+        let dist = DistanceMap::build(map);
+        let ctx = TeamContext::build(
+            &state,
+            map,
+            &dist,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            TeamContextConfig::default(),
+        );
+        let global = vec![
+            BotIntent {
+                bot_id: "0".to_owned(),
+                intent: Intent::MoveTo {
+                    cell: map.idx(1, 4).expect("dropoff"),
+                },
+            },
+            BotIntent {
+                bot_id: "1".to_owned(),
+                intent: Intent::MoveTo {
+                    cell: map.idx(1, 4).expect("dropoff"),
+                },
+            },
+        ];
+        let legacy = vec![
+            BotIntent {
+                bot_id: "0".to_owned(),
+                intent: Intent::Wait,
+            },
+            BotIntent {
+                bot_id: "1".to_owned(),
+                intent: Intent::MoveTo {
+                    cell: map.idx(5, 3).expect("stand"),
+                },
+            },
+        ];
+        let merged = merge_hybrid_intents(&state, &ctx, global, &legacy);
+        let by_bot = merged
+            .into_iter()
+            .map(|entry| (entry.bot_id, entry.intent))
+            .collect::<HashMap<_, _>>();
+        assert!(matches!(
+            by_bot.get("0"),
+            Some(Intent::MoveTo { cell }) if map.dropoff_cells.contains(cell)
+        ));
+        assert!(matches!(by_bot.get("1"), Some(Intent::MoveTo { .. })));
+        assert!(!matches!(
+            by_bot.get("1"),
+            Some(Intent::MoveTo { cell }) if map.dropoff_cells.contains(cell)
+        ));
+    }
+
+    #[test]
+    fn move_loop_watchdog_requires_conversion_stall() {
+        let intents = vec![
+            BotIntent {
+                bot_id: "0".to_owned(),
+                intent: Intent::MoveTo { cell: 10 },
+            },
+            BotIntent {
+                bot_id: "1".to_owned(),
+                intent: Intent::MoveTo { cell: 11 },
+            },
+            BotIntent {
+                bot_id: "2".to_owned(),
+                intent: Intent::Wait,
+            },
+        ];
+        assert!(should_trigger_assignment_move_loop_watchdog(&intents, 12, 20));
+        assert!(!should_trigger_assignment_move_loop_watchdog(&intents, 2, 20));
     }
 }
 
@@ -1837,6 +2260,18 @@ fn queue_max_ring_entrants() -> usize {
             .unwrap_or(1)
             .max(1)
     })
+}
+
+fn assignment_no_progress_trigger_ticks() -> u8 {
+    6
+}
+
+fn assignment_forced_legacy_ticks() -> u8 {
+    12
+}
+
+fn assignment_goal_history_window() -> usize {
+    96
 }
 
 fn deadlock_escape_ticks() -> u8 {

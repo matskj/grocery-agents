@@ -1,9 +1,11 @@
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use crate::dispatcher::{BotIntent, Intent};
 use crate::dist::DistanceMap;
-use crate::model::{GameState, OrderStatus};
+use crate::model::{BotState, GameState, OrderStatus};
+use crate::scoring::{maybe_score_pick, CandidateFeatures};
 use crate::team_context::{BotRole, TeamContext};
 use crate::world::MapCache;
 
@@ -12,6 +14,10 @@ pub struct AssignmentResult {
     pub intents: Vec<BotIntent>,
     pub task_count: usize,
     pub edge_count: usize,
+    pub active_task_count: usize,
+    pub preview_task_count: usize,
+    pub stand_task_count: usize,
+    pub dropoff_task_count: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -21,7 +27,23 @@ struct Task {
     target_cell: u16,
     shareable: bool,
     kind: TaskKind,
+    demand_tier: DemandTier,
+    nearest_drop_dist: u16,
     intent: Intent,
+}
+
+impl Task {
+    fn target_share_cap(&self, sparse_active_stands: bool) -> u8 {
+        if !self.shareable
+            && sparse_active_stands
+            && matches!(self.demand_tier, DemandTier::Active)
+            && matches!(self.kind, TaskKind::PickupStand | TaskKind::ImmediatePickup)
+        {
+            2
+        } else {
+            1
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,11 +55,25 @@ enum TaskKind {
     QueuePosition,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DemandTier {
+    None,
+    Active,
+    Preview,
+}
+
 #[derive(Debug, Clone)]
 struct Edge {
     bot_id: String,
     task_id: usize,
     cost: i32,
+}
+
+#[derive(Debug, Clone)]
+struct StandCandidate {
+    stand: u16,
+    item_id: String,
+    nearest_drop_dist: u16,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -74,11 +110,43 @@ impl AssignmentEngine {
                     .collect(),
                 task_count: 0,
                 edge_count: 0,
+                active_task_count: 0,
+                preview_task_count: 0,
+                stand_task_count: 0,
+                dropoff_task_count: 0,
             });
         }
 
+        let active_task_count = tasks
+            .iter()
+            .filter(|task| matches!(task.demand_tier, DemandTier::Active))
+            .count();
+        let preview_task_count = tasks
+            .iter()
+            .filter(|task| matches!(task.demand_tier, DemandTier::Preview))
+            .count();
+        let stand_task_count = tasks
+            .iter()
+            .filter(|task| {
+                matches!(task.kind, TaskKind::PickupStand | TaskKind::ImmediatePickup)
+            })
+            .count();
+        let dropoff_task_count = tasks
+            .iter()
+            .filter(|task| {
+                matches!(task.kind, TaskKind::ImmediateDropOff | TaskKind::CarryToDropoff)
+            })
+            .count();
+
         let mut bots = state.bots.iter().collect::<Vec<_>>();
         bots.sort_by(|a, b| a.id.cmp(&b.id));
+
+        let order_urgency = team
+            .order_snapshot
+            .active_remaining_by_item
+            .values()
+            .copied()
+            .sum::<u64>() as f64;
 
         let mut all_edges = Vec::<Edge>::new();
         for bot in &bots {
@@ -95,10 +163,29 @@ impl AssignmentEngine {
             let bot_has_capacity = bot.carrying.len() < bot.capacity;
             let role = team.role_for(&bot.id);
             let queue_goal = team.queue_goal_for(&bot.id);
+            let inventory_util = if bot.capacity == 0 {
+                0.0
+            } else {
+                bot.carrying.len() as f64 / bot.capacity as f64
+            };
+            let teammate_proximity = avg_teammate_distance(bot, &state.bots);
+            let local_congestion = team
+                .traffic
+                .local_conflict_count_by_bot
+                .get(&bot.id)
+                .copied()
+                .map(f64::from)
+                .unwrap_or(0.0);
+            let blocked_ticks = team
+                .bot_snapshot
+                .get(&bot.id)
+                .map(|snap| f64::from(snap.blocked_ticks))
+                .unwrap_or(0.0);
             let on_dropoff = map
                 .idx(bot.x, bot.y)
                 .map(|cell| map.dropoff_cells.contains(&cell))
                 .unwrap_or(false);
+
             let mut ranked = tasks
                 .iter()
                 .filter(|task| {
@@ -148,22 +235,44 @@ impl AssignmentEngine {
                     );
                     let mut adjusted = base;
                     if carrying_active && matches!(task.kind, TaskKind::CarryToDropoff) {
-                        adjusted -= 20;
+                        adjusted -= 30;
                     }
                     if matches!(task.kind, TaskKind::ImmediateDropOff) {
-                        adjusted -= 50;
+                        adjusted -= 80;
                     }
-                    if !carrying_active && matches!(task.kind, TaskKind::PickupStand) {
-                        adjusted -= if task.target_cell == bot_cell { 0 } else { 30 };
+                    if !carrying_active
+                        && matches!(task.kind, TaskKind::PickupStand)
+                        && matches!(task.demand_tier, DemandTier::Active)
+                    {
+                        adjusted -= 25;
                     }
                     if matches!(task.kind, TaskKind::ImmediatePickup) {
-                        adjusted -= 80;
+                        adjusted -= if matches!(task.demand_tier, DemandTier::Active) {
+                            110
+                        } else {
+                            55
+                        };
                     }
                     if matches!(role, BotRole::LeadCourier | BotRole::QueueCourier)
                         && matches!(task.intent, Intent::MoveTo { .. })
                         && queue_goal == Some(task.target_cell)
                     {
                         adjusted -= 15;
+                    }
+                    if matches!(task.kind, TaskKind::PickupStand | TaskKind::ImmediatePickup) {
+                        let dist_to_stand = f64::from(dist_to(bot_cell, task.target_cell, dist));
+                        let features = CandidateFeatures {
+                            dist_to_nearest_active_item: dist_to_stand,
+                            dist_to_dropoff: f64::from(task.nearest_drop_dist.min(64)),
+                            inventory_util,
+                            local_congestion,
+                            teammate_proximity,
+                            order_urgency,
+                            blocked_ticks,
+                        };
+                        let mode = team.mode.as_str();
+                        let model_score = maybe_score_pick(mode, features).unwrap_or(0.0);
+                        adjusted -= (model_score * 6.0).round() as i32;
                     }
                     (adjusted, task.task_id)
                 })
@@ -189,13 +298,24 @@ impl AssignmentEngine {
                 .then_with(|| a.task_id.cmp(&b.task_id))
         });
 
+        let active_stands = tasks
+            .iter()
+            .filter(|task| {
+                matches!(task.demand_tier, DemandTier::Active)
+                    && matches!(task.kind, TaskKind::PickupStand | TaskKind::ImmediatePickup)
+            })
+            .map(|task| task.target_cell)
+            .collect::<HashSet<_>>();
+        let sparse_active_stands = !active_stands.is_empty()
+            && active_stands.len() <= state.bots.len().saturating_add(1) / 2;
+
         let task_by_id = tasks
             .iter()
             .map(|task| (task.task_id, task.clone()))
             .collect::<HashMap<_, _>>();
         let mut bot_taken = HashSet::<String>::new();
         let mut task_taken = HashSet::<usize>::new();
-        let mut target_cell_taken = HashSet::<u16>::new();
+        let mut target_cell_taken = HashMap::<u16, u8>::new();
         let mut assigned = HashMap::<String, Intent>::new();
         for edge in &all_edges {
             if bot_taken.contains(&edge.bot_id) {
@@ -207,13 +327,18 @@ impl AssignmentEngine {
             if !task.shareable && task_taken.contains(&edge.task_id) {
                 continue;
             }
-            if !task.shareable && target_cell_taken.contains(&task.target_cell) {
-                continue;
+            if !task.shareable {
+                let used = target_cell_taken.get(&task.target_cell).copied().unwrap_or(0);
+                let cap = task.target_share_cap(sparse_active_stands);
+                if used >= cap {
+                    continue;
+                }
             }
             bot_taken.insert(edge.bot_id.clone());
             if !task.shareable {
                 task_taken.insert(edge.task_id);
-                target_cell_taken.insert(task.target_cell);
+                let used = target_cell_taken.get(&task.target_cell).copied().unwrap_or(0);
+                target_cell_taken.insert(task.target_cell, used.saturating_add(1));
             }
             assigned.insert(edge.bot_id.clone(), task.intent.clone());
         }
@@ -231,6 +356,10 @@ impl AssignmentEngine {
             intents,
             task_count: tasks.len(),
             edge_count: all_edges.len(),
+            active_task_count,
+            preview_task_count,
+            stand_task_count,
+            dropoff_task_count,
         })
     }
 }
@@ -286,6 +415,8 @@ fn build_tasks(
                     target_cell: map.idx(bot.x, bot.y).unwrap_or(0),
                     shareable: true,
                     kind: TaskKind::ImmediateDropOff,
+                    demand_tier: DemandTier::None,
+                    nearest_drop_dist: 0,
                     intent: Intent::DropOff {
                         order_id: order.id.clone(),
                     },
@@ -313,57 +444,91 @@ fn build_tasks(
                 target_cell: drop,
                 shareable: true,
                 kind: TaskKind::CarryToDropoff,
+                demand_tier: DemandTier::None,
+                nearest_drop_dist: 0,
                 intent: Intent::MoveTo { cell: drop },
             });
             next_id += 1;
         }
     }
 
-    let mut item_order = state.items.iter().collect::<Vec<_>>();
-    item_order.sort_by(|a, b| a.id.cmp(&b.id));
-    let mut active_slots_left = active_missing.clone();
-    let mut preview_slots_left = preview_missing.clone();
-    for item in item_order {
-        let active_left = active_slots_left.get(&item.kind).copied().unwrap_or(0);
-        let preview_left = preview_slots_left.get(&item.kind).copied().unwrap_or(0);
-        if active_left == 0 && preview_left == 0 {
+    let stand_pool = build_stand_pool(state, map, dist);
+
+    let mut active_kinds = active_missing.keys().cloned().collect::<Vec<_>>();
+    active_kinds.sort();
+    for kind in active_kinds {
+        let demand = active_missing.get(&kind).copied().unwrap_or(0);
+        if demand == 0 {
             continue;
         }
-        let tier = if active_left > 0 { 2 } else { 3 };
-        if active_left > 0 {
-            active_slots_left.insert(item.kind.clone(), active_left.saturating_sub(1));
-        } else {
-            preview_slots_left.insert(item.kind.clone(), preview_left.saturating_sub(1));
-        }
-        let mut stands = map.stand_cells_for_item(&item.id).to_vec();
-        stands.sort_unstable();
-        for stand in stands {
-            let nearest_drop = map
-                .dropoff_cells
-                .iter()
-                .copied()
-                .min_by_key(|drop| dist.dist(stand, *drop))
-                .unwrap_or(stand);
-            let intent = Intent::MoveTo { cell: stand };
+        let Some(pool) = stand_pool.get(&kind) else {
+            continue;
+        };
+        for candidate in pool {
             tasks.push(Task {
                 task_id: next_id,
-                sort_key: (tier, item.kind.clone(), stand),
-                target_cell: stand,
+                sort_key: (2, kind.clone(), candidate.stand),
+                target_cell: candidate.stand,
                 shareable: false,
                 kind: TaskKind::PickupStand,
-                intent,
+                demand_tier: DemandTier::Active,
+                nearest_drop_dist: candidate.nearest_drop_dist,
+                intent: Intent::MoveTo {
+                    cell: candidate.stand,
+                },
             });
             next_id += 1;
-            let pickup_intent = Intent::PickUp {
-                item_id: item.id.clone(),
-            };
             tasks.push(Task {
                 task_id: next_id,
-                sort_key: (tier, item.kind.clone(), nearest_drop),
-                target_cell: stand,
+                sort_key: (2, kind.clone(), candidate.stand),
+                target_cell: candidate.stand,
                 shareable: false,
                 kind: TaskKind::ImmediatePickup,
-                intent: pickup_intent,
+                demand_tier: DemandTier::Active,
+                nearest_drop_dist: candidate.nearest_drop_dist,
+                intent: Intent::PickUp {
+                    item_id: candidate.item_id.clone(),
+                },
+            });
+            next_id += 1;
+        }
+    }
+
+    let mut preview_kinds = preview_missing.keys().cloned().collect::<Vec<_>>();
+    preview_kinds.sort();
+    for kind in preview_kinds {
+        let demand = preview_missing.get(&kind).copied().unwrap_or(0);
+        if demand == 0 || active_missing.get(&kind).copied().unwrap_or(0) > 0 {
+            continue;
+        }
+        let Some(pool) = stand_pool.get(&kind) else {
+            continue;
+        };
+        for candidate in pool {
+            tasks.push(Task {
+                task_id: next_id,
+                sort_key: (3, kind.clone(), candidate.stand),
+                target_cell: candidate.stand,
+                shareable: false,
+                kind: TaskKind::PickupStand,
+                demand_tier: DemandTier::Preview,
+                nearest_drop_dist: candidate.nearest_drop_dist,
+                intent: Intent::MoveTo {
+                    cell: candidate.stand,
+                },
+            });
+            next_id += 1;
+            tasks.push(Task {
+                task_id: next_id,
+                sort_key: (3, kind.clone(), candidate.stand),
+                target_cell: candidate.stand,
+                shareable: false,
+                kind: TaskKind::ImmediatePickup,
+                demand_tier: DemandTier::Preview,
+                nearest_drop_dist: candidate.nearest_drop_dist,
+                intent: Intent::PickUp {
+                    item_id: candidate.item_id.clone(),
+                },
             });
             next_id += 1;
         }
@@ -385,6 +550,8 @@ fn build_tasks(
                     target_cell: goal,
                     shareable: true,
                     kind: TaskKind::QueuePosition,
+                    demand_tier: DemandTier::None,
+                    nearest_drop_dist: nearest_drop_dist(goal, map, dist),
                     intent: Intent::MoveTo { cell: goal },
                 });
                 next_id += 1;
@@ -395,6 +562,8 @@ fn build_tasks(
                     target_cell: drop,
                     shareable: true,
                     kind: TaskKind::QueuePosition,
+                    demand_tier: DemandTier::None,
+                    nearest_drop_dist: 0,
                     intent: Intent::MoveTo { cell: drop },
                 });
                 next_id += 1;
@@ -404,6 +573,45 @@ fn build_tasks(
 
     tasks.sort_by(|a, b| a.sort_key.cmp(&b.sort_key).then_with(|| a.task_id.cmp(&b.task_id)));
     Some(tasks)
+}
+
+fn build_stand_pool(
+    state: &GameState,
+    map: &MapCache,
+    dist: &DistanceMap,
+) -> HashMap<String, Vec<StandCandidate>> {
+    let mut items = state.items.iter().collect::<Vec<_>>();
+    items.sort_by(|a, b| compare_item_ids(&a.id, &b.id).then_with(|| a.kind.cmp(&b.kind)));
+
+    let mut by_kind: HashMap<String, HashMap<u16, StandCandidate>> = HashMap::new();
+    for item in items {
+        let mut stands = map.stand_cells_for_item(&item.id).to_vec();
+        stands.sort_unstable();
+        for stand in stands {
+            by_kind
+                .entry(item.kind.clone())
+                .or_default()
+                .entry(stand)
+                .or_insert_with(|| StandCandidate {
+                    stand,
+                    item_id: item.id.clone(),
+                    nearest_drop_dist: nearest_drop_dist(stand, map, dist),
+                });
+        }
+    }
+
+    let mut out = HashMap::<String, Vec<StandCandidate>>::new();
+    for (kind, stands) in by_kind {
+        let mut pool = stands.into_values().collect::<Vec<_>>();
+        pool.sort_by(|a, b| {
+            a.nearest_drop_dist
+                .cmp(&b.nearest_drop_dist)
+                .then_with(|| a.stand.cmp(&b.stand))
+                .then_with(|| compare_item_ids(&a.item_id, &b.item_id))
+        });
+        out.insert(kind, pool);
+    }
+    out
 }
 
 fn task_cost(
@@ -421,21 +629,33 @@ fn task_cost(
             let d = f64::from(dist_to(bot_cell, task.target_cell, dist));
             let density = local_density(task.target_cell, state) as f64;
             let choke = choke_penalty(task.target_cell, map) as f64;
-            (d + 0.5 * lambda_density * density + lambda_choke * choke).round() as i32
+            (d + 0.4 * lambda_density * density + lambda_choke * choke).round() as i32
         }
         TaskKind::PickupStand => {
             let d = f64::from(dist_to(bot_cell, task.target_cell, dist));
             let density = local_density(task.target_cell, state) as f64;
             let choke = choke_penalty(task.target_cell, map) as f64;
-            let already_on_stand_penalty = if bot_cell == task.target_cell { 40.0 } else { 0.0 };
-            (d + lambda_density * density + lambda_choke * choke + already_on_stand_penalty)
+            let demand_bias = match task.demand_tier {
+                DemandTier::Active => -25.0,
+                DemandTier::Preview => 30.0,
+                DemandTier::None => 0.0,
+            };
+            (d
+                + 0.45 * f64::from(task.nearest_drop_dist.min(64))
+                + lambda_density * density
+                + lambda_choke * choke
+                + demand_bias)
                 .round() as i32
         }
         TaskKind::ImmediatePickup => {
             if bot_cell != task.target_cell {
                 return 9_000;
             }
-            0
+            match task.demand_tier {
+                DemandTier::Active => -60,
+                DemandTier::Preview => -20,
+                DemandTier::None => 0,
+            }
         }
         TaskKind::QueuePosition => {
             let d = f64::from(dist_to(bot_cell, task.target_cell, dist));
@@ -462,7 +682,50 @@ fn choke_penalty(cell: u16, map: &MapCache) -> u16 {
 
 fn dist_to(a: u16, b: u16, dist: &DistanceMap) -> u16 {
     let d = dist.dist(a, b);
-    if d == u16::MAX { 256 } else { d }
+    if d == u16::MAX {
+        256
+    } else {
+        d
+    }
+}
+
+fn nearest_drop_dist(cell: u16, map: &MapCache, dist: &DistanceMap) -> u16 {
+    map.dropoff_cells
+        .iter()
+        .copied()
+        .map(|drop| dist_to(cell, drop, dist))
+        .min()
+        .unwrap_or(256)
+}
+
+fn avg_teammate_distance(bot: &BotState, bots: &[BotState]) -> f64 {
+    let mut total = 0.0;
+    let mut count = 0.0;
+    for other in bots {
+        if other.id == bot.id {
+            continue;
+        }
+        total += f64::from((other.x - bot.x).abs() + (other.y - bot.y).abs());
+        count += 1.0;
+    }
+    if count == 0.0 {
+        0.0
+    } else {
+        total / count
+    }
+}
+
+fn parse_item_numeric_suffix(id: &str) -> Option<u32> {
+    id.strip_prefix("item_")?.parse::<u32>().ok()
+}
+
+fn compare_item_ids(a: &str, b: &str) -> Ordering {
+    let a_num = parse_item_numeric_suffix(a);
+    let b_num = parse_item_numeric_suffix(b);
+    match (a_num, b_num) {
+        (Some(aa), Some(bb)) => aa.cmp(&bb).then_with(|| a.cmp(b)),
+        _ => a.cmp(b),
+    }
 }
 
 #[cfg(test)]
@@ -477,7 +740,7 @@ mod tests {
         world::World,
     };
 
-    use super::AssignmentEngine;
+    use super::{compare_item_ids, AssignmentEngine};
 
     #[test]
     fn deterministic_assignment_ordering() {
@@ -566,61 +829,52 @@ mod tests {
     }
 
     #[test]
-    fn empty_bots_do_not_all_target_dropoff() {
+    fn item_id_numeric_sorting_is_not_lexicographic() {
+        let mut ids = vec!["item_102", "item_12", "item_2"];
+        ids.sort_by(|a, b| compare_item_ids(a, b));
+        assert_eq!(ids, vec!["item_2", "item_12", "item_102"]);
+    }
+
+    #[test]
+    fn active_pickup_beats_preview_pickup_when_geometry_equal() {
         let state = GameState {
             grid: Grid {
-                width: 16,
-                height: 12,
-                drop_off_tiles: vec![[1, 10]],
+                width: 7,
+                height: 5,
+                drop_off_tiles: vec![[0, 0]],
                 ..Grid::default()
             },
-            bots: vec![
-                BotState {
-                    id: "0".to_owned(),
-                    x: 14,
-                    y: 10,
-                    carrying: vec![],
-                    capacity: 3,
-                },
-                BotState {
-                    id: "1".to_owned(),
-                    x: 14,
-                    y: 10,
-                    carrying: vec![],
-                    capacity: 3,
-                },
-                BotState {
-                    id: "2".to_owned(),
-                    x: 14,
-                    y: 10,
-                    carrying: vec![],
-                    capacity: 3,
-                },
-            ],
+            bots: vec![BotState {
+                id: "0".to_owned(),
+                x: 4,
+                y: 2,
+                carrying: vec![],
+                capacity: 3,
+            }],
             items: vec![
                 Item {
-                    id: "item_a".to_owned(),
+                    id: "item_12".to_owned(),
                     kind: "milk".to_owned(),
-                    x: 13,
-                    y: 8,
+                    x: 5,
+                    y: 2,
                 },
                 Item {
-                    id: "item_b".to_owned(),
+                    id: "item_2".to_owned(),
                     kind: "bread".to_owned(),
-                    x: 13,
+                    x: 3,
                     y: 2,
                 },
             ],
             orders: vec![
                 Order {
-                    id: "o1".to_owned(),
+                    id: "o_active".to_owned(),
                     item_id: "milk".to_owned(),
                     status: OrderStatus::InProgress,
                 },
                 Order {
-                    id: "o2".to_owned(),
+                    id: "o_preview".to_owned(),
                     item_id: "bread".to_owned(),
-                    status: OrderStatus::InProgress,
+                    status: OrderStatus::Pending,
                 },
             ],
             ..GameState::default()
@@ -658,15 +912,16 @@ mod tests {
                 Duration::from_millis(200),
             )
             .expect("assignment");
-        let all_dropoff = result.intents.iter().all(|intent| {
-            matches!(
-                intent.intent,
-                crate::dispatcher::Intent::MoveTo { cell } if map.dropoff_cells.contains(&cell)
-            )
-        });
-        assert!(
-            !all_dropoff,
-            "empty bots should not all be assigned to dropoff"
-        );
+        assert!(result.active_task_count > 0);
+        assert!(result.preview_task_count > 0);
+        let first = result
+            .intents
+            .into_iter()
+            .find(|intent| intent.bot_id == "0")
+            .expect("bot intent");
+        assert!(matches!(first.intent, crate::dispatcher::Intent::PickUp { .. }));
+        if let crate::dispatcher::Intent::PickUp { item_id } = first.intent {
+            assert_eq!(item_id, "item_12");
+        }
     }
 }

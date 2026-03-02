@@ -1,12 +1,20 @@
 use std::path::PathBuf;
 
-use clap::Args;
+use clap::{Args, ValueEnum};
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, ValueEnum)]
+pub enum AssignmentMode {
+    Hybrid,
+    GlobalOnly,
+    LegacyOnly,
+}
 
 #[derive(Debug, Clone)]
 pub struct Config {
     pub horizon: u8,
     pub candidate_k: usize,
     pub assignment_enabled: bool,
+    pub assignment_mode: AssignmentMode,
     pub dropoff_scheduling_enabled: bool,
     pub dropoff_window: u8,
     pub dropoff_capacity: u8,
@@ -29,6 +37,14 @@ pub struct ConfigArgs {
 
     #[arg(long, env = "GROCERY_ASSIGNMENT_ENABLED", default_value_t = true)]
     pub assignment_enabled: bool,
+
+    #[arg(
+        long,
+        env = "GROCERY_ASSIGNMENT_MODE",
+        value_enum,
+        default_value_t = AssignmentMode::Hybrid
+    )]
+    pub assignment_mode: AssignmentMode,
 
     #[arg(
         long,
@@ -71,6 +87,11 @@ impl ConfigArgs {
             horizon: self.horizon.clamp(8, 32),
             candidate_k: self.candidate_k.clamp(1, 32),
             assignment_enabled: self.assignment_enabled,
+            assignment_mode: if self.assignment_enabled {
+                self.assignment_mode
+            } else {
+                AssignmentMode::LegacyOnly
+            },
             dropoff_scheduling_enabled: self.dropoff_scheduling_enabled,
             dropoff_window: self.dropoff_window.clamp(4, 32),
             dropoff_capacity: self.dropoff_capacity.clamp(1, 4),

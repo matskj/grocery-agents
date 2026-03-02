@@ -1,3 +1,4 @@
+mod config;
 mod dispatcher;
 mod dist;
 mod model;
@@ -8,8 +9,11 @@ mod scoring;
 mod team_context;
 mod world;
 
+use std::sync::Arc;
+
 use base64::Engine;
 use clap::Parser;
+use config::ConfigArgs;
 use model::{RuntimeContext, SessionMetadata};
 use serde::Deserialize;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -30,36 +34,41 @@ struct Cli {
 
     #[arg(long, env = "GROCERY_WS_URL")]
     ws_url: Option<String>,
+
+    #[command(flatten)]
+    config: ConfigArgs,
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let cli = Cli::parse();
+    let config = Arc::new(cli.config.clone().build());
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(config.log_level.clone()));
 
     tracing_subscriber::registry()
         .with(env_filter)
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    let cli = Cli::parse();
-    let (token, ws_url) = resolve_connection(cli)?;
+    let (token, ws_url) = resolve_connection(cli.connect, cli.token, cli.ws_url)?;
     let session = parse_session_metadata(&token).unwrap_or_default();
     let ctx = RuntimeContext {
         token,
         ws_url,
         session,
     };
-    let policy = policy::Policy::new();
+    let policy = policy::Policy::new(Arc::clone(&config));
 
-    net::run_game_loop(ctx, policy).await
+    net::run_game_loop(ctx, policy, config).await
 }
 
-fn resolve_connection(cli: Cli) -> Result<(String, Option<String>), Box<dyn std::error::Error>> {
-    let mut token = cli.token;
-    let mut ws_url = cli.ws_url;
-
-    if let Some(connect) = cli.connect {
+fn resolve_connection(
+    connect: Option<String>,
+    mut token: Option<String>,
+    mut ws_url: Option<String>,
+) -> Result<(String, Option<String>), Box<dyn std::error::Error>> {
+    if let Some(connect) = connect {
         if looks_like_ws_url(&connect) {
             let (base, url_token) = split_ws_url_and_token(&connect)?;
             ws_url = Some(base);

@@ -140,6 +140,12 @@ fn build_map_cache(state: &GameState) -> MapCache {
             wall_mask[(y * width + x) as usize] = true;
         }
     }
+    // In the challenge protocol, item tiles are shelf cells and are not walkable.
+    for item in &state.items {
+        if item.x >= 0 && item.y >= 0 && item.x < width && item.y < height {
+            wall_mask[(item.y * width + item.x) as usize] = true;
+        }
+    }
 
     let mut neighbors = vec![SmallVec::<[u16; 4]>::new(); n];
     for y in 0..height {
@@ -176,7 +182,11 @@ fn build_map_cache(state: &GameState) -> MapCache {
 
     for (ix, item) in state.items.iter().enumerate() {
         item_by_id.insert(item.id.clone(), ix);
-        let shelf = (item.y * width + item.x) as u16;
+        let shelf = if item.x >= 0 && item.y >= 0 && item.x < width && item.y < height {
+            (item.y * width + item.x) as u16
+        } else {
+            0
+        };
         item_shelf_cells.push(shelf);
 
         let mut stands = SmallVec::<[u16; 4]>::new();
@@ -206,5 +216,43 @@ fn build_map_cache(state: &GameState) -> MapCache {
         item_shelf_cells,
         item_stand_cells,
         item_by_id,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::model::{GameState, Grid, Item};
+
+    use super::World;
+
+    #[test]
+    fn item_shelf_cells_are_blocked_for_pathing() {
+        let state = GameState {
+            grid: Grid {
+                width: 5,
+                height: 5,
+                ..Grid::default()
+            },
+            items: vec![Item {
+                id: "item_1".to_owned(),
+                kind: "milk".to_owned(),
+                x: 2,
+                y: 2,
+            }],
+            ..GameState::default()
+        };
+
+        let world = World::new(state);
+        let map = world.map();
+        let shelf_idx = map.idx(2, 2).expect("shelf idx");
+        let left_idx = map.idx(1, 2).expect("left idx");
+        assert!(
+            map.wall_mask[shelf_idx as usize],
+            "shelf tile must be blocked"
+        );
+        assert!(
+            !map.neighbors[left_idx as usize].contains(&shelf_idx),
+            "path graph must not include shelf tile as neighbor"
+        );
     }
 }

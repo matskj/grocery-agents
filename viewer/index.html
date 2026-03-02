@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Grocery Replay Studio</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div class="app">
+      <header class="topbar">
+        <div class="titleblock">
+          <h1>Grocery Replay Studio</h1>
+          <p>Local visualizer for bot runs and tick-by-tick behavior</p>
+        </div>
+        <div class="toolbar">
+          <label class="field">
+            <span>Run</span>
+            <select id="runSelect"></select>
+          </label>
+          <button id="reloadRunsBtn">Reload Runs</button>
+          <button id="loadRunBtn">Load Run</button>
+          <label class="check">
+            <input type="checkbox" id="followLatest" />
+            <span>Follow latest run</span>
+          </label>
+          <label class="check">
+            <input type="checkbox" id="liveRefresh" checked />
+            <span>Live refresh</span>
+          </label>
+        </div>
+      </header>
+
+      <main class="layout">
+        <section class="boardPanel">
+          <div class="boardCard">
+            <div class="boardHeader">
+              <div id="turnText">Turn 0/0</div>
+              <div id="scoreText">Score: 0</div>
+            </div>
+            <canvas id="boardCanvas" width="840" height="560"></canvas>
+          </div>
+
+          <div class="controlsCard">
+            <div class="transport">
+              <button id="prevTickBtn" title="Previous tick">Prev</button>
+              <button id="playPauseBtn" title="Play/Pause">Play</button>
+              <button id="nextTickBtn" title="Next tick">Next</button>
+              <label class="field inline">
+                <span>Speed</span>
+                <select id="speedSelect">
+                  <option value="60">4x</option>
+                  <option value="120">2x</option>
+                  <option value="220" selected>1x</option>
+                  <option value="420">0.5x</option>
+                </select>
+              </label>
+            </div>
+            <div class="scrubber">
+              <input id="tickSlider" type="range" min="0" max="0" value="0" />
+              <div class="tickInfo">
+                <span id="tickLabel">Tick 0</span>
+                <span id="modeLabel">Mode: -</span>
+                <span id="runLabel">Run: -</span>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <aside class="infoPanel">
+          <section class="panelCard">
+            <h2>Run Summary</h2>
+            <div class="kv">
+              <div><span>Final score</span><strong id="finalScore">-</strong></div>
+              <div><span>Ticks</span><strong id="tickCount">-</strong></div>
+              <div><span>Bots</span><strong id="botCount">-</strong></div>
+              <div><span>Grid</span><strong id="gridSize">-</strong></div>
+              <div><span>Blocked bots</span><strong id="blockedBots">-</strong></div>
+              <div><span>Stuck bots</span><strong id="stuckBots">-</strong></div>
+              <div><span>Queue violations</span><strong id="queueViolations">-</strong></div>
+              <div><span>Lane congestion</span><strong id="laneCongestion">-</strong></div>
+            </div>
+            <div class="legend">
+              <span><i class="lane"></i>Queue lane</span>
+              <span><i class="ring"></i>Dropoff ring</span>
+              <span><i class="heat"></i>Conflict hotspot</span>
+            </div>
+          </section>
+
+          <section class="panelCard">
+            <h2>Orders</h2>
+            <div class="orders">
+              <div>
+                <h3>Active</h3>
+                <ul id="activeOrders"></ul>
+              </div>
+              <div>
+                <h3>Preview</h3>
+                <ul id="previewOrders"></ul>
+              </div>
+            </div>
+          </section>
+
+          <section class="panelCard">
+            <h2>Tick Actions</h2>
+            <ul id="actionList" class="actions"></ul>
+          </section>
+        </aside>
+      </main>
+    </div>
+    <script src="./app.js"></script>
+  </body>
+</html>

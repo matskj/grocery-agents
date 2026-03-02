@@ -1,4 +1,6 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::OnceLock};
+
+use tracing::info;
 
 use crate::{
     dispatcher::{BotIntent, Dispatcher, Intent},
@@ -44,12 +46,24 @@ impl Policy {
                 Some(b) => b,
                 None => continue,
             };
+            if bot_debug_enabled() {
+                info!(tick = state.tick, bot_id = %bot.id, intent = ?intent, "assignment selected");
+            }
             let cell = map.idx(bot.x, bot.y).unwrap_or(0);
             let mem = self.memory.entry(bot.id.clone()).or_default();
             if mem.prev_cell == Some(cell) {
                 mem.blocked_ticks = mem.blocked_ticks.saturating_add(1);
             } else {
                 mem.blocked_ticks = 0;
+            }
+            if bot_debug_enabled() && mem.blocked_ticks >= 2 {
+                info!(
+                    tick = state.tick,
+                    bot_id = %bot.id,
+                    blocked_ticks = mem.blocked_ticks,
+                    cell,
+                    "congestion/jam detected"
+                );
             }
             mem.prev_cell = Some(cell);
 
@@ -85,6 +99,15 @@ impl Policy {
                             })
                             .count();
                         if crowded > 2 {
+                            if bot_debug_enabled() {
+                                info!(
+                                    tick = state.tick,
+                                    bot_id = %bot.id,
+                                    target_cell = cell,
+                                    crowded,
+                                    "drop-off congestion detected; rerouting toward ring"
+                                );
+                            }
                             if let Some(&ring) = map.neighbors[cell as usize].first() {
                                 cell = ring;
                             }
@@ -92,6 +115,15 @@ impl Policy {
                     }
                     if mem.blocked_ticks >= 2 {
                         if let Some(&evac) = map.neighbors[cell as usize].first() {
+                            if bot_debug_enabled() {
+                                info!(
+                                    tick = state.tick,
+                                    bot_id = %bot.id,
+                                    from_cell = cell,
+                                    evac_cell = evac,
+                                    "evacuation trigger fired"
+                                );
+                            }
                             goals.insert(bot.id.clone(), evac);
                         } else {
                             goals.insert(bot.id.clone(), cell);
@@ -121,4 +153,13 @@ impl Policy {
             })
             .collect()
     }
+}
+
+fn bot_debug_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("BOT_DEBUG")
+            .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+            .unwrap_or(false)
+    })
 }

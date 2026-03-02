@@ -7,6 +7,7 @@ use std::{
 use tracing::info;
 
 use crate::{
+    assign::AssignmentEngine,
     config::Config,
     dispatcher::{BotIntent, Dispatcher, Intent},
     dist::DistanceMap,
@@ -41,6 +42,7 @@ struct BotMemory {
 #[derive(Debug)]
 pub struct Policy {
     config: Arc<Config>,
+    assigner: AssignmentEngine,
     dispatcher: Dispatcher,
     planner: MotionPlanner,
     memory: HashMap<String, BotMemory>,
@@ -53,6 +55,7 @@ impl Policy {
         Self {
             planner: MotionPlanner::new(config.horizon),
             config,
+            assigner: AssignmentEngine::new(),
             dispatcher: Dispatcher::new(),
             memory: HashMap::new(),
             sticky_roles: HashMap::new(),
@@ -199,9 +202,35 @@ impl Policy {
         self.sticky_roles = team_ctx.queue.next_sticky.clone();
 
         let assign_started = Instant::now();
-        let intents =
+        let mut assignment_source = "legacy_dispatcher";
+        let mut assignment_task_count = 0usize;
+        let mut assignment_edge_count = 0usize;
+        let intents = if self.config.assignment_enabled {
+            let remaining = soft_budget.saturating_sub(tick_started.elapsed());
+            match self.assigner.build_intents(
+                state,
+                map,
+                &dist,
+                &team_ctx,
+                self.config.candidate_k,
+                self.config.lambda_density,
+                self.config.lambda_choke,
+                remaining,
+            ) {
+                Some(result) => {
+                    assignment_source = "global_assignment";
+                    assignment_task_count = result.task_count;
+                    assignment_edge_count = result.edge_count;
+                    result.intents
+                }
+                None => self
+                    .dispatcher
+                    .build_intents(state, map, &dist, &blocked_snapshot, &team_ctx),
+            }
+        } else {
             self.dispatcher
-                .build_intents(state, map, &dist, &blocked_snapshot, &team_ctx);
+                .build_intents(state, map, &dist, &blocked_snapshot, &team_ctx)
+        };
         let assign_ms = assign_started.elapsed().as_millis() as u64;
         let mut goals = HashMap::new();
         let mut immediate = HashMap::new();
@@ -759,6 +788,22 @@ impl Policy {
             obj.insert(
                 "assign_ms".to_owned(),
                 serde_json::Value::Number(serde_json::Number::from(assign_ms)),
+            );
+            obj.insert(
+                "assignment_source".to_owned(),
+                serde_json::Value::String(assignment_source.to_owned()),
+            );
+            obj.insert(
+                "assignment_enabled".to_owned(),
+                serde_json::Value::Bool(self.config.assignment_enabled),
+            );
+            obj.insert(
+                "assignment_task_count".to_owned(),
+                serde_json::Value::Number(serde_json::Number::from(assignment_task_count as i64)),
+            );
+            obj.insert(
+                "assignment_edge_count".to_owned(),
+                serde_json::Value::Number(serde_json::Number::from(assignment_edge_count as i64)),
             );
         }
         self.last_team_telemetry = telemetry;

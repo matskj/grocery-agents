@@ -41,22 +41,36 @@ pub struct MotionPlanResult {
 struct ReservationTable {
     vertex_res: HashSet<(u8, u16)>,
     edge_res: HashSet<(u8, u16, u16)>,
+    dropoff_res: HashMap<(u8, u16), u8>,
+    dropoff_capacity: u8,
 }
 
 impl ReservationTable {
-    fn is_vertex_free(&self, t: u8, cell: u16) -> bool {
-        !self.vertex_res.contains(&(t, cell))
-    }
-
-    fn is_edge_free(&self, t: u8, from: u16, to: u16) -> bool {
-        !self.edge_res.contains(&(t, from, to))
+    fn new(dropoff_capacity: u8) -> Self {
+        Self {
+            vertex_res: HashSet::new(),
+            edge_res: HashSet::new(),
+            dropoff_res: HashMap::new(),
+            dropoff_capacity: dropoff_capacity.max(1),
+        }
     }
 
     fn reserve_wait(&mut self, t: u8, cell: u16) {
         self.vertex_res.insert((t, cell));
     }
 
-    fn reserve_path(&mut self, path: &[u16], reserve_horizon: u8, max_horizon: u8) {
+    fn reserve_dropoff_slot(&mut self, t: u8, drop_cell: u16) {
+        let entry = self.dropoff_res.entry((t, drop_cell)).or_insert(0);
+        *entry = entry.saturating_add(1);
+    }
+
+    fn reserve_path(
+        &mut self,
+        path: &[u16],
+        reserve_horizon: u8,
+        max_horizon: u8,
+        dropoff_cells: &[u16],
+    ) {
         let mut prev = path.first().copied().unwrap_or(0);
         for t in 1..=reserve_horizon.min(max_horizon) {
             let idx = usize::from(t).min(path.len().saturating_sub(1));
@@ -64,6 +78,9 @@ impl ReservationTable {
             self.vertex_res.insert((t, next));
             self.edge_res.insert((t, prev, next));
             self.edge_res.insert((t, next, prev));
+            if dropoff_cells.contains(&next) {
+                self.reserve_dropoff_slot(t, next);
+            }
             prev = next;
         }
     }
@@ -110,9 +127,10 @@ impl MotionPlanner {
         reservation: &MovementReservation,
         explicit_order: &[String],
         soft_deadline: Option<Instant>,
+        dropoff_capacity: u8,
     ) -> MotionPlanResult {
         let mut out = HashMap::with_capacity(state.bots.len());
-        let mut res_table = ReservationTable::default();
+        let mut res_table = ReservationTable::new(dropoff_capacity);
         let mut diagnostics = MotionPlanDiagnostics::default();
         let cbs_start = Instant::now();
         let cbs_budget = Duration::from_millis(3);
@@ -187,6 +205,8 @@ impl MotionPlanner {
                 dist,
                 &res_table.vertex_res,
                 &res_table.edge_res,
+                &res_table.dropoff_res,
+                res_table.dropoff_capacity,
                 blocked,
                 &forbidden,
                 role,
@@ -208,7 +228,12 @@ impl MotionPlanner {
                     .horizon
                     .min(outcome.path.len().saturating_sub(1) as u8)
                     .max(1);
-                res_table.reserve_path(&outcome.path, reserve_horizon, self.horizon);
+                res_table.reserve_path(
+                    &outcome.path,
+                    reserve_horizon,
+                    self.horizon,
+                    &map.dropoff_cells,
+                );
             } else {
                 res_table.reserve_wait(1, start);
             }
@@ -275,6 +300,8 @@ impl MotionPlanner {
         dist: &DistanceMap,
         v_res: &HashSet<(u8, u16)>,
         e_res: &HashSet<(u8, u16, u16)>,
+        dropoff_res: &HashMap<(u8, u16), u8>,
+        dropoff_capacity: u8,
         blocked_moves: &[BlockedMove],
         forbidden_cells: &HashSet<u16>,
         role: BotRole,
@@ -286,6 +313,8 @@ impl MotionPlanner {
             dist,
             v_res,
             e_res,
+            dropoff_res,
+            dropoff_capacity,
             blocked_moves,
             forbidden_cells,
             self.horizon,
@@ -317,6 +346,8 @@ impl MotionPlanner {
             dist,
             &reduced_v,
             &reduced_e,
+            dropoff_res,
+            dropoff_capacity,
             blocked_moves,
             forbidden_cells,
             10,
@@ -334,6 +365,8 @@ impl MotionPlanner {
                 dist,
                 v_res,
                 e_res,
+                dropoff_res,
+                dropoff_capacity,
                 blocked_moves,
                 &HashSet::new(),
                 self.horizon,
@@ -364,6 +397,8 @@ impl MotionPlanner {
         dist: &DistanceMap,
         v_res: &HashSet<(u8, u16)>,
         e_res: &HashSet<(u8, u16, u16)>,
+        dropoff_res: &HashMap<(u8, u16), u8>,
+        dropoff_capacity: u8,
         blocked_moves: &[BlockedMove],
         forbidden_cells: &HashSet<u16>,
         max_horizon: u8,
@@ -406,6 +441,11 @@ impl MotionPlanner {
                     continue;
                 }
                 if v_res.contains(&(nt, next)) || e_res.contains(&(nt, cell, next)) {
+                    continue;
+                }
+                if map.dropoff_cells.contains(&next)
+                    && dropoff_res.get(&(nt, next)).copied().unwrap_or(0) >= dropoff_capacity
+                {
                     continue;
                 }
                 if t == 0
@@ -636,6 +676,8 @@ impl MotionPlanner {
             dist,
             &v_res,
             &e_res,
+            &HashMap::new(),
+            1,
             blocked,
             &forbidden,
             role,
@@ -1017,7 +1059,7 @@ mod tests {
             map.idx(2, 1).expect("z2"),
         ]);
 
-        let result = planner.plan(&state, map, &dist, &goals, &reservation, &[], None);
+        let result = planner.plan(&state, map, &dist, &goals, &reservation, &[], None, 1);
         let a_action = result.actions.get("a").expect("a action");
         let b_action = result.actions.get("b").expect("b action");
         let is_swap = matches!(a_action.action, Action::Move { dx: 1, dy: 0, .. })
@@ -1075,6 +1117,7 @@ mod tests {
             &reservation,
             &explicit_order,
             None,
+            1,
         );
         let second = planner.plan(
             &state,
@@ -1084,6 +1127,7 @@ mod tests {
             &reservation,
             &explicit_order,
             None,
+            1,
         );
         let a1 = first.actions.get("a").expect("a action first");
         let b1 = first.actions.get("b").expect("b action first");

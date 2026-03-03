@@ -26,6 +26,10 @@ def main() -> None:
         modes[str(mode)] = {
             "weights": payload.get("weights", {}),
             "ordering_weights": payload.get("ordering_weights", {}),
+            "feature_columns": payload.get("feature_columns", []),
+            "normalization": payload.get("normalization", {}),
+            "heads": payload.get("heads", {}),
+            "calibration": payload.get("calibration", {}),
         }
 
     artifact = {

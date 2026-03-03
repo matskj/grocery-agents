@@ -35,6 +35,12 @@ struct Cli {
 
     #[arg(long)]
     mode_filter: Option<String>,
+
+    #[arg(long, default_value_t = false)]
+    enforce_gates: bool,
+
+    #[arg(long, default_value_t = GateProfile::Default, value_enum)]
+    gate_profile: GateProfile,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum, Default)]
@@ -43,6 +49,13 @@ enum EvalProfile {
     Aggressive,
     #[default]
     Default,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum, Default)]
+enum GateProfile {
+    #[default]
+    Default,
+    Strict,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -90,6 +103,11 @@ struct EpisodeMetrics {
     goal_collapse_ticks: u64,
     guard_fallback_ticks: u64,
     guard_fallback_ratio: f64,
+    items_delivered: u64,
+    pickup_attempts: u64,
+    pickup_successes: u64,
+    dropoff_attempts: u64,
+    dropoff_successes: u64,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -106,6 +124,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     print_summary(&metrics);
+    let failed = evaluate_gates(&metrics, cli.gate_profile);
+    if failed && cli.enforce_gates {
+        return Err("regression gate failure".into());
+    }
     Ok(())
 }
 
@@ -297,6 +319,8 @@ fn parse_metrics(path: &Path) -> Result<EpisodeMetrics, Box<dyn std::error::Erro
     let mut goal_counts = HashMap::<(i64, i64), u64>::new();
     let mut total_goal_observations = 0u64;
     let mut tick_snapshots = Vec::<TickSnapshot>::new();
+    let mut prev_carrying_by_bot = HashMap::<String, i64>::new();
+    let mut prev_action_by_bot = HashMap::<String, String>::new();
     for line in content.lines() {
         if line.trim().is_empty() {
             continue;
@@ -351,6 +375,68 @@ fn parse_metrics(path: &Path) -> Result<EpisodeMetrics, Box<dyn std::error::Erro
                     }
                 }
             }
+            let mut action_by_bot = HashMap::<String, String>::new();
+            if let Some(actions) = data.get("actions").and_then(Value::as_array) {
+                for action in actions {
+                    let bot_id = action
+                        .get("bot_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_owned();
+                    let kind = action
+                        .get("kind")
+                        .and_then(Value::as_str)
+                        .unwrap_or("wait")
+                        .to_owned();
+                    if !bot_id.is_empty() {
+                        action_by_bot.insert(bot_id, kind);
+                    }
+                }
+            }
+            let mut carrying_by_bot = HashMap::<String, i64>::new();
+            if let Some(bots) = data
+                .get("game_state")
+                .and_then(|s| s.get("bots"))
+                .and_then(Value::as_array)
+            {
+                for bot in bots {
+                    let bot_id = bot
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_owned();
+                    if bot_id.is_empty() {
+                        continue;
+                    }
+                    let carrying = bot
+                        .get("carrying")
+                        .and_then(Value::as_array)
+                        .map(|c| c.len() as i64)
+                        .unwrap_or(0);
+                    carrying_by_bot.insert(bot_id, carrying);
+                }
+            }
+            for (bot_id, prev_action) in &prev_action_by_bot {
+                let Some(&prev_carrying) = prev_carrying_by_bot.get(bot_id) else {
+                    continue;
+                };
+                let Some(&current_carrying) = carrying_by_bot.get(bot_id) else {
+                    continue;
+                };
+                if prev_action == "pick_up" {
+                    metrics.pickup_attempts = metrics.pickup_attempts.saturating_add(1);
+                    if current_carrying > prev_carrying {
+                        metrics.pickup_successes = metrics.pickup_successes.saturating_add(1);
+                    }
+                } else if prev_action == "drop_off" {
+                    metrics.dropoff_attempts = metrics.dropoff_attempts.saturating_add(1);
+                    if current_carrying < prev_carrying {
+                        metrics.dropoff_successes = metrics.dropoff_successes.saturating_add(1);
+                    }
+                }
+            }
+            prev_action_by_bot = action_by_bot;
+            prev_carrying_by_bot = carrying_by_bot;
             let blocked = data
                 .get("team_summary")
                 .and_then(|s| s.get("blocked_bot_count"))
@@ -431,6 +517,7 @@ fn parse_metrics(path: &Path) -> Result<EpisodeMetrics, Box<dyn std::error::Erro
                 .get("items_delivered_delta")
                 .and_then(Value::as_u64)
                 .unwrap_or(0);
+            metrics.items_delivered = metrics.items_delivered.saturating_add(items_delivered_delta);
             let order_completed_delta = tick_outcome
                 .get("order_completed_delta")
                 .and_then(Value::as_u64)
@@ -528,6 +615,11 @@ fn print_summary(metrics: &[EpisodeMetrics]) {
         acc.goal_collapse_ticks += item.goal_collapse_ticks;
         acc.guard_fallback_ticks += item.guard_fallback_ticks;
         acc.guard_fallback_ratio += item.guard_fallback_ratio;
+        acc.items_delivered += item.items_delivered;
+        acc.pickup_attempts += item.pickup_attempts;
+        acc.pickup_successes += item.pickup_successes;
+        acc.dropoff_attempts += item.dropoff_attempts;
+        acc.dropoff_successes += item.dropoff_successes;
         for phase_idx in 0..PHASE_COUNT {
             let src = item.phase[phase_idx];
             let dst = &mut acc.phase[phase_idx];
@@ -571,6 +663,31 @@ fn print_summary(metrics: &[EpisodeMetrics]) {
     println!(
         "avg_assign_ms={:.2} repeated_goal_concentration={:.3}",
         avg_assign_ms, avg_goal_concentration
+    );
+    let delivered_per_100_ticks = if totals.tick_count == 0 {
+        0.0
+    } else {
+        totals.items_delivered as f64 * 100.0 / totals.tick_count as f64
+    };
+    let pickup_success_ratio = if totals.pickup_attempts == 0 {
+        0.0
+    } else {
+        totals.pickup_successes as f64 / totals.pickup_attempts as f64
+    };
+    let dropoff_success_ratio = if totals.dropoff_attempts == 0 {
+        0.0
+    } else {
+        totals.dropoff_successes as f64 / totals.dropoff_attempts as f64
+    };
+    println!(
+        "conversion delivered_per_100_ticks={:.3} pickup_success_ratio={:.3} ({}/{}) dropoff_success_ratio={:.3} ({}/{})",
+        delivered_per_100_ticks,
+        pickup_success_ratio,
+        totals.pickup_successes,
+        totals.pickup_attempts,
+        dropoff_success_ratio,
+        totals.dropoff_successes,
+        totals.dropoff_attempts
     );
     println!(
         "collapse_alarms late_no_delivery_streak_avg={:.2} goal_collapse_ratio={:.3} guard_fallback_ratio={:.3}",
@@ -622,6 +739,159 @@ fn print_summary(metrics: &[EpisodeMetrics]) {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct GateThreshold {
+    min_delivered_per_100_ticks: f64,
+    min_pickup_success_ratio: f64,
+    min_dropoff_success_ratio: f64,
+    max_guard_fallback_ratio: f64,
+    max_repeated_goal_concentration: f64,
+    max_late_no_delivery_streak: f64,
+}
+
+fn threshold_for_mode(mode: &str) -> Option<GateThreshold> {
+    match mode {
+        "easy" => Some(GateThreshold {
+            min_delivered_per_100_ticks: 1.8,
+            min_pickup_success_ratio: 0.45,
+            min_dropoff_success_ratio: 0.45,
+            max_guard_fallback_ratio: 0.25,
+            max_repeated_goal_concentration: 0.25,
+            max_late_no_delivery_streak: 220.0,
+        }),
+        "medium" => Some(GateThreshold {
+            min_delivered_per_100_ticks: 3.0,
+            min_pickup_success_ratio: 0.55,
+            min_dropoff_success_ratio: 0.22,
+            max_guard_fallback_ratio: 0.15,
+            max_repeated_goal_concentration: 0.25,
+            max_late_no_delivery_streak: 180.0,
+        }),
+        "hard" => Some(GateThreshold {
+            min_delivered_per_100_ticks: 3.5,
+            min_pickup_success_ratio: 0.20,
+            min_dropoff_success_ratio: 0.20,
+            max_guard_fallback_ratio: 0.10,
+            max_repeated_goal_concentration: 0.30,
+            max_late_no_delivery_streak: 160.0,
+        }),
+        "expert" => Some(GateThreshold {
+            min_delivered_per_100_ticks: 1.6,
+            min_pickup_success_ratio: 0.25,
+            min_dropoff_success_ratio: 0.07,
+            max_guard_fallback_ratio: 0.12,
+            max_repeated_goal_concentration: 0.22,
+            max_late_no_delivery_streak: 230.0,
+        }),
+        _ => None,
+    }
+}
+
+fn apply_gate_profile(threshold: GateThreshold, profile: GateProfile) -> GateThreshold {
+    match profile {
+        GateProfile::Default => threshold,
+        GateProfile::Strict => GateThreshold {
+            min_delivered_per_100_ticks: threshold.min_delivered_per_100_ticks * 1.1,
+            min_pickup_success_ratio: threshold.min_pickup_success_ratio * 1.1,
+            min_dropoff_success_ratio: threshold.min_dropoff_success_ratio * 1.1,
+            max_guard_fallback_ratio: threshold.max_guard_fallback_ratio * 0.9,
+            max_repeated_goal_concentration: threshold.max_repeated_goal_concentration * 0.9,
+            max_late_no_delivery_streak: threshold.max_late_no_delivery_streak * 0.9,
+        },
+    }
+}
+
+fn evaluate_gates(metrics: &[EpisodeMetrics], profile: GateProfile) -> bool {
+    let mut by_mode = HashMap::<String, Vec<&EpisodeMetrics>>::new();
+    for item in metrics {
+        by_mode.entry(item.mode.clone()).or_default().push(item);
+    }
+    let mut any_failed = false;
+    for (mode, rows) in by_mode {
+        let Some(base_threshold) = threshold_for_mode(mode.as_str()) else {
+            continue;
+        };
+        let t = apply_gate_profile(base_threshold, profile);
+        let ticks = rows.iter().map(|r| r.tick_count).sum::<u64>();
+        let delivered = rows.iter().map(|r| r.items_delivered).sum::<u64>();
+        let pickup_attempts = rows.iter().map(|r| r.pickup_attempts).sum::<u64>();
+        let pickup_successes = rows.iter().map(|r| r.pickup_successes).sum::<u64>();
+        let dropoff_attempts = rows.iter().map(|r| r.dropoff_attempts).sum::<u64>();
+        let dropoff_successes = rows.iter().map(|r| r.dropoff_successes).sum::<u64>();
+        let guard_ticks = rows.iter().map(|r| r.guard_fallback_ticks).sum::<u64>();
+        let repeated_goal_concentration =
+            rows.iter().map(|r| r.repeated_goal_concentration).sum::<f64>() / rows.len() as f64;
+        let late_no_delivery_streak =
+            rows.iter().map(|r| r.late_no_delivery_streak as f64).sum::<f64>() / rows.len() as f64;
+
+        let delivered_per_100_ticks = if ticks == 0 {
+            0.0
+        } else {
+            delivered as f64 * 100.0 / ticks as f64
+        };
+        let pickup_success_ratio = if pickup_attempts == 0 {
+            0.0
+        } else {
+            pickup_successes as f64 / pickup_attempts as f64
+        };
+        let dropoff_success_ratio = if dropoff_attempts == 0 {
+            0.0
+        } else {
+            dropoff_successes as f64 / dropoff_attempts as f64
+        };
+        let guard_fallback_ratio = if ticks == 0 {
+            0.0
+        } else {
+            guard_ticks as f64 / ticks as f64
+        };
+        let mut failed_checks = Vec::<&str>::new();
+        if delivered_per_100_ticks < t.min_delivered_per_100_ticks {
+            failed_checks.push("delivered_per_100_ticks");
+        }
+        if pickup_success_ratio < t.min_pickup_success_ratio {
+            failed_checks.push("pickup_success_ratio");
+        }
+        if dropoff_success_ratio < t.min_dropoff_success_ratio {
+            failed_checks.push("dropoff_success_ratio");
+        }
+        if guard_fallback_ratio > t.max_guard_fallback_ratio {
+            failed_checks.push("guard_fallback_ratio");
+        }
+        if repeated_goal_concentration > t.max_repeated_goal_concentration {
+            failed_checks.push("repeated_goal_concentration");
+        }
+        if late_no_delivery_streak > t.max_late_no_delivery_streak {
+            failed_checks.push("late_no_delivery_streak");
+        }
+        if failed_checks.is_empty() {
+            println!(
+                "gate mode={} status=PASS delivered_per_100_ticks={:.3} pickup_success_ratio={:.3} dropoff_success_ratio={:.3} guard_fallback_ratio={:.3} repeated_goal_concentration={:.3} late_no_delivery_streak={:.2}",
+                mode,
+                delivered_per_100_ticks,
+                pickup_success_ratio,
+                dropoff_success_ratio,
+                guard_fallback_ratio,
+                repeated_goal_concentration,
+                late_no_delivery_streak,
+            );
+        } else {
+            any_failed = true;
+            println!(
+                "gate mode={} status=FAIL failed={} delivered_per_100_ticks={:.3} pickup_success_ratio={:.3} dropoff_success_ratio={:.3} guard_fallback_ratio={:.3} repeated_goal_concentration={:.3} late_no_delivery_streak={:.2}",
+                mode,
+                failed_checks.join(","),
+                delivered_per_100_ticks,
+                pickup_success_ratio,
+                dropoff_success_ratio,
+                guard_fallback_ratio,
+                repeated_goal_concentration,
+                late_no_delivery_streak,
+            );
+        }
+    }
+    any_failed
+}
+
 fn percentile(sorted: &[i64], p: f64) -> i64 {
     if sorted.is_empty() {
         return 0;
@@ -655,4 +925,83 @@ fn is_guard_fallback_tick(source: &str, guard_reason: &str) -> bool {
             | "legacy_forced_watchdog"
             | "legacy_forced_watchdog_trigger"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::parse_metrics;
+
+    fn tick_line(
+        tick: u64,
+        action_kind: &str,
+        carrying: &[&str],
+        items_delivered_delta: u64,
+    ) -> String {
+        let carrying_json = carrying
+            .iter()
+            .map(|v| serde_json::Value::String((*v).to_owned()))
+            .collect::<Vec<_>>();
+        serde_json::json!({
+            "event": "tick",
+            "data": {
+                "mode": "easy",
+                "tick": tick,
+                "actions": [
+                    {"bot_id":"0", "kind": action_kind}
+                ],
+                "game_state": {
+                    "bots": [
+                        {"id":"0","x":1,"y":1,"carrying": carrying_json}
+                    ]
+                },
+                "team_summary": {
+                    "assignment_source": "hybrid_assignment",
+                    "assignment_guard_reason": "none",
+                    "assignment_goal_concentration_top3": 0.1,
+                    "dropoff_congestion": 0,
+                    "blocked_bot_count": 0,
+                    "stuck_bot_count": 0
+                },
+                "tick_outcome": {
+                    "delta_score": 0,
+                    "items_delivered_delta": items_delivered_delta,
+                    "order_completed_delta": 0
+                }
+            }
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn parse_metrics_infers_conversion_attempts_and_successes() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let path = std::env::temp_dir().join(format!("run-eval-test-{suffix}.jsonl"));
+        let content = vec![
+            tick_line(0, "pick_up", &[], 0),
+            tick_line(1, "drop_off", &["milk"], 0),
+            tick_line(2, "wait", &[], 1),
+            serde_json::json!({
+                "event": "game_over",
+                "data": {
+                    "final_score": 10
+                }
+            })
+            .to_string(),
+        ]
+        .join("\n");
+        fs::write(&path, content).expect("write fixture");
+        let parsed = parse_metrics(&path).expect("parsed metrics");
+        assert_eq!(parsed.pickup_attempts, 1);
+        assert_eq!(parsed.pickup_successes, 1);
+        assert_eq!(parsed.dropoff_attempts, 1);
+        assert_eq!(parsed.dropoff_successes, 1);
+        assert!(parsed.items_delivered >= 1);
+        let _ = fs::remove_file(path);
+    }
 }

@@ -69,6 +69,12 @@ Run quick metric summaries from existing logs:
 .\cargo-x64.cmd run --bin eval -- --from-logs --episodes 10
 ```
 
+Expert-only regression gate from logs:
+
+```powershell
+.\cargo-x64.cmd run --bin eval -- --from-logs --episodes 20 --mode-filter expert
+```
+
 Run fresh episodes against local websocket simulator:
 
 ```powershell
@@ -93,6 +99,12 @@ Profile behavior:
 
 The eval summary prints score mean/p50/p90, wait ratio, move/pickup/dropoff counts,
 blocked events, and near-dropoff congestion events.
+
+It also prints collapse-focused metrics:
+
+- `collapse_alarms`: late no-delivery streak, goal-collapse ratio, guard-fallback ratio
+- phase slices (`early`, `mid`, `late`): score gain, delivered/completed, avg blocked/stuck,
+  avg unique-goals, avg goal concentration top-3
 
 ## Local Replay UI
 

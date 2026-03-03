@@ -36,13 +36,13 @@ rustup target add x86_64-pc-windows-msvc
 ## Build and run
 
 ```bash
-RUST_LOG=info cargo run -- --token <jwt>
+RUST_LOG=info cargo run --bin grocery-agents -- --token <jwt>
 ```
 
 You can also paste the full websocket URL directly (token auto-extracted):
 
 ```bash
-cargo run -- 'wss://game.ainm.no/ws?token=eyJ...'
+cargo run --bin grocery-agents -- 'wss://game.ainm.no/ws?token=eyJ...'
 ```
 
 Windows ARM64 helper (uses VS `vcvars64` + x64 Rust toolchain):
@@ -60,6 +60,51 @@ Install offline training dependencies:
 ```bash
 python -m pip install -r requirements.txt
 ```
+
+## Local evaluation runner (Rust)
+
+Run quick metric summaries from existing logs:
+
+```powershell
+.\cargo-x64.cmd run --bin eval -- --from-logs --episodes 10
+```
+
+Expert-only regression gate from logs:
+
+```powershell
+.\cargo-x64.cmd run --bin eval -- --from-logs --episodes 20 --mode-filter expert
+```
+
+Run fresh episodes against local websocket simulator:
+
+```powershell
+.\cargo-x64.cmd run --bin eval -- --episodes 10 --ws-url ws://localhost:8765/ws --token <jwt>
+```
+
+Profiles:
+
+```powershell
+# conservative planning budget
+.\cargo-x64.cmd run --bin eval -- --episodes 10 --profile safe --ws-url ws://localhost:8765/ws --token <jwt>
+
+# wider search / longer horizon
+.\cargo-x64.cmd run --bin eval -- --episodes 10 --profile aggressive --ws-url ws://localhost:8765/ws --token <jwt>
+```
+
+Profile behavior:
+
+- `safe`: `legacy_only` assignment mode
+- `default`: `hybrid` assignment mode
+- `aggressive`: `global_only` assignment mode
+
+The eval summary prints score mean/p50/p90, wait ratio, move/pickup/dropoff counts,
+blocked events, and near-dropoff congestion events.
+
+It also prints collapse-focused metrics:
+
+- `collapse_alarms`: late no-delivery streak, goal-collapse ratio, guard-fallback ratio
+- phase slices (`early`, `mid`, `late`): score gain, delivered/completed, avg blocked/stuck,
+  avg unique-goals, avg goal concentration top-3
 
 ## Local Replay UI
 
@@ -227,7 +272,7 @@ POLICY_ARTIFACT_PATH=models/policy_artifacts.json
 Set `BOT_DEBUG=1` (or `true`/`yes`) to enable additional operational logs.
 
 ```bash
-BOT_DEBUG=1 RUST_LOG=info cargo run -- --token <jwt>
+BOT_DEBUG=1 RUST_LOG=info cargo run --bin grocery-agents -- --token <jwt>
 ```
 
 When enabled, logs include:
@@ -242,6 +287,19 @@ Coordination knobs:
 - `QUEUE_STRICT_MODE=1` (default on in medium/hard/expert)
 - `QUEUE_MAX_RING_ENTRANTS=1` (strict queue default)
 - `DEADLOCK_ESCAPE_TICKS=3`
+- `GROCERY_HORIZON=16`
+- `GROCERY_CANDIDATE_K=8`
+- `GROCERY_ASSIGNMENT_ENABLED=true`
+- `GROCERY_ASSIGNMENT_MODE=hybrid` (`hybrid`, `global-only`, `legacy-only`)
+- `GROCERY_DROPOFF_SCHEDULING_ENABLED=true`
+- `GROCERY_DROPOFF_WINDOW=12`
+- `GROCERY_DROPOFF_CAPACITY=1`
+- `GROCERY_LAMBDA_DENSITY=1.0`
+- `GROCERY_LAMBDA_CHOKE=1.5`
+- `GROCERY_PLANNER_SOFT_BUDGET_MS=1200`
+- `GROCERY_STRUCTURED_BOT_LOG=1`
+- `GROCERY_ASCII_RENDER=1`
+- `GROCERY_REPLAY_DUMP_PATH=logs/replay_dump.jsonl`
 
 ## Safety fallback behavior (`wait`)
 

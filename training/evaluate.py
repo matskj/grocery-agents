@@ -3,12 +3,19 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Optional
 
 import numpy as np
 import pandas as pd
 
-from .common import FEATURE_COLUMNS, read_table
+from .common import (
+    CONVERSION_LABEL_COLUMNS,
+    FEATURE_COLUMNS,
+    build_run_signature_map,
+    ensure_columns,
+    read_table,
+    signature_cluster_sizes,
+)
 
 
 def load_model(path: Path) -> Dict:
@@ -23,6 +30,58 @@ def score(frame: pd.DataFrame, weights: Dict[str, float]) -> np.ndarray:
     return y
 
 
+def sigmoid(values: np.ndarray) -> np.ndarray:
+    return 1.0 / (1.0 + np.exp(-np.clip(values, -24.0, 24.0)))
+
+
+def prob_logloss(y_true: np.ndarray, y_prob: np.ndarray) -> float:
+    if y_true.size == 0:
+        return 0.0
+    p = np.clip(y_prob, 1e-6, 1.0 - 1e-6)
+    loss = -(y_true * np.log(p) + (1.0 - y_true) * np.log(1.0 - p))
+    return float(loss.mean())
+
+
+def auc_roc(y_true: np.ndarray, y_prob: np.ndarray) -> float:
+    if y_true.size == 0:
+        return 0.0
+    positives = int((y_true > 0.5).sum())
+    negatives = int((y_true <= 0.5).sum())
+    if positives == 0 or negatives == 0:
+        return 0.5
+    order = np.argsort(y_prob)
+    ranks = np.empty_like(order, dtype=float)
+    ranks[order] = np.arange(1, y_true.size + 1, dtype=float)
+    pos_ranks = ranks[y_true > 0.5].sum()
+    auc = (pos_ranks - positives * (positives + 1) / 2.0) / (positives * negatives)
+    return float(np.clip(auc, 0.0, 1.0))
+
+
+def pearson_corr(a: np.ndarray, b: np.ndarray) -> float:
+    if a.size == 0 or b.size == 0:
+        return 0.0
+    a_std = float(a.std())
+    b_std = float(b.std())
+    if a_std <= 1e-9 or b_std <= 1e-9:
+        return 0.0
+    return float(np.corrcoef(a, b)[0, 1])
+
+
+def v2_head_predict(
+    x_norm: np.ndarray,
+    head: Dict,
+    default_clip: float = 8.0,
+) -> np.ndarray:
+    weights = np.array(head.get("weights", []), dtype=float)
+    if x_norm.shape[1] != weights.size:
+        return np.zeros((x_norm.shape[0],), dtype=float)
+    bias = float(head.get("bias", 0.0))
+    clip = float(head.get("clip", default_clip))
+    temp = float(head.get("temperature", 1.0))
+    logits = bias + x_norm @ weights
+    return sigmoid(np.clip(logits, -clip, clip) / max(0.25, temp))
+
+
 def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, float]:
     if y_true.size == 0:
         return {"mae": 0.0, "rmse": 0.0, "r2": 0.0}
@@ -35,11 +94,107 @@ def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, float]:
     return {"mae": mae, "rmse": rmse, "r2": r2}
 
 
+def build_team_tick_frame(frame: pd.DataFrame) -> pd.DataFrame:
+    keep = frame.sort_values(["run_id", "tick", "bot_id"], kind="mergesort")
+    return keep.drop_duplicates(["run_id", "tick"], keep="first").copy()
+
+
+def summarize_runs(team_ticks: pd.DataFrame) -> pd.DataFrame:
+    if team_ticks.empty:
+        return pd.DataFrame(
+            columns=[
+                "run_id",
+                "final_score",
+                "items_delivered",
+                "orders_completed",
+                "ticks",
+                "delivered_per_100_ticks",
+            ]
+        )
+    grouped = team_ticks.groupby("run_id", sort=False)
+    out = grouped.agg(
+        final_score=("score", "max"),
+        items_delivered=("items_delivered_delta", "sum"),
+        orders_completed=("order_completed_delta", "sum"),
+        ticks=("tick", "max"),
+    ).reset_index()
+    out["ticks"] = out["ticks"].astype(int) + 1
+    out["delivered_per_100_ticks"] = (
+        out["items_delivered"].astype(float) * 100.0 / out["ticks"].clip(lower=1).astype(float)
+    )
+    return out
+
+
+def _expanded_event_ticks(group: pd.DataFrame, delta_col: str) -> list[int]:
+    ticks: list[int] = []
+    for tick, delta in zip(group["tick"].astype(int), group[delta_col].astype(int)):
+        for _ in range(max(0, delta)):
+            ticks.append(int(tick))
+    return ticks
+
+
+def run_completion_profile(team_ticks: pd.DataFrame, run_id: str) -> Dict[str, object]:
+    group = team_ticks[team_ticks["run_id"].astype(str) == str(run_id)].copy()
+    if group.empty:
+        return {}
+    group = group.sort_values("tick", kind="mergesort")
+    order_ticks = _expanded_event_ticks(group, "order_completed_delta")
+    item_ticks = _expanded_event_ticks(group, "items_delivered_delta")
+
+    order_gaps = np.diff(np.array(order_ticks, dtype=int)) if len(order_ticks) >= 2 else np.array([], dtype=int)
+    item_gaps = np.diff(np.array(item_ticks, dtype=int)) if len(item_ticks) >= 2 else np.array([], dtype=int)
+    return {
+        "run_id": str(run_id),
+        "final_score": int(group["score"].max()),
+        "items_delivered": int(group["items_delivered_delta"].sum()),
+        "orders_completed": int(group["order_completed_delta"].sum()),
+        "order_completion_ticks": [int(t) for t in order_ticks[:12]],
+        "item_delivery_ticks": [int(t) for t in item_ticks[:16]],
+        "order_completion_gap_mean": float(order_gaps.mean()) if order_gaps.size else 0.0,
+        "order_completion_gap_max": int(order_gaps.max()) if order_gaps.size else 0,
+        "item_delivery_gap_mean": float(item_gaps.mean()) if item_gaps.size else 0.0,
+        "item_delivery_gap_max": int(item_gaps.max()) if item_gaps.size else 0,
+    }
+
+
+def choose_run_id(
+    run_summary: pd.DataFrame,
+    preferred_run_id: Optional[str],
+    preferred_score: Optional[int],
+) -> Optional[str]:
+    if preferred_run_id:
+        run_id = str(preferred_run_id)
+        if run_id in set(run_summary["run_id"].astype(str)):
+            return run_id
+        return None
+    if preferred_score is None:
+        return None
+    score_matches = run_summary[run_summary["final_score"].astype(int) == int(preferred_score)].copy()
+    if score_matches.empty:
+        return None
+    score_matches = score_matches.sort_values(
+        ["orders_completed", "items_delivered", "run_id"],
+        ascending=[False, False, True],
+        kind="mergesort",
+    )
+    return str(score_matches.iloc[0]["run_id"])
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Evaluate a trained mode model.")
     parser.add_argument("--data", default="data/runs_features.parquet")
     parser.add_argument("--model", required=True)
     parser.add_argument("--mode", default=None)
+    parser.add_argument("--reference-run-id", default=None)
+    parser.add_argument("--candidate-run-id", default=None)
+    parser.add_argument("--reference-score", type=int, default=None)
+    parser.add_argument("--candidate-score", type=int, default=None)
+    parser.add_argument(
+        "--signature-kind",
+        choices=["action", "state_action"],
+        default="action",
+        help="Run-signature basis for duplicate-cluster diagnostics.",
+    )
     args = parser.parse_args()
 
     frame = read_table(Path(args.data))
@@ -52,17 +207,115 @@ def main() -> None:
 
     if "n_step_return" not in frame.columns:
         frame["n_step_return"] = frame["reward_proxy"]
-    for col in FEATURE_COLUMNS:
-        if col not in frame.columns:
-            frame[col] = 0.0
+    frame = ensure_columns(frame, FEATURE_COLUMNS, default=0.0)
+    frame = ensure_columns(frame, CONVERSION_LABEL_COLUMNS, default=0.0)
+    if "ordering_target" not in frame.columns:
+        frame["ordering_target"] = 0.0
 
     y_true = frame["n_step_return"].to_numpy(dtype=float)
     y_pred = score(frame, model.get("weights", {}))
-    result = {
+    result: Dict[str, object] = {
         "mode": mode,
         "rows": int(len(frame)),
         **compute_metrics(y_true, y_pred),
     }
+    team_ticks = build_team_tick_frame(frame)
+    run_summary = summarize_runs(team_ticks)
+    signature_by_run = build_run_signature_map(frame, signature_kind=args.signature_kind)
+    cluster_sizes = signature_cluster_sizes(signature_by_run)
+    cluster_counts = np.array(list(cluster_sizes.values()), dtype=int)
+    duplicated_clusters = int((cluster_counts > 1).sum()) if cluster_counts.size else 0
+    duplicate_runs = int(cluster_counts[cluster_counts > 1].sum() - duplicated_clusters) if cluster_counts.size else 0
+    best_run = (
+        run_summary.sort_values(
+            ["final_score", "orders_completed", "items_delivered", "run_id"],
+            ascending=[False, False, False, True],
+            kind="mergesort",
+        ).iloc[0]
+        if not run_summary.empty
+        else None
+    )
+    result["run_analysis"] = {
+        "runs": int(len(run_summary)),
+        "best_run_id": str(best_run["run_id"]) if best_run is not None else None,
+        "best_score": int(best_run["final_score"]) if best_run is not None else None,
+        "duplicate_signature_clusters": duplicated_clusters,
+        "duplicate_runs": duplicate_runs,
+        "top_cluster_sizes": [int(v) for v in sorted(cluster_sizes.values(), reverse=True)[:5]],
+    }
+
+    reference_run_id = choose_run_id(run_summary, args.reference_run_id, args.reference_score)
+    candidate_run_id = choose_run_id(run_summary, args.candidate_run_id, args.candidate_score)
+    if not reference_run_id and not candidate_run_id and not run_summary.empty:
+        auto_ref = choose_run_id(run_summary, None, 101)
+        auto_cand = choose_run_id(run_summary, None, 85)
+        if auto_ref and auto_cand:
+            reference_run_id = auto_ref
+            candidate_run_id = auto_cand
+    if reference_run_id and candidate_run_id:
+        ref_profile = run_completion_profile(team_ticks, reference_run_id)
+        cand_profile = run_completion_profile(team_ticks, candidate_run_id)
+        if ref_profile and cand_profile:
+            result["trajectory_diff"] = {
+                "reference": ref_profile,
+                "candidate": cand_profile,
+                "delta_items_delivered": int(ref_profile["items_delivered"]) - int(cand_profile["items_delivered"]),
+                "delta_orders_completed": int(ref_profile["orders_completed"]) - int(cand_profile["orders_completed"]),
+                "delta_score": int(ref_profile["final_score"]) - int(cand_profile["final_score"]),
+                "same_signature": bool(
+                    signature_by_run.get(reference_run_id, "") == signature_by_run.get(candidate_run_id, "")
+                    and signature_by_run.get(reference_run_id, "") != ""
+                ),
+            }
+
+    feature_columns = model.get("feature_columns", [])
+    heads = model.get("heads", {})
+    normalization = model.get("normalization", {})
+    if isinstance(feature_columns, list) and feature_columns and isinstance(heads, dict):
+        eval_cols = [str(c) for c in feature_columns]
+        frame = ensure_columns(frame, eval_cols, default=0.0)
+        x = frame[eval_cols].to_numpy(dtype=float)
+        mean = np.array(normalization.get("mean", [0.0] * len(eval_cols)), dtype=float)
+        std = np.array(normalization.get("std", [1.0] * len(eval_cols)), dtype=float)
+        if mean.size != len(eval_cols):
+            mean = np.zeros((len(eval_cols),), dtype=float)
+        if std.size != len(eval_cols):
+            std = np.ones((len(eval_cols),), dtype=float)
+        std = np.where(std <= 1e-9, 1.0, std)
+        x_norm = (x - mean) / std
+
+        pickup_probs = v2_head_predict(x_norm, heads.get("pickup", {}))
+        dropoff_probs = v2_head_predict(x_norm, heads.get("dropoff", {}))
+        ordering_head = heads.get("ordering", {})
+        ordering_weights = np.array(ordering_head.get("weights", []), dtype=float)
+        if ordering_weights.size == x_norm.shape[1]:
+            ordering_score = float(ordering_head.get("bias", 0.0)) + x_norm @ ordering_weights
+        else:
+            ordering_score = frame.get("ordering_score", pd.Series(np.zeros(len(frame)))).to_numpy(dtype=float)
+        eta = frame.get("dist_to_dropoff", pd.Series(np.ones(len(frame)))).to_numpy(dtype=float)
+        eta = np.clip(eta, 0.0, 99.0)
+        expected_score = ordering_score * pickup_probs * dropoff_probs / (eta + 1.0)
+        realized = frame.get("items_delivered_delta", pd.Series(np.zeros(len(frame)))).to_numpy(dtype=float)
+
+        pickup_mask = frame["pickup_attempt"].to_numpy(dtype=float) > 0.5
+        dropoff_mask = frame["dropoff_attempt"].to_numpy(dtype=float) > 0.5
+        pickup_true = frame["pickup_success"].to_numpy(dtype=float)[pickup_mask]
+        dropoff_true = frame["dropoff_success"].to_numpy(dtype=float)[dropoff_mask]
+        pickup_eval = pickup_probs[pickup_mask] if pickup_probs.size else np.zeros((0,))
+        dropoff_eval = dropoff_probs[dropoff_mask] if dropoff_probs.size else np.zeros((0,))
+        result["metrics_v2"] = {
+            "pickup": {
+                "rows": int(pickup_true.size),
+                "logloss": prob_logloss(pickup_true, pickup_eval),
+                "auc": auc_roc(pickup_true, pickup_eval),
+            },
+            "dropoff": {
+                "rows": int(dropoff_true.size),
+                "logloss": prob_logloss(dropoff_true, dropoff_eval),
+                "auc": auc_roc(dropoff_true, dropoff_eval),
+            },
+            "expected_score_delivery_corr": pearson_corr(expected_score, realized),
+        }
     print(json.dumps(result, indent=2))
 
 

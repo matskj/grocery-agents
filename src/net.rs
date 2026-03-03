@@ -4,8 +4,8 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
     process::Command,
-    sync::OnceLock,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    sync::{Arc, OnceLock},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use futures_util::{SinkExt, StreamExt};
@@ -19,6 +19,7 @@ use tokio_tungstenite::{
 use tracing::{info, warn};
 
 use crate::{
+    config::Config,
     dispatcher::Dispatcher,
     model::{
         to_wire_action_envelope, Action, ActionEnvelope, BotState, GameOver, GameState,
@@ -30,7 +31,7 @@ use crate::{
 
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 const ROUND_PLANNING_BUDGET: Duration = Duration::from_millis(1_400);
-const LOG_SCHEMA_VERSION: &str = "1.1.0";
+const LOG_SCHEMA_VERSION: &str = "1.2.0";
 
 #[derive(Debug, serde::Deserialize)]
 #[serde(untagged)]
@@ -53,6 +54,9 @@ struct PlanRoundResult {
     actions: Vec<Action>,
     invalid_action_count: u64,
     team_telemetry: serde_json::Value,
+    action_validated_by_bot: HashMap<String, bool>,
+    plan_ms: u64,
+    assign_ms: u64,
 }
 
 async fn connect_with_base_url(
@@ -68,11 +72,12 @@ async fn connect_with_base_url(
 pub async fn run_game_loop(
     ctx: RuntimeContext,
     mut policy: Policy,
+    config: Arc<Config>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let base_url = ctx.ws_url.clone().unwrap_or_else(|| {
         std::env::var("GROCERY_WS_URL").unwrap_or_else(|_| "ws://localhost:8765/ws".to_owned())
     });
-    let mut run_logger = RunLogger::new(&base_url);
+    let mut run_logger = RunLogger::new(&base_url, config.replay_dump_path.clone());
     let mut socket = match connect_with_base_url(&base_url, &ctx.token).await {
         Ok(socket) => socket,
         Err(err) => {
@@ -127,6 +132,7 @@ pub async fn run_game_loop(
                             &dispatcher,
                             &mut run_logger,
                             &mut mode_logged,
+                            config.as_ref(),
                             game_state,
                         )
                         .await?;
@@ -139,6 +145,7 @@ pub async fn run_game_loop(
                             &dispatcher,
                             &mut run_logger,
                             &mut mode_logged,
+                            config.as_ref(),
                             game_state,
                         )
                         .await?;
@@ -152,6 +159,7 @@ pub async fn run_game_loop(
                                 "mode": run_logger.last_mode.as_deref().unwrap_or("unknown"),
                                 "final_score": game_over.final_score,
                                 "reason": reason,
+                                "episode_counters": run_logger.episode_counters_json(),
                             }),
                         );
                         info!(
@@ -170,6 +178,7 @@ pub async fn run_game_loop(
                                 "mode": run_logger.last_mode.as_deref().unwrap_or("unknown"),
                                 "final_score": game_over.final_score,
                                 "reason": reason,
+                                "episode_counters": run_logger.episode_counters_json(),
                             }),
                         );
                         info!(
@@ -218,6 +227,7 @@ async fn handle_game_state(
     dispatcher: &Dispatcher,
     run_logger: &mut RunLogger,
     mode_logged: &mut bool,
+    config: &Config,
     game_state: GameState,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if !*mode_logged {
@@ -227,7 +237,7 @@ async fn handle_game_state(
 
     let planned = timeout(
         ROUND_PLANNING_BUDGET,
-        plan_round_actions(policy, dispatcher, &game_state),
+        plan_round_actions(policy, dispatcher, &game_state, config),
     )
     .await
     .unwrap_or_else(|_| {
@@ -247,15 +257,27 @@ async fn handle_game_state(
     });
 
     let envelope = ActionEnvelope {
-        actions: planned.actions,
+        actions: planned.actions.clone(),
     };
-    let analytics =
-        run_logger.observe_tick(
-            &game_state,
-            &envelope.actions,
-            planned.invalid_action_count,
-            &planned.team_telemetry,
+    let analytics = run_logger.observe_tick(
+        &game_state,
+        &envelope.actions,
+        planned.invalid_action_count,
+        &planned.team_telemetry,
+    );
+    if config.structured_bot_log {
+        log_structured_bot_ticks(run_logger, &game_state, &envelope.actions, &planned);
+    }
+    if config.ascii_render {
+        let frame = render_ascii_frame(&game_state, &envelope.actions, &planned.team_telemetry);
+        run_logger.log(
+            "ascii_render",
+            serde_json::json!({
+                "tick": game_state.tick,
+                "frame": frame,
+            }),
         );
+    }
     let payload = serde_json::to_string(&to_wire_action_envelope(&envelope.actions))?;
     let tick = game_state.tick;
     info!(
@@ -291,6 +313,7 @@ async fn handle_game_state(
             "tick_outcome": analytics.tick_outcome,
         }),
     );
+    run_logger.dump_replay(&game_state, &envelope.actions, &planned.team_telemetry);
     socket.send(Message::Text(payload.into())).await?;
     info!(tick, "sent round action envelope");
     Ok(())
@@ -299,6 +322,7 @@ async fn handle_game_state(
 struct RunLogger {
     file: Option<File>,
     path: Option<PathBuf>,
+    replay_dump_file: Option<File>,
     run_id: String,
     last_score: Option<i64>,
     last_items_remaining: Option<i64>,
@@ -306,10 +330,17 @@ struct RunLogger {
     prev_positions: HashMap<String, (i32, i32)>,
     blocked_ticks: HashMap<String, u8>,
     last_mode: Option<String>,
+    episode_moves: u64,
+    episode_waits: u64,
+    episode_pickups: u64,
+    episode_dropoffs: u64,
+    episode_invalids_prevented: u64,
+    episode_blocked_events: u64,
+    episode_near_dropoff_congestion_events: u64,
 }
 
 impl RunLogger {
-    fn new(base_url: &str) -> Self {
+    fn new(base_url: &str, replay_dump_path: Option<PathBuf>) -> Self {
         let dir = std::env::var("GAME_LOG_DIR").unwrap_or_else(|_| "logs".to_owned());
         let dir_path = Path::new(&dir);
         if let Err(err) = create_dir_all(dir_path) {
@@ -317,6 +348,7 @@ impl RunLogger {
             return Self {
                 file: None,
                 path: None,
+                replay_dump_file: None,
                 run_id: format!("run-{}", now_unix_millis()),
                 last_score: None,
                 last_items_remaining: None,
@@ -324,6 +356,13 @@ impl RunLogger {
                 prev_positions: HashMap::new(),
                 blocked_ticks: HashMap::new(),
                 last_mode: None,
+                episode_moves: 0,
+                episode_waits: 0,
+                episode_pickups: 0,
+                episode_dropoffs: 0,
+                episode_invalids_prevented: 0,
+                episode_blocked_events: 0,
+                episode_near_dropoff_congestion_events: 0,
             };
         }
 
@@ -337,6 +376,7 @@ impl RunLogger {
                 return Self {
                     file: None,
                     path: None,
+                    replay_dump_file: None,
                     run_id,
                     last_score: None,
                     last_items_remaining: None,
@@ -344,6 +384,13 @@ impl RunLogger {
                     prev_positions: HashMap::new(),
                     blocked_ticks: HashMap::new(),
                     last_mode: None,
+                    episode_moves: 0,
+                    episode_waits: 0,
+                    episode_pickups: 0,
+                    episode_dropoffs: 0,
+                    episode_invalids_prevented: 0,
+                    episode_blocked_events: 0,
+                    episode_near_dropoff_congestion_events: 0,
                 };
             }
         };
@@ -359,10 +406,46 @@ impl RunLogger {
             .unwrap_or_else(|_| "{\"event\":\"log_opened\"}".to_owned());
         let _ = writeln!(file, "{line}");
 
+        let replay_dump_file = replay_dump_path.and_then(|path| {
+            if let Some(parent) = path.parent() {
+                if let Err(err) = create_dir_all(parent) {
+                    warn!(
+                        error = %err,
+                        path = %path.display(),
+                        "failed creating replay dump parent"
+                    );
+                    return None;
+                }
+            }
+            match OpenOptions::new().create(true).append(true).open(&path) {
+                Ok(mut replay_file) => {
+                    let header = serde_json::json!({
+                        "event": "replay_dump_opened",
+                        "run_id": run_id,
+                        "schema_version": LOG_SCHEMA_VERSION,
+                        "ts_ms": now_unix_millis(),
+                    });
+                    if let Ok(line) = serde_json::to_string(&header) {
+                        let _ = writeln!(replay_file, "{line}");
+                    }
+                    Some(replay_file)
+                }
+                Err(err) => {
+                    warn!(
+                        error = %err,
+                        path = %path.display(),
+                        "failed opening replay dump file"
+                    );
+                    None
+                }
+            }
+        });
+
         info!(path = %path.display(), run_id = %run_id, "game log enabled");
         Self {
             file: Some(file),
             path: Some(path),
+            replay_dump_file,
             run_id,
             last_score: None,
             last_items_remaining: None,
@@ -370,6 +453,13 @@ impl RunLogger {
             prev_positions: HashMap::new(),
             blocked_ticks: HashMap::new(),
             last_mode: None,
+            episode_moves: 0,
+            episode_waits: 0,
+            episode_pickups: 0,
+            episode_dropoffs: 0,
+            episode_invalids_prevented: 0,
+            episode_blocked_events: 0,
+            episode_near_dropoff_congestion_events: 0,
         }
     }
 
@@ -414,6 +504,49 @@ impl RunLogger {
                 warn!(error = %err, "failed to serialize game log record");
             }
         }
+    }
+
+    fn dump_replay(
+        &mut self,
+        state: &GameState,
+        actions: &[Action],
+        team_telemetry: &serde_json::Value,
+    ) {
+        let Some(file) = self.replay_dump_file.as_mut() else {
+            return;
+        };
+        let record = serde_json::json!({
+            "event": "tick_replay",
+            "run_id": self.run_id,
+            "schema_version": LOG_SCHEMA_VERSION,
+            "ts_ms": now_unix_millis(),
+            "tick": state.tick,
+            "game_state": state,
+            "actions": actions,
+            "team_telemetry": team_telemetry,
+        });
+        match serde_json::to_string(&record) {
+            Ok(line) => {
+                if writeln!(file, "{line}").is_err() {
+                    self.replay_dump_file = None;
+                }
+            }
+            Err(err) => {
+                warn!(error = %err, "failed to serialize replay dump tick");
+            }
+        }
+    }
+
+    fn episode_counters_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "moves": self.episode_moves,
+            "waits": self.episode_waits,
+            "pickups": self.episode_pickups,
+            "dropoffs": self.episode_dropoffs,
+            "invalids_prevented": self.episode_invalids_prevented,
+            "blocked_events": self.episode_blocked_events,
+            "near_dropoff_congestion_events": self.episode_near_dropoff_congestion_events,
+        })
     }
 
     fn observe_tick(
@@ -488,6 +621,33 @@ impl RunLogger {
             .filter(|action| matches!(action, Action::Wait { .. }))
             .count() as u64;
         let non_wait_actions = actions.len() as u64 - wait_actions;
+        let move_actions = actions
+            .iter()
+            .filter(|action| matches!(action, Action::Move { .. }))
+            .count() as u64;
+        let pickup_actions = actions
+            .iter()
+            .filter(|action| matches!(action, Action::PickUp { .. }))
+            .count() as u64;
+        let dropoff_actions = actions
+            .iter()
+            .filter(|action| matches!(action, Action::DropOff { .. }))
+            .count() as u64;
+        self.episode_moves = self.episode_moves.saturating_add(move_actions);
+        self.episode_waits = self.episode_waits.saturating_add(wait_actions);
+        self.episode_pickups = self.episode_pickups.saturating_add(pickup_actions);
+        self.episode_dropoffs = self.episode_dropoffs.saturating_add(dropoff_actions);
+        self.episode_invalids_prevented = self
+            .episode_invalids_prevented
+            .saturating_add(invalid_action_count);
+        self.episode_blocked_events = self
+            .episode_blocked_events
+            .saturating_add(blocked_bot_count);
+        if dropoff_congestion >= 2 {
+            self.episode_near_dropoff_congestion_events = self
+                .episode_near_dropoff_congestion_events
+                .saturating_add(1);
+        }
 
         let mut team_summary = serde_json::Map::new();
         team_summary.insert("mode".to_owned(), serde_json::Value::String(mode));
@@ -519,6 +679,7 @@ impl RunLogger {
             "non_wait_action_count".to_owned(),
             serde_json::Value::Number(serde_json::Number::from(non_wait_actions)),
         );
+        team_summary.insert("episode_counters".to_owned(), self.episode_counters_json());
         if let Some(extra) = team_telemetry.as_object() {
             for (key, value) in extra {
                 team_summary.insert(key.clone(), value.clone());
@@ -607,6 +768,141 @@ fn action_label(action: &Action) -> String {
     }
 }
 
+fn log_structured_bot_ticks(
+    run_logger: &mut RunLogger,
+    state: &GameState,
+    actions: &[Action],
+    planned: &PlanRoundResult,
+) {
+    let mut action_by_bot: HashMap<&str, &Action> = HashMap::new();
+    for action in actions {
+        action_by_bot.insert(action.bot_id(), action);
+    }
+    let mut bots = state.bots.iter().collect::<Vec<_>>();
+    bots.sort_by(|a, b| a.id.cmp(&b.id));
+
+    let intents = planned
+        .team_telemetry
+        .get("selected_intents")
+        .and_then(serde_json::Value::as_object);
+    let goals = planned
+        .team_telemetry
+        .get("goal_cell_by_bot")
+        .and_then(serde_json::Value::as_object);
+    let blocked = planned
+        .team_telemetry
+        .get("blocked_ticks_by_bot")
+        .and_then(serde_json::Value::as_object);
+    let fallback_stage = planned
+        .team_telemetry
+        .get("planner_fallback_stage_by_bot")
+        .and_then(serde_json::Value::as_object);
+    let wait_reason = planned
+        .team_telemetry
+        .get("wait_reason_by_bot")
+        .and_then(serde_json::Value::as_object);
+
+    for bot in bots {
+        let action = action_by_bot
+            .get(bot.id.as_str())
+            .copied()
+            .map(action_label)
+            .unwrap_or_else(|| format!("{}:wait", bot.id));
+        let intent = intents
+            .and_then(|m| m.get(&bot.id))
+            .cloned()
+            .unwrap_or_else(|| serde_json::Value::String("unknown".to_owned()));
+        let goal_cell = goals
+            .and_then(|m| m.get(&bot.id))
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        let blocked_ticks = blocked
+            .and_then(|m| m.get(&bot.id))
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        let replan_reason = fallback_stage
+            .and_then(|m| m.get(&bot.id))
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| {
+                wait_reason
+                    .and_then(|m| m.get(&bot.id))
+                    .and_then(serde_json::Value::as_str)
+            })
+            .unwrap_or("none")
+            .to_owned();
+
+        run_logger.log(
+            "bot_tick",
+            serde_json::json!({
+                "tick": state.tick,
+                "bot_id": bot.id,
+                "pos": [bot.x, bot.y],
+                "intent": intent,
+                "goal_cell": goal_cell,
+                "chosen_action": action,
+                "action_validated": planned
+                    .action_validated_by_bot
+                    .get(&bot.id)
+                    .copied()
+                    .unwrap_or(false),
+                "blocked_ticks": blocked_ticks,
+                "replan_reason": replan_reason,
+                "plan_ms": planned.plan_ms,
+                "assign_ms": planned.assign_ms,
+            }),
+        );
+    }
+}
+
+fn render_ascii_frame(
+    state: &GameState,
+    actions: &[Action],
+    team_telemetry: &serde_json::Value,
+) -> String {
+    let width = state.grid.width.max(0) as usize;
+    let height = state.grid.height.max(0) as usize;
+    if width == 0 || height == 0 {
+        return "empty-grid".to_owned();
+    }
+
+    let mut cells = vec![vec!['.'; width]; height];
+    for [x, y] in &state.grid.walls {
+        if *x >= 0 && *y >= 0 && (*x as usize) < width && (*y as usize) < height {
+            cells[*y as usize][*x as usize] = '#';
+        }
+    }
+    for [x, y] in &state.grid.drop_off_tiles {
+        if *x >= 0 && *y >= 0 && (*x as usize) < width && (*y as usize) < height {
+            cells[*y as usize][*x as usize] = 'D';
+        }
+    }
+    for bot in &state.bots {
+        if bot.x >= 0 && bot.y >= 0 && (bot.x as usize) < width && (bot.y as usize) < height {
+            let ch = bot.id.chars().next().unwrap_or('B');
+            cells[bot.y as usize][bot.x as usize] = ch;
+        }
+    }
+
+    let mut lines = cells
+        .into_iter()
+        .map(|row| row.into_iter().collect::<String>())
+        .collect::<Vec<_>>();
+
+    let actions_line = format!(
+        "actions: {}",
+        actions
+            .iter()
+            .map(action_label)
+            .collect::<Vec<_>>()
+            .join(" ; ")
+    );
+    lines.push(actions_line);
+    if let Some(reserved) = team_telemetry.get("reserved_cells_by_t") {
+        lines.push(format!("reserved_cells_by_t: {reserved}"));
+    }
+    lines.join("\n")
+}
+
 fn game_mode_payload(state: &GameState) -> serde_json::Value {
     serde_json::json!({
         "mode": detect_mode_label(state),
@@ -622,10 +918,20 @@ async fn plan_round_actions(
     policy: &mut Policy,
     dispatcher: &Dispatcher,
     state: &GameState,
+    config: &Config,
 ) -> PlanRoundResult {
-    let proposed = policy.decide_round(state);
+    let plan_started = Instant::now();
+    let proposed = policy.decide_round(
+        state,
+        Duration::from_millis(config.planner_soft_budget_ms),
+    );
     let team_telemetry = policy.last_team_telemetry();
+    let assign_ms = team_telemetry
+        .get("assign_ms")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
     let mut invalid = 0u64;
+    let mut action_validated_by_bot = HashMap::new();
     let actions = state
         .bots
         .iter()
@@ -636,6 +942,7 @@ async fn plan_round_actions(
             if was_invalid {
                 invalid += 1;
             }
+            action_validated_by_bot.insert(bot.id.clone(), !was_invalid);
             validated
         })
         .collect::<Vec<_>>();
@@ -644,6 +951,9 @@ async fn plan_round_actions(
         actions,
         invalid_action_count: invalid,
         team_telemetry,
+        action_validated_by_bot,
+        plan_ms: plan_started.elapsed().as_millis() as u64,
+        assign_ms,
     }
 }
 
@@ -708,12 +1018,7 @@ fn fallback_wait_actions(state: &GameState) -> PlanRoundResult {
     let none_string_map = state
         .bots
         .iter()
-        .map(|bot| {
-            (
-                bot.id.clone(),
-                serde_json::Value::String("none".to_owned()),
-            )
-        })
+        .map(|bot| (bot.id.clone(), serde_json::Value::String("none".to_owned())))
         .collect::<serde_json::Map<_, _>>();
 
     PlanRoundResult {
@@ -733,7 +1038,15 @@ fn fallback_wait_actions(state: &GameState) -> PlanRoundResult {
             "cbs_timeout": false,
             "cbs_expanded_nodes": 0,
             "dropoff_target_status_by_bot": none_string_map,
+            "assign_ms": 0,
         }),
+        action_validated_by_bot: state
+            .bots
+            .iter()
+            .map(|bot| (bot.id.clone(), false))
+            .collect(),
+        plan_ms: 0,
+        assign_ms: 0,
     }
 }
 

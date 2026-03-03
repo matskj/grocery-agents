@@ -75,13 +75,15 @@ impl Dispatcher {
         let (active_missing, preview_missing) = self.compute_missing(state);
         let mode = detect_mode_label(state);
         let order_urgency = active_missing.values().copied().map(f64::from).sum::<f64>();
-        let mut carried_supply: HashMap<u16, u16> = HashMap::new();
-        for bot in &state.bots {
-            for item in &bot.carrying {
-                let item_id = self.intern(item);
-                *carried_supply.entry(item_id).or_insert(0) += 1;
-            }
-        }
+        let carried_supply = self.build_effective_carried_supply(state, map, dist, team);
+        let active_gap_total = active_missing
+            .iter()
+            .map(|(item, needed)| {
+                let covered = carried_supply.get(item).copied().unwrap_or(0);
+                needed.saturating_sub(covered)
+            })
+            .sum::<u16>();
+        let preview_enabled = active_gap_total == 0;
 
         let mut bot_order = state.bots.iter().collect::<Vec<_>>();
         bot_order.sort_by(|a, b| {
@@ -222,6 +224,15 @@ impl Dispatcher {
                         teammate_proximity,
                         order_urgency,
                         blocked_ticks: blocked_f,
+                        stand_failure_count_recent: 0.0,
+                        stand_success_count_recent: 0.0,
+                        stand_cooldown_ticks_remaining: 0.0,
+                        kind_failure_count_recent: 0.0,
+                        repeated_same_stand_no_delta_streak: 0.0,
+                        contention_at_stand_proxy: 0.0,
+                        time_since_last_conversion_tick: 0.0,
+                        last_conversion_was_pickup: 0.0,
+                        last_conversion_was_dropoff: 0.0,
                     },
                 );
                 if blocked >= 2 && active_pickups.len() > 1 {
@@ -243,42 +254,53 @@ impl Dispatcher {
                     });
                 }
 
-                let mut preview_pickups = self.choose_pickup_candidates(
-                    bot,
-                    state,
-                    map,
-                    dist,
-                    &preview_missing,
-                    &carried_supply,
-                    3,
-                    mode,
-                    CandidateFeatures {
-                        dist_to_nearest_active_item: 0.0,
-                        dist_to_dropoff: nearest_drop_dist,
-                        inventory_util,
-                        local_congestion,
-                        teammate_proximity,
-                        order_urgency: order_urgency * 0.5,
-                        blocked_ticks: blocked_f,
-                    },
-                );
-                if blocked >= 2 && preview_pickups.len() > 1 {
-                    preview_pickups.rotate_left(1);
-                }
-                for pick in preview_pickups {
-                    let intent = if pick.cell == bot_idx {
-                        Intent::PickUp {
-                            item_id: pick.item_id,
-                        }
-                    } else {
-                        Intent::MoveTo { cell: pick.cell }
-                    };
-                    candidates.push(IntentCandidate {
-                        bot_id: bot.id.clone(),
-                        target_cell: Some(pick.cell),
-                        score: 300.0 + pick.score + blocked_f * 0.25,
-                        intent,
-                    });
+                if preview_enabled {
+                    let mut preview_pickups = self.choose_pickup_candidates(
+                        bot,
+                        state,
+                        map,
+                        dist,
+                        &preview_missing,
+                        &carried_supply,
+                        3,
+                        mode,
+                        CandidateFeatures {
+                            dist_to_nearest_active_item: 0.0,
+                            dist_to_dropoff: nearest_drop_dist,
+                            inventory_util,
+                            local_congestion,
+                            teammate_proximity,
+                            order_urgency: order_urgency * 0.5,
+                            blocked_ticks: blocked_f,
+                            stand_failure_count_recent: 0.0,
+                            stand_success_count_recent: 0.0,
+                            stand_cooldown_ticks_remaining: 0.0,
+                            kind_failure_count_recent: 0.0,
+                            repeated_same_stand_no_delta_streak: 0.0,
+                            contention_at_stand_proxy: 0.0,
+                            time_since_last_conversion_tick: 0.0,
+                            last_conversion_was_pickup: 0.0,
+                            last_conversion_was_dropoff: 0.0,
+                        },
+                    );
+                    if blocked >= 2 && preview_pickups.len() > 1 {
+                        preview_pickups.rotate_left(1);
+                    }
+                    for pick in preview_pickups {
+                        let intent = if pick.cell == bot_idx {
+                            Intent::PickUp {
+                                item_id: pick.item_id,
+                            }
+                        } else {
+                            Intent::MoveTo { cell: pick.cell }
+                        };
+                        candidates.push(IntentCandidate {
+                            bot_id: bot.id.clone(),
+                            target_cell: Some(pick.cell),
+                            score: 300.0 + pick.score + blocked_f * 0.25,
+                            intent,
+                        });
+                    }
                 }
                 }
             }
@@ -523,7 +545,9 @@ impl Dispatcher {
                 if d != u16::MAX {
                     let mut features = base_features;
                     features.dist_to_nearest_active_item = f64::from(d);
-                    let model_score = maybe_score_pick(mode, features).unwrap_or(0.0);
+                    let model_score = maybe_score_pick(mode, features)
+                        .map(|score| score.combined_expected_score)
+                        .unwrap_or(0.0);
                     let heuristic = -(d as f64);
                     candidates.push(PickupCandidate {
                         item_id: item.id.clone(),
@@ -551,6 +575,45 @@ impl Dispatcher {
         self.item_rev.push(item_id.to_owned());
         self.item_intern.insert(item_id.to_owned(), id);
         id
+    }
+
+    fn build_effective_carried_supply(
+        &mut self,
+        state: &GameState,
+        map: &MapCache,
+        dist: &DistanceMap,
+        team: &TeamContext,
+    ) -> HashMap<u16, u16> {
+        const ACTIVE_SUPPLY_NEAR_DROP_MAX: u16 = 10;
+        const ACTIVE_SUPPLY_COURIER_DROP_MAX: u16 = 16;
+        let mut out: HashMap<u16, u16> = HashMap::new();
+        for bot in &state.bots {
+            if bot.carrying.is_empty() {
+                continue;
+            }
+            let Some(cell) = map.idx(bot.x, bot.y) else {
+                continue;
+            };
+            let near_drop = map
+                .dropoff_cells
+                .iter()
+                .copied()
+                .map(|drop| dist.dist(cell, drop))
+                .min()
+                .unwrap_or(u16::MAX);
+            let role = team.role_for(&bot.id);
+            let courier_role = matches!(role, BotRole::LeadCourier | BotRole::QueueCourier);
+            let serviceable = near_drop <= ACTIVE_SUPPLY_NEAR_DROP_MAX
+                || (courier_role && near_drop <= ACTIVE_SUPPLY_COURIER_DROP_MAX);
+            if !serviceable {
+                continue;
+            }
+            for item in &bot.carrying {
+                let item_id = self.intern(item);
+                *out.entry(item_id).or_insert(0) += 1;
+            }
+        }
+        out
     }
 }
 
@@ -794,6 +857,85 @@ mod tests {
                 .iter()
                 .all(|it| !matches!(it.intent, Intent::DropOff { .. })),
             "dispatcher emitted dropoff for pending order"
+        );
+    }
+
+    #[test]
+    fn preview_pickups_disabled_while_active_gap_exists() {
+        let state = GameState {
+            tick: 7,
+            grid: Grid {
+                width: 7,
+                height: 7,
+                drop_off_tiles: vec![[1, 1]],
+                walls: vec![[2, 3], [4, 3], [3, 2], [3, 4]],
+                ..Grid::default()
+            },
+            bots: vec![BotState {
+                id: "0".to_owned(),
+                x: 5,
+                y: 4,
+                carrying: vec![],
+                capacity: 3,
+            }],
+            items: vec![
+                Item {
+                    id: "item_active".to_owned(),
+                    kind: "milk".to_owned(),
+                    x: 3,
+                    y: 3,
+                },
+                Item {
+                    id: "item_preview".to_owned(),
+                    kind: "bread".to_owned(),
+                    x: 5,
+                    y: 5,
+                },
+            ],
+            orders: vec![
+                Order {
+                    id: "o_active".to_owned(),
+                    item_id: "milk".to_owned(),
+                    status: OrderStatus::InProgress,
+                },
+                Order {
+                    id: "o_preview".to_owned(),
+                    item_id: "bread".to_owned(),
+                    status: OrderStatus::Pending,
+                },
+            ],
+            ..GameState::default()
+        };
+        let world = World::new(state.clone());
+        let map = world.map();
+        let dist = DistanceMap::build(map);
+        let mut dispatcher = Dispatcher::new();
+        let team = TeamContext::build(
+            &state,
+            map,
+            &dist,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            TeamContextConfig::default(),
+        );
+        let intents = dispatcher.build_intents(&state, map, &dist, &HashMap::new(), &team);
+        assert!(
+            intents.iter().all(|it| {
+                !matches!(
+                    &it.intent,
+                    Intent::PickUp { item_id } if item_id == "item_preview"
+                )
+            }),
+            "preview pickup should be disabled while active gap exists"
         );
     }
 }

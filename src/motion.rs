@@ -28,12 +28,63 @@ pub struct MotionPlanDiagnostics {
     pub local_conflict_count_by_bot: HashMap<String, u16>,
     pub cbs_timeout: bool,
     pub cbs_expanded_nodes: u16,
+    pub budget_cutoff_waits: u16,
+    pub reserved_cells_by_t: HashMap<u8, Vec<u16>>,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct MotionPlanResult {
     pub actions: HashMap<String, PlannedAction>,
     pub diagnostics: MotionPlanDiagnostics,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ReservationTable {
+    vertex_res: HashSet<(u8, u16)>,
+    edge_res: HashSet<(u8, u16, u16)>,
+    dropoff_res: HashMap<(u8, u16), u8>,
+    dropoff_capacity: u8,
+}
+
+impl ReservationTable {
+    fn new(dropoff_capacity: u8) -> Self {
+        Self {
+            vertex_res: HashSet::new(),
+            edge_res: HashSet::new(),
+            dropoff_res: HashMap::new(),
+            dropoff_capacity: dropoff_capacity.max(1),
+        }
+    }
+
+    fn reserve_wait(&mut self, t: u8, cell: u16) {
+        self.vertex_res.insert((t, cell));
+    }
+
+    fn reserve_dropoff_slot(&mut self, t: u8, drop_cell: u16) {
+        let entry = self.dropoff_res.entry((t, drop_cell)).or_insert(0);
+        *entry = entry.saturating_add(1);
+    }
+
+    fn reserve_path(
+        &mut self,
+        path: &[u16],
+        reserve_horizon: u8,
+        max_horizon: u8,
+        dropoff_cells: &[u16],
+    ) {
+        let mut prev = path.first().copied().unwrap_or(0);
+        for t in 1..=reserve_horizon.min(max_horizon) {
+            let idx = usize::from(t).min(path.len().saturating_sub(1));
+            let next = path.get(idx).copied().unwrap_or(prev);
+            self.vertex_res.insert((t, next));
+            self.edge_res.insert((t, prev, next));
+            self.edge_res.insert((t, next, prev));
+            if dropoff_cells.contains(&next) {
+                self.reserve_dropoff_slot(t, next);
+            }
+            prev = next;
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -76,45 +127,61 @@ impl MotionPlanner {
         goals: &HashMap<String, u16>,
         reservation: &MovementReservation,
         explicit_order: &[String],
+        soft_deadline: Option<Instant>,
+        dropoff_capacity: u8,
     ) -> MotionPlanResult {
         let mut out = HashMap::with_capacity(state.bots.len());
-        let mut v_res: HashSet<(u8, u16)> = HashSet::new();
-        let mut e_res: HashSet<(u8, u16, u16)> = HashSet::new();
+        let mut res_table = ReservationTable::new(dropoff_capacity);
         let mut diagnostics = MotionPlanDiagnostics::default();
         let cbs_start = Instant::now();
         let cbs_budget = Duration::from_millis(3);
         let cbs_node_cap: u16 = 80;
-
-        let mut order_ix = HashMap::new();
-        for (ix, bot_id) in explicit_order.iter().enumerate() {
-            order_ix.insert(bot_id.as_str(), ix);
-        }
+        let _ = explicit_order;
         let mut bots = state.bots.iter().collect::<Vec<_>>();
-        bots.sort_by(|a, b| {
-            let ao = order_ix.get(a.id.as_str()).copied().unwrap_or(usize::MAX);
-            let bo = order_ix.get(b.id.as_str()).copied().unwrap_or(usize::MAX);
-            ao.cmp(&bo)
-                .then_with(|| {
-                    reservation
-                        .priorities
-                        .get(&a.id)
-                        .copied()
-                        .unwrap_or(u8::MAX)
-                        .cmp(
-                            &reservation
-                                .priorities
-                                .get(&b.id)
-                                .copied()
-                                .unwrap_or(u8::MAX),
-                        )
-                })
-                .then_with(|| a.id.cmp(&b.id))
-        });
+        bots.sort_by(|a, b| a.id.cmp(&b.id));
 
-        for bot in bots {
+        for (ix, bot) in bots.iter().enumerate() {
+            if soft_deadline
+                .map(|deadline| Instant::now() + Duration::from_millis(2) >= deadline)
+                .unwrap_or(false)
+            {
+                for pending in bots.iter().skip(ix) {
+                    if out.contains_key(&pending.id) {
+                        continue;
+                    }
+                    if let Some(start) = map.idx(pending.x, pending.y) {
+                        res_table.reserve_wait(1, start);
+                    }
+                    out.insert(
+                        pending.id.clone(),
+                        PlannedAction {
+                            action: Action::wait(pending.id.clone()),
+                            wait_reason: "timeout_fallback",
+                            fallback_stage: "budget_guard_wait",
+                            ordering_stage: "pmat_budget_guard",
+                            path_preview: Vec::new(),
+                        },
+                    );
+                    diagnostics.budget_cutoff_waits =
+                        diagnostics.budget_cutoff_waits.saturating_add(1);
+                }
+                break;
+            }
             let start = match map.idx(bot.x, bot.y) {
                 Some(v) => v,
-                None => continue,
+                None => {
+                    out.insert(
+                        bot.id.clone(),
+                        PlannedAction {
+                            action: Action::wait(bot.id.clone()),
+                            wait_reason: "no_path_with_constraints",
+                            fallback_stage: "invalid_start",
+                            ordering_stage: "pmat_ordered",
+                            path_preview: Vec::new(),
+                        },
+                    );
+                    continue;
+                }
             };
             let goal = goals.get(&bot.id).copied().unwrap_or(start);
             let blocked = reservation
@@ -133,7 +200,17 @@ impl MotionPlanner {
                 .copied()
                 .unwrap_or(BotRole::Idle);
             let outcome = self.pick_step_with_fallback(
-                start, goal, map, dist, &v_res, &e_res, blocked, &forbidden, role,
+                start,
+                goal,
+                map,
+                dist,
+                &res_table.vertex_res,
+                &res_table.edge_res,
+                &res_table.dropoff_res,
+                res_table.dropoff_capacity,
+                blocked,
+                &forbidden,
+                role,
             );
             let action = if outcome.step == start {
                 Action::wait(bot.id.clone())
@@ -147,19 +224,20 @@ impl MotionPlanner {
                 }
             };
 
-            let reserve_horizon = reservation
-                .reserve_horizon
-                .get(&bot.id)
-                .copied()
-                .unwrap_or(1)
-                .max(1);
-            self.reserve_path(
-                &outcome.path,
-                reserve_horizon,
-                &mut v_res,
-                &mut e_res,
-                self.horizon,
-            );
+            if outcome.path.len() > 1 && outcome.step != start {
+                let reserve_horizon = self
+                    .horizon
+                    .min(outcome.path.len().saturating_sub(1) as u8)
+                    .max(1);
+                res_table.reserve_path(
+                    &outcome.path,
+                    reserve_horizon,
+                    self.horizon,
+                    &map.dropoff_cells,
+                );
+            } else {
+                res_table.reserve_wait(1, start);
+            }
             out.insert(
                 bot.id.clone(),
                 PlannedAction {
@@ -172,39 +250,51 @@ impl MotionPlanner {
             );
         }
 
-        let cbs_result = self.resolve_dropoff_zone_conflicts(
-            state,
-            map,
-            dist,
-            goals,
-            reservation,
-            &mut out,
-            cbs_start,
-            cbs_budget,
-            cbs_node_cap,
-        );
-        if cbs_result.timeout {
-            for bot in &state.bots {
-                let Some(start) = map.idx(bot.x, bot.y) else {
-                    continue;
-                };
-                let goal = goals.get(&bot.id).copied().unwrap_or(start);
-                if !(reservation.dropoff_control_zone.contains(&start)
-                    || reservation.dropoff_control_zone.contains(&goal))
-                {
-                    continue;
-                }
-                if let Some(entry) = out.get_mut(&bot.id) {
-                    if entry.fallback_stage == "primary" {
-                        entry.fallback_stage = "cbs_fallback_prioritized";
+        if diagnostics.budget_cutoff_waits == 0 {
+            let cbs_result = self.resolve_dropoff_zone_conflicts(
+                state,
+                map,
+                dist,
+                goals,
+                reservation,
+                &mut out,
+                cbs_start,
+                cbs_budget,
+                cbs_node_cap,
+            );
+            if cbs_result.timeout {
+                for bot in &state.bots {
+                    let Some(start) = map.idx(bot.x, bot.y) else {
+                        continue;
+                    };
+                    let goal = goals.get(&bot.id).copied().unwrap_or(start);
+                    if !(reservation.dropoff_control_zone.contains(&start)
+                        || reservation.dropoff_control_zone.contains(&goal))
+                    {
+                        continue;
                     }
-                    entry.ordering_stage = "pmat_cbs_fallback";
+                    if let Some(entry) = out.get_mut(&bot.id) {
+                        if entry.fallback_stage == "primary" {
+                            entry.fallback_stage = "cbs_fallback_prioritized";
+                        }
+                        entry.ordering_stage = "pmat_cbs_fallback";
+                    }
                 }
             }
+            diagnostics.local_conflict_count_by_bot = cbs_result.local_conflict_count_by_bot;
+            diagnostics.cbs_timeout = cbs_result.timeout;
+            diagnostics.cbs_expanded_nodes = cbs_result.expanded_nodes;
         }
-        diagnostics.local_conflict_count_by_bot = cbs_result.local_conflict_count_by_bot;
-        diagnostics.cbs_timeout = cbs_result.timeout;
-        diagnostics.cbs_expanded_nodes = cbs_result.expanded_nodes;
+
+        let mut reserved_cells_by_t = HashMap::<u8, Vec<u16>>::new();
+        for &(t, cell) in &res_table.vertex_res {
+            reserved_cells_by_t.entry(t).or_default().push(cell);
+        }
+        for cells in reserved_cells_by_t.values_mut() {
+            cells.sort_unstable();
+            cells.dedup();
+        }
+        diagnostics.reserved_cells_by_t = reserved_cells_by_t;
 
         MotionPlanResult {
             actions: out,
@@ -221,6 +311,8 @@ impl MotionPlanner {
         dist: &DistanceMap,
         v_res: &HashSet<(u8, u16)>,
         e_res: &HashSet<(u8, u16, u16)>,
+        dropoff_res: &HashMap<(u8, u16), u8>,
+        dropoff_capacity: u8,
         blocked_moves: &[BlockedMove],
         forbidden_cells: &HashSet<u16>,
         role: BotRole,
@@ -232,6 +324,8 @@ impl MotionPlanner {
             dist,
             v_res,
             e_res,
+            dropoff_res,
+            dropoff_capacity,
             blocked_moves,
             forbidden_cells,
             self.horizon,
@@ -239,6 +333,13 @@ impl MotionPlanner {
         let step = primary.get(1).copied().unwrap_or(start);
         if step != start {
             return StepOutcome::move_step(step, primary, "primary");
+        }
+        if matches!(role, BotRole::Collector | BotRole::Yield) {
+            if let Some(egress) =
+                best_dropoff_egress_step(start, map, dist, forbidden_cells, blocked_moves)
+            {
+                return StepOutcome::move_step(egress, vec![start, egress], "dropoff_egress");
+            }
         }
 
         let base_reason =
@@ -263,6 +364,8 @@ impl MotionPlanner {
             dist,
             &reduced_v,
             &reduced_e,
+            dropoff_res,
+            dropoff_capacity,
             blocked_moves,
             forbidden_cells,
             10,
@@ -280,6 +383,8 @@ impl MotionPlanner {
                 dist,
                 v_res,
                 e_res,
+                dropoff_res,
+                dropoff_capacity,
                 blocked_moves,
                 &HashSet::new(),
                 self.horizon,
@@ -310,6 +415,8 @@ impl MotionPlanner {
         dist: &DistanceMap,
         v_res: &HashSet<(u8, u16)>,
         e_res: &HashSet<(u8, u16, u16)>,
+        dropoff_res: &HashMap<(u8, u16), u8>,
+        dropoff_capacity: u8,
         blocked_moves: &[BlockedMove],
         forbidden_cells: &HashSet<u16>,
         max_horizon: u8,
@@ -352,6 +459,11 @@ impl MotionPlanner {
                     continue;
                 }
                 if v_res.contains(&(nt, next)) || e_res.contains(&(nt, cell, next)) {
+                    continue;
+                }
+                if map.dropoff_cells.contains(&next)
+                    && dropoff_res.get(&(nt, next)).copied().unwrap_or(0) >= dropoff_capacity
+                {
                     continue;
                 }
                 if t == 0
@@ -402,25 +514,6 @@ impl MotionPlanner {
             path_rev.insert(0, start);
         }
         path_rev
-    }
-
-    fn reserve_path(
-        &self,
-        path: &[u16],
-        reserve_horizon: u8,
-        v_res: &mut HashSet<(u8, u16)>,
-        e_res: &mut HashSet<(u8, u16, u16)>,
-        max_horizon: u8,
-    ) {
-        let mut prev = path.first().copied().unwrap_or(0);
-        for t in 1..=reserve_horizon.min(max_horizon) {
-            let idx = usize::from(t).min(path.len().saturating_sub(1));
-            let next = path.get(idx).copied().unwrap_or(prev);
-            v_res.insert((t, next));
-            e_res.insert((t, prev, next));
-            e_res.insert((t, next, prev));
-            prev = next;
-        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -601,6 +694,8 @@ impl MotionPlanner {
             dist,
             &v_res,
             &e_res,
+            &HashMap::new(),
+            1,
             blocked,
             &forbidden,
             role,
@@ -888,6 +983,48 @@ fn best_local_sidestep(
         })
 }
 
+fn best_dropoff_egress_step(
+    start: u16,
+    map: &MapCache,
+    dist: &DistanceMap,
+    forbidden_cells: &HashSet<u16>,
+    blocked_moves: &[BlockedMove],
+) -> Option<u16> {
+    let start_drop_dist = map
+        .dropoff_cells
+        .iter()
+        .map(|&drop| dist.dist(start, drop))
+        .min()
+        .unwrap_or(u16::MAX);
+    if start_drop_dist > 2 {
+        return None;
+    }
+    map.neighbors[start as usize]
+        .iter()
+        .copied()
+        .filter(|next| !forbidden_cells.contains(next))
+        .filter(|next| !is_prohibited_step(start, *next, map, blocked_moves))
+        .filter(|next| {
+            let next_drop_dist = map
+                .dropoff_cells
+                .iter()
+                .map(|&drop| dist.dist(*next, drop))
+                .min()
+                .unwrap_or(u16::MAX);
+            next_drop_dist > start_drop_dist
+        })
+        .max_by_key(|next| {
+            let d = map
+                .dropoff_cells
+                .iter()
+                .map(|&drop| dist.dist(*next, drop))
+                .min()
+                .unwrap_or(u16::MAX);
+            let free_degree = map.neighbors[*next as usize].len() as i32;
+            i32::from(d.min(128)) + free_degree
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::{HashMap, HashSet};
@@ -982,7 +1119,7 @@ mod tests {
             map.idx(2, 1).expect("z2"),
         ]);
 
-        let result = planner.plan(&state, map, &dist, &goals, &reservation, &[]);
+        let result = planner.plan(&state, map, &dist, &goals, &reservation, &[], None, 1);
         let a_action = result.actions.get("a").expect("a action");
         let b_action = result.actions.get("b").expect("b action");
         let is_swap = matches!(a_action.action, Action::Move { dx: 1, dy: 0, .. })
@@ -1032,8 +1169,26 @@ mod tests {
         reservation.reserve_horizon.insert("b".to_owned(), 1);
         let explicit_order = vec!["b".to_owned(), "a".to_owned()];
 
-        let first = planner.plan(&state, map, &dist, &goals, &reservation, &explicit_order);
-        let second = planner.plan(&state, map, &dist, &goals, &reservation, &explicit_order);
+        let first = planner.plan(
+            &state,
+            map,
+            &dist,
+            &goals,
+            &reservation,
+            &explicit_order,
+            None,
+            1,
+        );
+        let second = planner.plan(
+            &state,
+            map,
+            &dist,
+            &goals,
+            &reservation,
+            &explicit_order,
+            None,
+            1,
+        );
         let a1 = first.actions.get("a").expect("a action first");
         let b1 = first.actions.get("b").expect("b action first");
         let a2 = second.actions.get("a").expect("a action second");

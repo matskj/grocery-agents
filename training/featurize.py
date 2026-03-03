@@ -1,12 +1,27 @@
 from __future__ import annotations
 
 import argparse
+from collections import defaultdict, deque
 from pathlib import Path
+from typing import Deque, DefaultDict
 
 import numpy as np
 import pandas as pd
 
-from .common import read_table, write_table
+from .common import (
+    CONVERSION_LABEL_COLUMNS,
+    RELIABILITY_FEATURE_COLUMNS,
+    ensure_columns,
+    read_table,
+    write_table,
+)
+
+RELIABILITY_WINDOW_TICKS = 40
+STAND_COOLDOWN_TICKS = 12
+MAX_COUNT_CLIP = 20.0
+MAX_STREAK_CLIP = 20.0
+MAX_CONTENTION_CLIP = 8.0
+MAX_TIME_SINCE_CONVERSION = 200.0
 
 
 def col(frame: pd.DataFrame, name: str) -> pd.Series:
@@ -59,6 +74,155 @@ def n_step_return(values: np.ndarray, n: int) -> np.ndarray:
     return out
 
 
+def clip_series(values: pd.Series, max_value: float) -> pd.Series:
+    return values.clip(lower=0.0, upper=max_value).astype(float)
+
+
+def _trim_window(events: Deque[int], tick: int) -> None:
+    while events and tick - events[0] > RELIABILITY_WINDOW_TICKS:
+        events.popleft()
+
+
+def compute_contention_proxy(frame: pd.DataFrame) -> pd.Series:
+    if frame.empty:
+        return pd.Series(np.zeros(0, dtype=float))
+    goal_counts = (
+        frame[frame["goal_cell_valid"] == 1]
+        .groupby(["run_id", "tick", "goal_cell_x", "goal_cell_y"], sort=False)
+        .size()
+        .rename("goal_claim_count")
+    )
+    merged = frame.join(
+        goal_counts,
+        on=["run_id", "tick", "goal_cell_x", "goal_cell_y"],
+    )
+    goal_proxy = (merged["goal_claim_count"].fillna(1.0).astype(float) - 1.0).clip(lower=0.0)
+
+    pickup_rows = frame[frame["pickup_attempt"] == 1]
+    pickup_counts = (
+        pickup_rows.groupby(["run_id", "tick", "stand_key"], sort=False)
+        .size()
+        .rename("pickup_stand_claim_count")
+    )
+    merged = merged.join(
+        pickup_counts,
+        on=["run_id", "tick", "stand_key"],
+    )
+    pickup_proxy = (
+        merged["pickup_stand_claim_count"].fillna(1.0).astype(float) - 1.0
+    ).clip(lower=0.0)
+    return np.maximum(goal_proxy.to_numpy(dtype=float), pickup_proxy.to_numpy(dtype=float))
+
+
+def compute_reliability_features(frame: pd.DataFrame) -> pd.DataFrame:
+    out = frame.copy()
+    out["stand_failure_count_recent"] = 0.0
+    out["stand_success_count_recent"] = 0.0
+    out["stand_cooldown_ticks_remaining"] = 0.0
+    out["kind_failure_count_recent"] = 0.0
+    out["repeated_same_stand_no_delta_streak"] = 0.0
+    out["time_since_last_conversion_tick"] = MAX_TIME_SINCE_CONVERSION
+    out["last_conversion_was_pickup"] = 0.0
+    out["last_conversion_was_dropoff"] = 0.0
+
+    for run_id, run_group in out.groupby("run_id", sort=False):
+        stand_fail_events: DefaultDict[str, Deque[int]] = defaultdict(deque)
+        stand_success_events: DefaultDict[str, Deque[int]] = defaultdict(deque)
+        kind_fail_events: DefaultDict[str, Deque[int]] = defaultdict(deque)
+        stand_last_fail_tick: dict[str, int] = {}
+        per_bot_last_failed_stand: dict[str, str] = {}
+        per_bot_same_stand_fail_streak: dict[str, int] = defaultdict(int)
+        last_conversion_tick_by_bot: dict[str, int] = {}
+        last_conversion_type_by_bot: dict[str, str] = {}
+
+        for idx in run_group.index:
+            tick = int(out.at[idx, "tick"])
+            bot_id = str(out.at[idx, "bot_id"])
+            stand_key = str(out.at[idx, "stand_key"])
+            kind_key = str(out.at[idx, "action_item_kind"])
+            pickup_attempt = int(out.at[idx, "pickup_attempt"]) == 1
+            pickup_success = int(out.at[idx, "pickup_success"]) == 1
+            dropoff_success = int(out.at[idx, "dropoff_success"]) == 1
+
+            stand_fail = stand_fail_events[stand_key]
+            stand_succ = stand_success_events[stand_key]
+            _trim_window(stand_fail, tick)
+            _trim_window(stand_succ, tick)
+            out.at[idx, "stand_failure_count_recent"] = float(len(stand_fail))
+            out.at[idx, "stand_success_count_recent"] = float(len(stand_succ))
+
+            if stand_key in stand_last_fail_tick:
+                age = tick - stand_last_fail_tick[stand_key]
+                cooldown = max(0, STAND_COOLDOWN_TICKS - age)
+            else:
+                cooldown = 0
+            out.at[idx, "stand_cooldown_ticks_remaining"] = float(cooldown)
+
+            if kind_key:
+                kind_fail = kind_fail_events[kind_key]
+                _trim_window(kind_fail, tick)
+                out.at[idx, "kind_failure_count_recent"] = float(len(kind_fail))
+            else:
+                out.at[idx, "kind_failure_count_recent"] = 0.0
+
+            last_tick = last_conversion_tick_by_bot.get(bot_id)
+            if last_tick is None:
+                out.at[idx, "time_since_last_conversion_tick"] = MAX_TIME_SINCE_CONVERSION
+            else:
+                out.at[idx, "time_since_last_conversion_tick"] = float(
+                    max(0, tick - last_tick)
+                )
+            last_type = last_conversion_type_by_bot.get(bot_id)
+            out.at[idx, "last_conversion_was_pickup"] = 1.0 if last_type == "pickup" else 0.0
+            out.at[idx, "last_conversion_was_dropoff"] = 1.0 if last_type == "dropoff" else 0.0
+            out.at[idx, "repeated_same_stand_no_delta_streak"] = float(
+                per_bot_same_stand_fail_streak.get(bot_id, 0)
+            )
+
+            if pickup_attempt:
+                if pickup_success:
+                    stand_success_events[stand_key].append(tick)
+                    per_bot_same_stand_fail_streak[bot_id] = 0
+                    per_bot_last_failed_stand.pop(bot_id, None)
+                else:
+                    stand_fail_events[stand_key].append(tick)
+                    stand_last_fail_tick[stand_key] = tick
+                    if kind_key:
+                        kind_fail_events[kind_key].append(tick)
+                    if per_bot_last_failed_stand.get(bot_id) == stand_key:
+                        per_bot_same_stand_fail_streak[bot_id] = (
+                            per_bot_same_stand_fail_streak.get(bot_id, 0) + 1
+                        )
+                    else:
+                        per_bot_same_stand_fail_streak[bot_id] = 1
+                    per_bot_last_failed_stand[bot_id] = stand_key
+
+            if pickup_success:
+                last_conversion_tick_by_bot[bot_id] = tick
+                last_conversion_type_by_bot[bot_id] = "pickup"
+            elif dropoff_success:
+                last_conversion_tick_by_bot[bot_id] = tick
+                last_conversion_type_by_bot[bot_id] = "dropoff"
+
+    out["stand_failure_count_recent"] = clip_series(out["stand_failure_count_recent"], MAX_COUNT_CLIP)
+    out["stand_success_count_recent"] = clip_series(out["stand_success_count_recent"], MAX_COUNT_CLIP)
+    out["stand_cooldown_ticks_remaining"] = clip_series(
+        out["stand_cooldown_ticks_remaining"], float(STAND_COOLDOWN_TICKS)
+    )
+    out["kind_failure_count_recent"] = clip_series(out["kind_failure_count_recent"], MAX_COUNT_CLIP)
+    out["repeated_same_stand_no_delta_streak"] = clip_series(
+        out["repeated_same_stand_no_delta_streak"], MAX_STREAK_CLIP
+    )
+    out["time_since_last_conversion_tick"] = clip_series(
+        out["time_since_last_conversion_tick"], MAX_TIME_SINCE_CONVERSION
+    )
+    out["last_conversion_was_pickup"] = out["last_conversion_was_pickup"].clip(lower=0.0, upper=1.0)
+    out["last_conversion_was_dropoff"] = out["last_conversion_was_dropoff"].clip(
+        lower=0.0, upper=1.0
+    )
+    return out
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Add training features and n-step targets.")
     parser.add_argument("--data", default="data/runs.parquet")
@@ -73,6 +237,17 @@ def main() -> None:
         return
 
     frame = frame.sort_values(["run_id", "bot_id", "tick"]).reset_index(drop=True)
+    frame = ensure_columns(
+        frame,
+        [
+            "goal_cell_x",
+            "goal_cell_y",
+            "goal_cell_valid",
+            "action_item_kind",
+            "carrying_count",
+        ],
+        default=0.0,
+    )
     for required in [
         "in_corner",
         "local_conflict_count",
@@ -92,6 +267,32 @@ def main() -> None:
     ]:
         if required not in frame.columns:
             frame[required] = 0
+    frame["action_item_kind"] = frame["action_item_kind"].fillna("").astype(str)
+    frame["goal_cell_x"] = frame["goal_cell_x"].astype(float).fillna(-1).astype(int)
+    frame["goal_cell_y"] = frame["goal_cell_y"].astype(float).fillna(-1).astype(int)
+    frame["goal_cell_valid"] = frame["goal_cell_valid"].astype(float).fillna(0).astype(int)
+    frame["stand_key"] = np.where(
+        frame["goal_cell_valid"] == 1,
+        frame["goal_cell_x"].astype(str) + ":" + frame["goal_cell_y"].astype(str),
+        frame["bot_x"].astype(int).astype(str) + ":" + frame["bot_y"].astype(int).astype(str),
+    )
+    frame["pickup_attempt"] = (frame["action_kind"] == "pick_up").astype(int)
+    frame["dropoff_attempt"] = (frame["action_kind"] == "drop_off").astype(int)
+    frame["next_carrying_count"] = frame.groupby(["run_id", "bot_id"], sort=False)[
+        "carrying_count"
+    ].shift(-1)
+    frame["pickup_success"] = (
+        (frame["pickup_attempt"] == 1)
+        & (frame["next_carrying_count"] > frame["carrying_count"])
+    ).astype(int)
+    frame["dropoff_success"] = (
+        (frame["dropoff_attempt"] == 1)
+        & (frame["next_carrying_count"] < frame["carrying_count"])
+    ).astype(int)
+    frame["contention_at_stand_proxy"] = compute_contention_proxy(frame)
+    frame["contention_at_stand_proxy"] = clip_series(
+        frame["contention_at_stand_proxy"], MAX_CONTENTION_CLIP
+    )
     frame["next_bot_x"] = frame.groupby(["run_id", "bot_id"], sort=False)["bot_x"].shift(-1)
     frame["next_bot_y"] = frame.groupby(["run_id", "bot_id"], sort=False)["bot_y"].shift(-1)
     frame["noop_move"] = (
@@ -168,6 +369,9 @@ def main() -> None:
     ]:
         frame[f"wait_reason_{reason}"] = (frame["wait_reason"] == reason).astype(int)
     frame["reward_proxy"] = reward_proxy(frame)
+    frame = compute_reliability_features(frame)
+    frame = ensure_columns(frame, CONVERSION_LABEL_COLUMNS, default=0.0)
+    frame = ensure_columns(frame, RELIABILITY_FEATURE_COLUMNS, default=0.0)
 
     result = []
     for (_, _, _), group in frame.groupby(["run_id", "bot_id", "mode"], sort=False):

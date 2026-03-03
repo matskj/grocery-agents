@@ -4,7 +4,7 @@ import argparse
 import json
 from collections import defaultdict
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 
@@ -35,6 +35,17 @@ def bot_metric_map(summary: Dict, key: str) -> Dict:
     if isinstance(raw, dict):
         return raw
     return {}
+
+
+def bot_goal_cell_map(summary: Dict, key: str) -> Dict[str, Tuple[int, int]]:
+    out: Dict[str, Tuple[int, int]] = {}
+    raw = summary.get(key, {})
+    if not isinstance(raw, dict):
+        return out
+    for bot_id, value in raw.items():
+        if isinstance(value, list) and len(value) == 2:
+            out[str(bot_id)] = (as_int(value[0], 0), as_int(value[1], 0))
+    return out
 
 
 def bool_flag(value: object) -> int:
@@ -70,6 +81,12 @@ def nearest_dropoff_distance(bot: Dict, dropoffs: List[List[int]]) -> float:
     bx = as_int(bot.get("x"), 0)
     by = as_int(bot.get("y"), 0)
     return float(min(abs(as_int(tile[0], 0) - bx) + abs(as_int(tile[1], 0) - by) for tile in dropoffs))
+
+
+def action_item_kind(action_kind: str, action_item_id: str, item_kind_by_id: Dict[str, str]) -> str:
+    if action_kind != "pick_up":
+        return ""
+    return str(item_kind_by_id.get(action_item_id, ""))
 
 
 def build_rows(logs_dir: Path) -> List[Dict]:
@@ -114,6 +131,11 @@ def build_rows(logs_dir: Path) -> List[Dict]:
             bots = bots if isinstance(bots, list) else []
             items = state.get("items", [])
             items = items if isinstance(items, list) else []
+            item_kind_by_id = {
+                str(item.get("id", "")): str(item.get("kind", ""))
+                for item in items
+                if isinstance(item, dict)
+            }
             orders = state.get("orders", [])
             orders = orders if isinstance(orders, list) else []
             grid = state.get("grid", {})
@@ -194,6 +216,11 @@ def build_rows(logs_dir: Path) -> List[Dict]:
             ordering_rank_by_bot = bot_metric_map(team_summary, "ordering_rank_by_bot")
             ordering_score_by_bot = bot_metric_map(team_summary, "ordering_score_by_bot")
             ordering_stage_by_bot = bot_metric_map(team_summary, "ordering_stage_by_bot")
+            goal_cell_by_bot = bot_goal_cell_map(team_summary, "goal_cell_by_bot")
+            pickup_fail_streak_by_bot = bot_metric_map(team_summary, "pickup_fail_streak_by_bot")
+            last_successful_drop_tick_by_bot = bot_metric_map(
+                team_summary, "last_successful_drop_tick_by_bot"
+            )
 
             for bot in bots:
                 bot_id = str(bot.get("id", ""))
@@ -230,6 +257,9 @@ def build_rows(logs_dir: Path) -> List[Dict]:
 
                 action = action_map.get(bot_id, {"kind": "wait", "bot_id": bot_id})
                 action_kind, action_dx, action_dy, action_item_id, action_order_id = parse_action(action)
+                goal_xy: Optional[Tuple[int, int]] = goal_cell_by_bot.get(bot_id)
+                goal_cell_x = goal_xy[0] if goal_xy else -1
+                goal_cell_y = goal_xy[1] if goal_xy else -1
                 move_target_x = bx + action_dx if action_kind == "move" else bx
                 move_target_y = by + action_dy if action_kind == "move" else by
                 move_target_in_bounds = (
@@ -362,7 +392,13 @@ def build_rows(logs_dir: Path) -> List[Dict]:
                     "action_dx": action_dx,
                     "action_dy": action_dy,
                     "action_item_id": action_item_id,
+                    "action_item_kind": action_item_kind(
+                        action_kind, action_item_id, item_kind_by_id
+                    ),
                     "action_order_id": action_order_id,
+                    "goal_cell_x": goal_cell_x,
+                    "goal_cell_y": goal_cell_y,
+                    "goal_cell_valid": 1 if goal_xy is not None else 0,
                     "attempted_move": 1 if action_kind == "move" else 0,
                     "move_target_x": move_target_x,
                     "move_target_y": move_target_y,
@@ -382,6 +418,10 @@ def build_rows(logs_dir: Path) -> List[Dict]:
                     "stuck_bot_count": as_int(team_summary.get("stuck_bot_count"), 0),
                     "wait_action_count": as_int(team_summary.get("wait_action_count"), 0),
                     "non_wait_action_count": as_int(team_summary.get("non_wait_action_count"), 0),
+                    "pickup_fail_streak": as_int(pickup_fail_streak_by_bot.get(bot_id), 0),
+                    "last_successful_drop_tick": as_int(
+                        last_successful_drop_tick_by_bot.get(bot_id), -1
+                    ),
                     "state_json": json.dumps(state, separators=(",", ":"), sort_keys=True),
                 }
                 rows.append(row)

@@ -31,7 +31,7 @@ use crate::{
 
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 const ROUND_PLANNING_BUDGET: Duration = Duration::from_millis(1_400);
-const LOG_SCHEMA_VERSION: &str = "1.1.0";
+const LOG_SCHEMA_VERSION: &str = "1.2.0";
 
 #[derive(Debug, serde::Deserialize)]
 #[serde(untagged)]

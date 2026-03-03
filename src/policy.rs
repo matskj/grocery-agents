@@ -42,6 +42,16 @@ struct BotMemory {
     dropoff_watchdog_triggered: bool,
     post_dropoff_retask_ticks_remaining: u8,
     egress_ticks_remaining: u8,
+    last_pickup_attempt: Option<PickupAttempt>,
+    pickup_fail_streak: u8,
+}
+
+#[derive(Debug, Clone)]
+struct PickupAttempt {
+    item_id: String,
+    stand_cell: u16,
+    tick: u64,
+    carrying_len: usize,
 }
 
 #[derive(Debug)]
@@ -60,6 +70,8 @@ pub struct Policy {
     forced_legacy_ticks_remaining: u8,
     stand_claims: HashMap<u16, StandClaim>,
     bot_commitments: HashMap<String, BotCommitment>,
+    depleted_item_ids: HashSet<String>,
+    pickup_failures_by_item: HashMap<String, u8>,
 }
 
 impl Policy {
@@ -79,11 +91,17 @@ impl Policy {
             forced_legacy_ticks_remaining: 0,
             stand_claims: HashMap::new(),
             bot_commitments: HashMap::new(),
+            depleted_item_ids: HashSet::new(),
+            pickup_failures_by_item: HashMap::new(),
         }
     }
 
     pub fn decide_round(&mut self, state: &GameState, soft_budget: Duration) -> Vec<Action> {
         let tick_started = Instant::now();
+        if state.tick == 0 {
+            self.depleted_item_ids.clear();
+            self.pickup_failures_by_item.clear();
+        }
         let world = World::new(state.clone());
         let map = world.map();
         let dist = DistanceMap::build(map);
@@ -96,7 +114,13 @@ impl Policy {
                 self.forced_legacy_ticks_remaining.saturating_sub(1);
         }
 
-        self.update_memory(state, map);
+        let newly_depleted = self.update_memory(state, map);
+        for item_id in newly_depleted {
+            self.depleted_item_ids.insert(item_id);
+        }
+        if !self.depleted_item_ids.is_empty() {
+            self.prune_depleted_targets(state, map);
+        }
         self.prune_coordination_state(state, map);
         let blocked_snapshot = self
             .memory
@@ -249,28 +273,29 @@ impl Policy {
         } else {
             AssignmentMode::LegacyOnly
         };
-        let global_result = if matches!(assignment_mode, AssignmentMode::LegacyOnly)
-            || forced_legacy_active
-        {
-            None
-        } else {
-            let remaining = soft_budget.saturating_sub(tick_started.elapsed());
-            self.assigner.build_intents(
-                state,
-                map,
-                &dist,
-                &team_ctx,
-                self.config.candidate_k,
-                self.config.lambda_density,
-                self.config.lambda_choke,
-                self.config.coord_area_balance_weight,
-                AssignmentRuntimeHints {
-                    late_phase_delivery_streak: self.ticks_since_dropoff,
-                    commitment_reassign_count: 0,
-                },
-                remaining,
-            )
-        };
+        let global_result =
+            if matches!(assignment_mode, AssignmentMode::LegacyOnly) || forced_legacy_active {
+                None
+            } else {
+                let remaining = soft_budget.saturating_sub(tick_started.elapsed());
+                self.assigner.build_intents(
+                    state,
+                    map,
+                    &dist,
+                    &team_ctx,
+                    self.config.candidate_k,
+                    self.config.lambda_density,
+                    self.config.lambda_choke,
+                    self.config.coord_area_balance_weight,
+                    AssignmentRuntimeHints {
+                        late_phase_delivery_streak: self.ticks_since_dropoff,
+                        commitment_reassign_count: 0,
+                        ticks_since_pickup: self.ticks_since_pickup,
+                        ticks_since_dropoff: self.ticks_since_dropoff,
+                    },
+                    remaining,
+                )
+            };
         let legacy_intents =
             self.dispatcher
                 .build_intents(state, map, &dist, &blocked_snapshot, &team_ctx);
@@ -372,7 +397,8 @@ impl Policy {
         } else {
             self.global_no_progress_streak = 0;
         };
-        rebalance_pickup_goal_crowding(
+        rebalance_pickup_goal_crowding(state, map, &dist, &team_ctx, &active_items, &mut intents);
+        let post_dropoff_retasked_bots = self.apply_post_dropoff_retask(
             state,
             map,
             &dist,
@@ -380,8 +406,6 @@ impl Policy {
             &active_items,
             &mut intents,
         );
-        let post_dropoff_retasked_bots =
-            self.apply_post_dropoff_retask(state, map, &dist, &team_ctx, &active_items, &mut intents);
         let claim_conflicts_resolved =
             self.apply_stand_commitments(state, map, &dist, &team_ctx, &active_items, &mut intents);
         let egress_forced_bots =
@@ -405,6 +429,11 @@ impl Policy {
             .iter()
             .map(|order| (order.id.clone(), order.item_id.clone()))
             .collect::<HashMap<_, _>>();
+        let item_kind_by_id = state
+            .items
+            .iter()
+            .map(|item| (item.id.as_str(), item.kind.as_str()))
+            .collect::<HashMap<_, _>>();
         let mut dropoff_target_status_by_bot = serde_json::Map::new();
         let mut serviceable_dropoff_by_bot = serde_json::Map::new();
         let mut dropoff_schedule_status_by_bot = serde_json::Map::new();
@@ -419,7 +448,12 @@ impl Policy {
             .map(|drop| {
                 (
                     drop,
-                    build_dropoff_staging_cells(drop, map, &dist, &team_ctx.traffic.conflict_hotspots),
+                    build_dropoff_staging_cells(
+                        drop,
+                        map,
+                        &dist,
+                        &team_ctx.traffic.conflict_hotspots,
+                    ),
                 )
             })
             .collect::<HashMap<_, _>>();
@@ -485,6 +519,7 @@ impl Policy {
 
             match intent {
                 Intent::DropOff { order_id } => {
+                    mem.last_pickup_attempt = None;
                     let status_label = match order_status_by_id.get(&order_id).copied() {
                         Some(crate::model::OrderStatus::InProgress) => "in_progress",
                         Some(crate::model::OrderStatus::Pending) => "pending",
@@ -570,6 +605,47 @@ impl Policy {
                 Intent::PickUp { item_id } => {
                     dropoff_target_status_by_bot
                         .insert(bot.id.clone(), serde_json::Value::String("none".to_owned()));
+                    mem.last_pickup_attempt = None;
+                    if self.depleted_item_ids.contains(&item_id) {
+                        if let Some(kind) = item_kind_by_id.get(item_id.as_str()) {
+                            if let Some(goal) = pick_alternate_stand_for_kind(
+                                state,
+                                map,
+                                &dist,
+                                cell,
+                                kind,
+                                &self.depleted_item_ids,
+                                Some(cell),
+                            ) {
+                                goals.insert(bot.id.clone(), goal);
+                            } else {
+                                immediate.insert(
+                                    bot.id.clone(),
+                                    PlannedAction {
+                                        action: Action::wait(bot.id.clone()),
+                                        wait_reason: "pickup_item_depleted",
+                                        fallback_stage: "depleted_pickup",
+                                        ordering_stage: "immediate",
+                                        path_preview: Vec::new(),
+                                    },
+                                );
+                            }
+                        } else {
+                            immediate.insert(
+                                bot.id.clone(),
+                                PlannedAction {
+                                    action: Action::wait(bot.id.clone()),
+                                    wait_reason: "pickup_item_unknown",
+                                    fallback_stage: "depleted_pickup",
+                                    ordering_stage: "immediate",
+                                    path_preview: Vec::new(),
+                                },
+                            );
+                        }
+                        self.bot_commitments.remove(&bot.id);
+                        self.stand_claims.retain(|_, claim| claim.bot_id != bot.id);
+                        continue;
+                    }
                     if bot
                         .carrying
                         .iter()
@@ -593,6 +669,12 @@ impl Policy {
                             );
                         }
                     } else {
+                        mem.last_pickup_attempt = Some(PickupAttempt {
+                            item_id: item_id.clone(),
+                            stand_cell: cell,
+                            tick: state.tick,
+                            carrying_len: bot.carrying.len(),
+                        });
                         immediate.insert(
                             bot.id.clone(),
                             PlannedAction {
@@ -609,6 +691,7 @@ impl Policy {
                     }
                 }
                 Intent::MoveTo { cell: mut goal } => {
+                    mem.last_pickup_attempt = None;
                     dropoff_target_status_by_bot
                         .insert(bot.id.clone(), serde_json::Value::String("none".to_owned()));
                     let carrying_active = bot
@@ -662,10 +745,8 @@ impl Policy {
                                     reserved_staging_cells.insert(stage);
                                     goal = stage;
                                     let (sx, sy) = map.xy(stage);
-                                    dropoff_staging_cell_by_bot.insert(
-                                        bot.id.clone(),
-                                        serde_json::json!([sx, sy]),
-                                    );
+                                    dropoff_staging_cell_by_bot
+                                        .insert(bot.id.clone(), serde_json::json!([sx, sy]));
                                     dropoff_schedule_status_by_bot.insert(
                                         bot.id.clone(),
                                         serde_json::Value::String("staging_wait_slot".to_owned()),
@@ -673,7 +754,9 @@ impl Policy {
                                 } else {
                                     dropoff_schedule_status_by_bot.insert(
                                         bot.id.clone(),
-                                        serde_json::Value::String("slot_reserved_direct".to_owned()),
+                                        serde_json::Value::String(
+                                            "slot_reserved_direct".to_owned(),
+                                        ),
                                     );
                                 }
                             } else {
@@ -715,6 +798,7 @@ impl Policy {
                     goals.insert(bot.id.clone(), goal);
                 }
                 Intent::Wait => {
+                    mem.last_pickup_attempt = None;
                     dropoff_target_status_by_bot
                         .insert(bot.id.clone(), serde_json::Value::String("none".to_owned()));
                     if let Some(goal) = queue_goal {
@@ -966,6 +1050,37 @@ impl Policy {
                 )
             })
             .collect::<serde_json::Map<_, _>>();
+        let pickup_fail_streak_by_bot = state
+            .bots
+            .iter()
+            .map(|bot| {
+                let streak = self
+                    .memory
+                    .get(&bot.id)
+                    .map(|m| m.pickup_fail_streak)
+                    .unwrap_or(0);
+                (
+                    bot.id.clone(),
+                    serde_json::Value::Number(serde_json::Number::from(streak as i64)),
+                )
+            })
+            .collect::<serde_json::Map<_, _>>();
+        let last_successful_drop_tick_by_bot = state
+            .bots
+            .iter()
+            .map(|bot| {
+                let tick = self
+                    .memory
+                    .get(&bot.id)
+                    .and_then(|m| m.last_successful_drop_tick)
+                    .map(|v| v as i64)
+                    .unwrap_or(-1);
+                (
+                    bot.id.clone(),
+                    serde_json::Value::Number(serde_json::Number::from(tick)),
+                )
+            })
+            .collect::<serde_json::Map<_, _>>();
         for bot in &state.bots {
             dropoff_target_status_by_bot
                 .entry(bot.id.clone())
@@ -1036,7 +1151,8 @@ impl Policy {
                     (
                         t.to_string(),
                         serde_json::Value::Array(
-                            cells.iter()
+                            cells
+                                .iter()
                                 .map(|idx| {
                                     let (x, y) = map.xy(*idx);
                                     serde_json::json!([x, y])
@@ -1087,6 +1203,14 @@ impl Policy {
                 serde_json::Value::Object(blocked_ticks_by_bot),
             );
             obj.insert(
+                "pickup_fail_streak_by_bot".to_owned(),
+                serde_json::Value::Object(pickup_fail_streak_by_bot),
+            );
+            obj.insert(
+                "last_successful_drop_tick_by_bot".to_owned(),
+                serde_json::Value::Object(last_successful_drop_tick_by_bot),
+            );
+            obj.insert(
                 "assign_ms".to_owned(),
                 serde_json::Value::Number(serde_json::Number::from(assign_ms)),
             );
@@ -1120,31 +1244,31 @@ impl Policy {
             obj.insert(
                 "assignment_active_task_count".to_owned(),
                 serde_json::Value::Number(serde_json::Number::from(
-                    assignment_active_task_count as i64
+                    assignment_active_task_count as i64,
                 )),
             );
             obj.insert(
                 "assignment_preview_task_count".to_owned(),
                 serde_json::Value::Number(serde_json::Number::from(
-                    assignment_preview_task_count as i64
+                    assignment_preview_task_count as i64,
                 )),
             );
             obj.insert(
                 "assignment_stand_task_count".to_owned(),
                 serde_json::Value::Number(serde_json::Number::from(
-                    assignment_stand_task_count as i64
+                    assignment_stand_task_count as i64,
                 )),
             );
             obj.insert(
                 "assignment_dropoff_task_count".to_owned(),
                 serde_json::Value::Number(serde_json::Number::from(
-                    assignment_dropoff_task_count as i64
+                    assignment_dropoff_task_count as i64,
                 )),
             );
             obj.insert(
                 "assignment_active_gap_total".to_owned(),
                 serde_json::Value::Number(serde_json::Number::from(
-                    assignment_active_gap_total as i64
+                    assignment_active_gap_total as i64,
                 )),
             );
             obj.insert(
@@ -1161,13 +1285,13 @@ impl Policy {
             obj.insert(
                 "assignment_late_phase_delivery_streak".to_owned(),
                 serde_json::Value::Number(serde_json::Number::from(
-                    assignment_late_phase_delivery_streak as i64
+                    assignment_late_phase_delivery_streak as i64,
                 )),
             );
             obj.insert(
                 "assignment_commitment_reassign_count".to_owned(),
                 serde_json::Value::Number(serde_json::Number::from(
-                    assignment_commitment_reassign_count as i64
+                    assignment_commitment_reassign_count as i64,
                 )),
             );
             obj.insert(
@@ -1179,6 +1303,18 @@ impl Policy {
                 serde_json::Value::String(
                     assignment_guard_trigger_reason.unwrap_or("none").to_owned(),
                 ),
+            );
+            obj.insert(
+                "depleted_item_count".to_owned(),
+                serde_json::Value::Number(serde_json::Number::from(
+                    self.depleted_item_ids.len() as i64
+                )),
+            );
+            obj.insert(
+                "pickup_failure_item_count".to_owned(),
+                serde_json::Value::Number(serde_json::Number::from(
+                    self.pickup_failures_by_item.len() as i64,
+                )),
             );
             obj.insert(
                 "dropoff_schedule_status_by_bot".to_owned(),
@@ -1198,33 +1334,39 @@ impl Policy {
             );
             obj.insert(
                 "ticks_since_dropoff".to_owned(),
-                serde_json::Value::Number(serde_json::Number::from(self.ticks_since_dropoff as i64)),
+                serde_json::Value::Number(serde_json::Number::from(
+                    self.ticks_since_dropoff as i64,
+                )),
             );
             obj.insert(
                 "unique_goal_cells_last_n".to_owned(),
                 serde_json::Value::Number(serde_json::Number::from(
-                    self.unique_goal_cells_recent() as i64
+                    self.unique_goal_cells_recent() as i64,
                 )),
             );
             obj.insert(
                 "forced_legacy_ticks_remaining".to_owned(),
                 serde_json::Value::Number(serde_json::Number::from(
-                    self.forced_legacy_ticks_remaining as i64
+                    self.forced_legacy_ticks_remaining as i64,
                 )),
             );
             obj.insert(
                 "global_no_progress_streak".to_owned(),
                 serde_json::Value::Number(serde_json::Number::from(
-                    self.global_no_progress_streak as i64
+                    self.global_no_progress_streak as i64,
                 )),
             );
             obj.insert(
                 "post_dropoff_retasked_bots".to_owned(),
-                serde_json::Value::Number(serde_json::Number::from(post_dropoff_retasked_bots as i64)),
+                serde_json::Value::Number(serde_json::Number::from(
+                    post_dropoff_retasked_bots as i64,
+                )),
             );
             obj.insert(
                 "claim_conflicts_resolved".to_owned(),
-                serde_json::Value::Number(serde_json::Number::from(claim_conflicts_resolved as i64)),
+                serde_json::Value::Number(serde_json::Number::from(
+                    claim_conflicts_resolved as i64,
+                )),
             );
             obj.insert(
                 "egress_forced_bots".to_owned(),
@@ -1328,13 +1470,28 @@ impl Policy {
             .collect::<HashSet<_>>();
         self.bot_commitments
             .retain(|bot_id, _| known_bots.contains(bot_id.as_str()));
-        let valid_goal_cells = self
-            .stand_claims
-            .keys()
-            .copied()
-            .collect::<HashSet<_>>();
+        let valid_goal_cells = self.stand_claims.keys().copied().collect::<HashSet<_>>();
         self.bot_commitments
             .retain(|_, c| valid_goal_cells.contains(&c.goal_cell));
+    }
+
+    fn prune_depleted_targets(&mut self, state: &GameState, map: &crate::world::MapCache) {
+        if self.depleted_item_ids.is_empty() {
+            return;
+        }
+        let mut viable_stands = HashSet::<u16>::new();
+        for item in &state.items {
+            if self.depleted_item_ids.contains(&item.id) {
+                continue;
+            }
+            for &stand in map.stand_cells_for_item(&item.id) {
+                viable_stands.insert(stand);
+            }
+        }
+        self.stand_claims
+            .retain(|cell, _| viable_stands.contains(cell));
+        self.bot_commitments
+            .retain(|_, commitment| viable_stands.contains(&commitment.goal_cell));
     }
 
     fn invalidate_stale_commitments(
@@ -1359,7 +1516,10 @@ impl Policy {
             if carrying_active || bot.carrying.len() >= bot.capacity {
                 continue;
             }
-            if matches!(team.role_for(&bot.id), BotRole::LeadCourier | BotRole::QueueCourier) {
+            if matches!(
+                team.role_for(&bot.id),
+                BotRole::LeadCourier | BotRole::QueueCourier
+            ) {
                 continue;
             }
             let since = state.tick.saturating_sub(commitment.last_progress_tick);
@@ -1429,31 +1589,42 @@ impl Policy {
             if carrying_active || bot.carrying.len() >= bot.capacity {
                 continue;
             }
-            if matches!(team.role_for(&bot.id), BotRole::LeadCourier | BotRole::QueueCourier) {
+            if matches!(
+                team.role_for(&bot.id),
+                BotRole::LeadCourier | BotRole::QueueCourier
+            ) {
                 continue;
             }
             let Some(start) = map.idx(bot.x, bot.y) else {
                 continue;
             };
-            let Some((goal_cell, item_kind)) =
-                choose_best_active_stand(
-                    start,
-                    team,
-                    map,
-                    dist,
-                    &self.stand_claims,
-                    &bot_id,
-                    self.config.coord_area_balance_weight,
-                    max_per_stand,
-                    state.tick,
-                )
-            else {
+            let Some((goal_cell, item_kind)) = choose_best_active_stand(
+                start,
+                team,
+                map,
+                dist,
+                state,
+                &self.stand_claims,
+                &bot_id,
+                self.config.coord_area_balance_weight,
+                max_per_stand,
+                state.tick,
+                &self.depleted_item_ids,
+            ) else {
                 continue;
             };
             let Some(&idx) = idx_by_bot.get(&bot.id) else {
                 continue;
             };
-            intents[idx].intent = build_pick_or_move_intent(state, map, start, goal_cell, &item_kind);
+            intents[idx].intent = build_pick_or_move_intent(
+                state,
+                map,
+                dist,
+                start,
+                goal_cell,
+                &item_kind,
+                &self.depleted_item_ids,
+            );
             self.bot_commitments.insert(
                 bot.id.clone(),
                 BotCommitment {
@@ -1499,6 +1670,9 @@ impl Policy {
             if !active_items.contains(item.kind.as_str()) {
                 continue;
             }
+            if self.depleted_item_ids.contains(&item.id) {
+                continue;
+            }
             for &stand in map.stand_cells_for_item(&item.id) {
                 active_stands.insert(stand);
             }
@@ -1519,7 +1693,10 @@ impl Policy {
         let mut bots = state.bots.iter().collect::<Vec<_>>();
         bots.sort_by(|a, b| a.id.cmp(&b.id));
         for bot in bots {
-            if matches!(team.role_for(&bot.id), BotRole::LeadCourier | BotRole::QueueCourier) {
+            if matches!(
+                team.role_for(&bot.id),
+                BotRole::LeadCourier | BotRole::QueueCourier
+            ) {
                 continue;
             }
             let Some(&intent_idx) = idx_by_bot.get(&bot.id) else {
@@ -1549,11 +1726,13 @@ impl Policy {
                             team,
                             map,
                             dist,
+                            state,
                             &self.stand_claims,
                             &bot.id,
                             self.config.coord_area_balance_weight,
                             max_per_stand,
                             state.tick,
+                            &self.depleted_item_ids,
                         )
                         .map(|(cell, kind)| (cell, kind, true))
                     } else {
@@ -1604,11 +1783,13 @@ impl Policy {
                     team,
                     map,
                     dist,
+                    state,
                     &self.stand_claims,
                     &bot.id,
                     self.config.coord_area_balance_weight,
                     max_per_stand,
                     state.tick,
+                    &self.depleted_item_ids,
                 ) {
                     goal = alt_goal;
                     kind = alt_kind;
@@ -1616,7 +1797,15 @@ impl Policy {
                     continue;
                 }
             }
-            intents[intent_idx].intent = build_pick_or_move_intent(state, map, start, goal, &kind);
+            intents[intent_idx].intent = build_pick_or_move_intent(
+                state,
+                map,
+                dist,
+                start,
+                goal,
+                &kind,
+                &self.depleted_item_ids,
+            );
             self.stand_claims.insert(
                 goal,
                 StandClaim {
@@ -1652,7 +1841,12 @@ impl Policy {
         for (idx, entry) in intents.iter().enumerate() {
             idx_by_bot.insert(entry.bot_id.clone(), idx);
         }
-        let ring = team.queue.ring_cells.iter().copied().collect::<HashSet<_>>();
+        let ring = team
+            .queue
+            .ring_cells
+            .iter()
+            .copied()
+            .collect::<HashSet<_>>();
         let lane = team
             .queue
             .lane_cells
@@ -1685,7 +1879,10 @@ impl Policy {
             if mem.egress_ticks_remaining == 0 || !bot.carrying.is_empty() {
                 continue;
             }
-            if matches!(team.role_for(&bot.id), BotRole::LeadCourier | BotRole::QueueCourier) {
+            if matches!(
+                team.role_for(&bot.id),
+                BotRole::LeadCourier | BotRole::QueueCourier
+            ) {
                 continue;
             }
             let Some(cell) = map.idx(bot.x, bot.y) else {
@@ -1697,12 +1894,7 @@ impl Policy {
             let Some(&idx) = idx_by_bot.get(&bot.id) else {
                 continue;
             };
-            if intent_is_active_aligned(
-                bot,
-                &intents[idx].intent,
-                team,
-                &item_kind_by_id,
-            ) {
+            if intent_is_active_aligned(bot, &intents[idx].intent, team, &item_kind_by_id) {
                 continue;
             }
             let candidate = map.neighbors[cell as usize]
@@ -1732,7 +1924,8 @@ impl Policy {
         forced
     }
 
-    fn update_memory(&mut self, state: &GameState, map: &crate::world::MapCache) {
+    fn update_memory(&mut self, state: &GameState, map: &crate::world::MapCache) -> Vec<String> {
+        let mut newly_depleted = Vec::<String>::new();
         for bot in &state.bots {
             let cell = map.idx(bot.x, bot.y).unwrap_or(0);
             let mem = self.memory.entry(bot.id.clone()).or_default();
@@ -1778,12 +1971,39 @@ impl Policy {
                 }
             }
 
+            if let Some(attempt) = mem.last_pickup_attempt.take() {
+                if state.tick > attempt.tick {
+                    let succeeded = bot.carrying.len() > attempt.carrying_len;
+                    if succeeded {
+                        mem.pickup_fail_streak = 0;
+                        self.pickup_failures_by_item.remove(&attempt.item_id);
+                    } else if bot.carrying.len() <= attempt.carrying_len
+                        && attempt.stand_cell == cell
+                    {
+                        mem.pickup_fail_streak = mem.pickup_fail_streak.saturating_add(1);
+                        let fail = self
+                            .pickup_failures_by_item
+                            .entry(attempt.item_id.clone())
+                            .or_insert(0);
+                        *fail = fail.saturating_add(1);
+                        if *fail >= pickup_deplete_fail_threshold() {
+                            newly_depleted.push(attempt.item_id);
+                        }
+                    } else {
+                        mem.pickup_fail_streak = 0;
+                    }
+                } else {
+                    mem.last_pickup_attempt = Some(attempt);
+                }
+            }
+
             if !mem.prev_carrying.is_empty() && bot.carrying.len() < mem.prev_carrying.len() {
                 mem.same_dropoff_order_streak = 0;
                 mem.last_dropoff_order_id = None;
                 mem.last_successful_drop_tick = Some(state.tick);
                 mem.dropoff_ban_ticks_by_order.clear();
-                mem.post_dropoff_retask_ticks_remaining = self.config.coord_post_dropoff_retask_ticks;
+                mem.post_dropoff_retask_ticks_remaining =
+                    self.config.coord_post_dropoff_retask_ticks;
                 mem.egress_ticks_remaining = 1;
                 if let Some(commitment) = self.bot_commitments.get_mut(&bot.id) {
                     commitment.last_progress_tick = state.tick;
@@ -1802,6 +2022,9 @@ impl Policy {
             mem.prev_cell = Some(cell);
             mem.prev_carrying = bot.carrying.clone();
         }
+        newly_depleted.sort();
+        newly_depleted.dedup();
+        newly_depleted
     }
 
     fn capture_last_moves(
@@ -1889,14 +2112,8 @@ fn merge_hybrid_intents(
                 .carrying
                 .iter()
                 .any(|item| team_ctx.active_order_items_set.contains(item));
-            let global_intent = global_by_bot
-                .get(&bot.id)
-                .cloned()
-                .unwrap_or(Intent::Wait);
-            let legacy_intent = legacy_by_bot
-                .get(&bot.id)
-                .cloned()
-                .unwrap_or(Intent::Wait);
+            let global_intent = global_by_bot.get(&bot.id).cloned().unwrap_or(Intent::Wait);
+            let legacy_intent = legacy_by_bot.get(&bot.id).cloned().unwrap_or(Intent::Wait);
             let intent = if carrying_active {
                 prefer_non_wait(global_intent, legacy_intent)
             } else if active_phase {
@@ -2007,7 +2224,9 @@ fn intent_is_active_aligned(
         Intent::MoveTo { cell } => {
             if let Some(kind) = team_ctx.knowledge.stand_to_kind.get(cell) {
                 team_ctx.active_order_items_set.contains(kind)
-            } else if team_ctx.queue.ring_cells.contains(cell) || team_ctx.queue.lane_cells.contains(cell) {
+            } else if team_ctx.queue.ring_cells.contains(cell)
+                || team_ctx.queue.lane_cells.contains(cell)
+            {
                 bot.carrying
                     .iter()
                     .any(|item| team_ctx.active_order_items_set.contains(item))
@@ -2079,10 +2298,7 @@ fn rebalance_pickup_goal_crowding(
         ) {
             continue;
         }
-        crowd_by_goal
-            .entry(cell)
-            .or_default()
-            .push(bot.id.clone());
+        crowd_by_goal.entry(cell).or_default().push(bot.id.clone());
     }
 
     let mut crowd_load = crowd_by_goal
@@ -2165,9 +2381,11 @@ fn rebalance_pickup_goal_crowding(
 fn build_pick_or_move_intent(
     state: &GameState,
     map: &crate::world::MapCache,
+    dist: &DistanceMap,
     bot_cell: u16,
     goal_cell: u16,
     item_kind: &str,
+    depleted_item_ids: &HashSet<String>,
 ) -> Intent {
     if bot_cell != goal_cell {
         return Intent::MoveTo { cell: goal_cell };
@@ -2176,6 +2394,7 @@ fn build_pick_or_move_intent(
         .items
         .iter()
         .filter(|item| item.kind == item_kind)
+        .filter(|item| !depleted_item_ids.contains(&item.id))
         .filter_map(|item| {
             let stands = map.stand_cells_for_item(&item.id);
             if stands.contains(&goal_cell) {
@@ -2191,7 +2410,17 @@ fn build_pick_or_move_intent(
             item_id: item_id.clone(),
         }
     } else {
-        Intent::MoveTo { cell: goal_cell }
+        let next = pick_alternate_stand_for_kind(
+            state,
+            map,
+            dist,
+            bot_cell,
+            item_kind,
+            depleted_item_ids,
+            Some(goal_cell),
+        );
+        next.map(|cell| Intent::MoveTo { cell })
+            .unwrap_or(Intent::Wait)
     }
 }
 
@@ -2200,11 +2429,13 @@ fn choose_best_active_stand(
     team: &TeamContext,
     map: &crate::world::MapCache,
     dist: &DistanceMap,
+    state: &GameState,
     stand_claims: &HashMap<u16, StandClaim>,
     bot_id: &str,
     area_balance_weight: f64,
     max_per_stand: u8,
     now_tick: u64,
+    depleted_item_ids: &HashSet<String>,
 ) -> Option<(u16, String)> {
     let mut kinds = team
         .knowledge
@@ -2220,6 +2451,9 @@ fn choose_best_active_stand(
             continue;
         };
         for &stand in stands {
+            if !stand_has_viable_item(state, map, stand, &kind, depleted_item_ids) {
+                continue;
+            }
             let claim_load = stand_claims
                 .iter()
                 .filter(|(cell, claim)| {
@@ -2242,8 +2476,7 @@ fn choose_best_active_stand(
                 .get(&area)
                 .copied()
                 .unwrap_or(0);
-            let choke = 4u16
-                .saturating_sub(map.neighbors[stand as usize].len().min(4) as u16);
+            let choke = 4u16.saturating_sub(map.neighbors[stand as usize].len().min(4) as u16);
             let score = d
                 + (area_balance_weight * f64::from(area_load)).round() as i32
                 + i32::from(claim_load) * 2
@@ -2252,7 +2485,8 @@ fn choose_best_active_stand(
                 Some((best_score, best_cell, ref best_kind))
                     if score > best_score
                         || (score == best_score
-                            && (stand > best_cell || (stand == best_cell && kind > *best_kind))) => {}
+                            && (stand > best_cell
+                                || (stand == best_cell && kind > *best_kind))) => {}
                 _ => {
                     best = Some((score, stand, kind.clone()));
                 }
@@ -2260,6 +2494,50 @@ fn choose_best_active_stand(
         }
     }
     best.map(|(_, cell, kind)| (cell, kind))
+}
+
+fn stand_has_viable_item(
+    state: &GameState,
+    map: &crate::world::MapCache,
+    stand: u16,
+    item_kind: &str,
+    depleted_item_ids: &HashSet<String>,
+) -> bool {
+    state
+        .items
+        .iter()
+        .filter(|item| item.kind == item_kind)
+        .filter(|item| !depleted_item_ids.contains(&item.id))
+        .any(|item| map.stand_cells_for_item(&item.id).contains(&stand))
+}
+
+fn pick_alternate_stand_for_kind(
+    state: &GameState,
+    map: &crate::world::MapCache,
+    dist: &DistanceMap,
+    start: u16,
+    item_kind: &str,
+    depleted_item_ids: &HashSet<String>,
+    exclude: Option<u16>,
+) -> Option<u16> {
+    let mut stands = state
+        .items
+        .iter()
+        .filter(|item| item.kind == item_kind)
+        .filter(|item| !depleted_item_ids.contains(&item.id))
+        .flat_map(|item| map.stand_cells_for_item(&item.id).iter().copied())
+        .collect::<Vec<_>>();
+    stands.sort_unstable();
+    stands.dedup();
+    if let Some(ex) = exclude {
+        stands.retain(|cell| *cell != ex);
+    }
+    stands.sort_by(|a, b| {
+        dist.dist(start, *a)
+            .cmp(&dist.dist(start, *b))
+            .then_with(|| a.cmp(b))
+    });
+    stands.into_iter().next()
 }
 
 fn nearest_dist_to_targets(cell: u16, targets: &HashSet<u16>, dist: &DistanceMap) -> u16 {
@@ -2910,9 +3188,9 @@ mod tests {
     };
 
     use super::{
-        assignment_guard_reason, build_dropoff_staging_cells, merge_hybrid_intents,
-        pick_staging_cell, rebalance_pickup_goal_crowding,
-        should_trigger_assignment_move_loop_watchdog,
+        assignment_guard_reason, build_dropoff_staging_cells, build_pick_or_move_intent,
+        merge_hybrid_intents, pick_alternate_stand_for_kind, pick_staging_cell,
+        rebalance_pickup_goal_crowding, should_trigger_assignment_move_loop_watchdog,
         should_trigger_dropoff_watchdog,
     };
 
@@ -3383,7 +3661,9 @@ mod tests {
         }];
         let legacy = vec![BotIntent {
             bot_id: "0".to_owned(),
-            intent: Intent::MoveTo { cell: preview_stand },
+            intent: Intent::MoveTo {
+                cell: preview_stand,
+            },
         }];
         let merged = merge_hybrid_intents(&state, &team, global, &legacy);
         assert_eq!(merged.len(), 1);
@@ -3406,8 +3686,12 @@ mod tests {
                 intent: Intent::Wait,
             },
         ];
-        assert!(should_trigger_assignment_move_loop_watchdog(&intents, 12, 20));
-        assert!(!should_trigger_assignment_move_loop_watchdog(&intents, 2, 20));
+        assert!(should_trigger_assignment_move_loop_watchdog(
+            &intents, 12, 20
+        ));
+        assert!(!should_trigger_assignment_move_loop_watchdog(
+            &intents, 2, 20
+        ));
     }
 
     #[test]
@@ -3499,14 +3783,7 @@ mod tests {
             },
         ];
         let active_items = HashSet::from(["milk"]);
-        rebalance_pickup_goal_crowding(
-            &state,
-            map,
-            &dist,
-            &team,
-            &active_items,
-            &mut intents,
-        );
+        rebalance_pickup_goal_crowding(&state, map, &dist, &team, &active_items, &mut intents);
         let goals = intents
             .iter()
             .filter_map(|entry| match entry.intent {
@@ -3516,6 +3793,95 @@ mod tests {
             .collect::<Vec<_>>();
         let distinct = goals.iter().copied().collect::<HashSet<_>>();
         assert!(distinct.len() >= 2, "collectors should be diversified");
+    }
+
+    #[test]
+    fn alternate_stand_selection_skips_depleted_items() {
+        let state = GameState {
+            grid: Grid {
+                width: 7,
+                height: 5,
+                drop_off_tiles: vec![[0, 4]],
+                ..Grid::default()
+            },
+            items: vec![
+                Item {
+                    id: "item_1".to_owned(),
+                    kind: "milk".to_owned(),
+                    x: 2,
+                    y: 2,
+                },
+                Item {
+                    id: "item_2".to_owned(),
+                    kind: "milk".to_owned(),
+                    x: 4,
+                    y: 2,
+                },
+            ],
+            ..GameState::default()
+        };
+        let world = World::new(state.clone());
+        let map = world.map();
+        let dist = DistanceMap::build(map);
+        let start = map.stand_cells_for_item("item_1")[0];
+        let depleted = HashSet::from(["item_1".to_owned()]);
+        let alt = pick_alternate_stand_for_kind(
+            &state,
+            map,
+            &dist,
+            start,
+            "milk",
+            &depleted,
+            Some(start),
+        )
+        .expect("alternate stand");
+        assert_ne!(alt, start);
+        assert!(
+            map.stand_cells_for_item("item_2").contains(&alt),
+            "alternate stand must come from non-depleted item"
+        );
+    }
+
+    #[test]
+    fn build_pick_or_move_reroutes_when_goal_item_is_depleted() {
+        let state = GameState {
+            grid: Grid {
+                width: 7,
+                height: 5,
+                drop_off_tiles: vec![[0, 4]],
+                ..Grid::default()
+            },
+            items: vec![
+                Item {
+                    id: "item_1".to_owned(),
+                    kind: "milk".to_owned(),
+                    x: 2,
+                    y: 2,
+                },
+                Item {
+                    id: "item_2".to_owned(),
+                    kind: "milk".to_owned(),
+                    x: 4,
+                    y: 2,
+                },
+            ],
+            ..GameState::default()
+        };
+        let world = World::new(state.clone());
+        let map = world.map();
+        let dist = DistanceMap::build(map);
+        let goal = map.stand_cells_for_item("item_1")[0];
+        let depleted = HashSet::from(["item_1".to_owned()]);
+        let intent = build_pick_or_move_intent(&state, map, &dist, goal, goal, "milk", &depleted);
+        assert!(matches!(intent, Intent::MoveTo { .. }));
+        let Intent::MoveTo { cell } = intent else {
+            panic!("expected move intent");
+        };
+        assert_ne!(cell, goal);
+        assert!(
+            map.stand_cells_for_item("item_2").contains(&cell),
+            "reroute should target non-depleted stand"
+        );
     }
 }
 
@@ -3536,6 +3902,10 @@ fn assignment_no_progress_trigger_ticks() -> u8 {
 
 fn assignment_goal_history_window() -> usize {
     96
+}
+
+fn pickup_deplete_fail_threshold() -> u8 {
+    2
 }
 
 fn deadlock_escape_ticks() -> u8 {

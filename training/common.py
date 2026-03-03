@@ -2,12 +2,29 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Dict, Iterable, Iterator, Optional
+from typing import Dict, Iterable, Iterator, Optional, Sequence
 
 import pandas as pd
 
 
-SCHEMA_VERSION = "1.1.0"
+SCHEMA_VERSION = "1.2.0"
+CONVERSION_LABEL_COLUMNS = [
+    "pickup_attempt",
+    "pickup_success",
+    "dropoff_attempt",
+    "dropoff_success",
+]
+RELIABILITY_FEATURE_COLUMNS = [
+    "stand_failure_count_recent",
+    "stand_success_count_recent",
+    "stand_cooldown_ticks_remaining",
+    "kind_failure_count_recent",
+    "repeated_same_stand_no_delta_streak",
+    "contention_at_stand_proxy",
+    "time_since_last_conversion_tick",
+    "last_conversion_was_pickup",
+    "last_conversion_was_dropoff",
+]
 FEATURE_COLUMNS = [
     "dist_to_nearest_active_item",
     "dist_to_dropoff",
@@ -55,6 +72,7 @@ FEATURE_COLUMNS = [
     "wait_reason_prohibited_repeat_move",
     "wait_reason_no_path_with_constraints",
     "wait_reason_timeout_fallback",
+    *RELIABILITY_FEATURE_COLUMNS,
 ]
 
 ORDERING_FEATURE_COLUMNS = [
@@ -67,6 +85,13 @@ ORDERING_FEATURE_COLUMNS = [
     "dropoff_watchdog_pressure",
     "choke_occupancy_proxy",
 ]
+
+
+def ensure_columns(frame: pd.DataFrame, columns: Sequence[str], default: float = 0.0) -> pd.DataFrame:
+    for col in columns:
+        if col not in frame.columns:
+            frame[col] = default
+    return frame
 
 
 def iter_jsonl(path: Path) -> Iterator[Dict]:

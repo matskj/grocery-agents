@@ -334,6 +334,13 @@ impl MotionPlanner {
         if step != start {
             return StepOutcome::move_step(step, primary, "primary");
         }
+        if matches!(role, BotRole::Collector | BotRole::Yield) {
+            if let Some(egress) =
+                best_dropoff_egress_step(start, map, dist, forbidden_cells, blocked_moves)
+            {
+                return StepOutcome::move_step(egress, vec![start, egress], "dropoff_egress");
+            }
+        }
 
         let base_reason =
             diagnose_wait_reason(start, map, v_res, e_res, blocked_moves, forbidden_cells);
@@ -964,6 +971,48 @@ fn best_local_sidestep(
         .copied()
         .filter(|next| !forbidden_cells.contains(next))
         .filter(|next| !is_prohibited_step(start, *next, map, blocked_moves))
+        .max_by_key(|next| {
+            let d = map
+                .dropoff_cells
+                .iter()
+                .map(|&drop| dist.dist(*next, drop))
+                .min()
+                .unwrap_or(u16::MAX);
+            let free_degree = map.neighbors[*next as usize].len() as i32;
+            i32::from(d.min(128)) + free_degree
+        })
+}
+
+fn best_dropoff_egress_step(
+    start: u16,
+    map: &MapCache,
+    dist: &DistanceMap,
+    forbidden_cells: &HashSet<u16>,
+    blocked_moves: &[BlockedMove],
+) -> Option<u16> {
+    let start_drop_dist = map
+        .dropoff_cells
+        .iter()
+        .map(|&drop| dist.dist(start, drop))
+        .min()
+        .unwrap_or(u16::MAX);
+    if start_drop_dist > 2 {
+        return None;
+    }
+    map.neighbors[start as usize]
+        .iter()
+        .copied()
+        .filter(|next| !forbidden_cells.contains(next))
+        .filter(|next| !is_prohibited_step(start, *next, map, blocked_moves))
+        .filter(|next| {
+            let next_drop_dist = map
+                .dropoff_cells
+                .iter()
+                .map(|&drop| dist.dist(*next, drop))
+                .min()
+                .unwrap_or(u16::MAX);
+            next_drop_dist > start_drop_dist
+        })
         .max_by_key(|next| {
             let d = map
                 .dropoff_cells

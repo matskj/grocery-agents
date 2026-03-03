@@ -1660,6 +1660,20 @@ impl Policy {
             .take(6)
             .copied()
             .collect::<HashSet<_>>();
+        let drop_targets = map.dropoff_cells.iter().copied().collect::<HashSet<_>>();
+        let active_targets = team
+            .knowledge
+            .active_gap_by_kind
+            .iter()
+            .filter(|(_, gap)| **gap > 0)
+            .filter_map(|(kind, _)| team.knowledge.kind_to_stands.get(kind))
+            .flat_map(|stands| stands.iter().copied())
+            .collect::<HashSet<_>>();
+        let item_kind_by_id = state
+            .items
+            .iter()
+            .map(|item| (item.id.as_str(), item.kind.as_str()))
+            .collect::<HashMap<_, _>>();
         if ring.is_empty() && lane.is_empty() {
             return 0;
         }
@@ -1683,24 +1697,32 @@ impl Policy {
             let Some(&idx) = idx_by_bot.get(&bot.id) else {
                 continue;
             };
+            if intent_is_active_aligned(
+                bot,
+                &intents[idx].intent,
+                team,
+                &item_kind_by_id,
+            ) {
+                continue;
+            }
             let candidate = map.neighbors[cell as usize]
                 .iter()
                 .copied()
                 .filter(|next| !ring.contains(next) && !lane.contains(next))
-                .max_by(|a, b| {
-                    let da = map
-                        .dropoff_cells
-                        .iter()
-                        .map(|drop| dist.dist(*a, *drop))
-                        .min()
-                        .unwrap_or(u16::MAX);
-                    let db = map
-                        .dropoff_cells
-                        .iter()
-                        .map(|drop| dist.dist(*b, *drop))
-                        .min()
-                        .unwrap_or(u16::MAX);
-                    da.cmp(&db).then_with(|| a.cmp(b))
+                .min_by(|a, b| {
+                    let active_a = nearest_dist_to_targets(*a, &active_targets, dist);
+                    let active_b = nearest_dist_to_targets(*b, &active_targets, dist);
+                    let drop_a = nearest_dist_to_targets(*a, &drop_targets, dist);
+                    let drop_b = nearest_dist_to_targets(*b, &drop_targets, dist);
+                    active_a
+                        .cmp(&active_b)
+                        .then_with(|| drop_a.cmp(&drop_b))
+                        .then_with(|| {
+                            map.neighbors[*b as usize]
+                                .len()
+                                .cmp(&map.neighbors[*a as usize].len())
+                        })
+                        .then_with(|| a.cmp(b))
                 });
             if let Some(next) = candidate {
                 intents[idx].intent = Intent::MoveTo { cell: next };
@@ -1762,7 +1784,7 @@ impl Policy {
                 mem.last_successful_drop_tick = Some(state.tick);
                 mem.dropoff_ban_ticks_by_order.clear();
                 mem.post_dropoff_retask_ticks_remaining = self.config.coord_post_dropoff_retask_ticks;
-                mem.egress_ticks_remaining = 2;
+                mem.egress_ticks_remaining = 1;
                 if let Some(commitment) = self.bot_commitments.get_mut(&bot.id) {
                     commitment.last_progress_tick = state.tick;
                 }
@@ -2238,6 +2260,17 @@ fn choose_best_active_stand(
         }
     }
     best.map(|(_, cell, kind)| (cell, kind))
+}
+
+fn nearest_dist_to_targets(cell: u16, targets: &HashSet<u16>, dist: &DistanceMap) -> u16 {
+    if targets.is_empty() {
+        return u16::MAX;
+    }
+    targets
+        .iter()
+        .map(|target| dist.dist(cell, *target))
+        .min()
+        .unwrap_or(u16::MAX)
 }
 
 fn goal_concentration_top3(intents: &[BotIntent]) -> f64 {

@@ -224,6 +224,15 @@ impl Dispatcher {
                         teammate_proximity,
                         order_urgency,
                         blocked_ticks: blocked_f,
+                        stand_failure_count_recent: 0.0,
+                        stand_success_count_recent: 0.0,
+                        stand_cooldown_ticks_remaining: 0.0,
+                        kind_failure_count_recent: 0.0,
+                        repeated_same_stand_no_delta_streak: 0.0,
+                        contention_at_stand_proxy: 0.0,
+                        time_since_last_conversion_tick: 0.0,
+                        last_conversion_was_pickup: 0.0,
+                        last_conversion_was_dropoff: 0.0,
                     },
                 );
                 if blocked >= 2 && active_pickups.len() > 1 {
@@ -263,6 +272,15 @@ impl Dispatcher {
                             teammate_proximity,
                             order_urgency: order_urgency * 0.5,
                             blocked_ticks: blocked_f,
+                            stand_failure_count_recent: 0.0,
+                            stand_success_count_recent: 0.0,
+                            stand_cooldown_ticks_remaining: 0.0,
+                            kind_failure_count_recent: 0.0,
+                            repeated_same_stand_no_delta_streak: 0.0,
+                            contention_at_stand_proxy: 0.0,
+                            time_since_last_conversion_tick: 0.0,
+                            last_conversion_was_pickup: 0.0,
+                            last_conversion_was_dropoff: 0.0,
                         },
                     );
                     if blocked >= 2 && preview_pickups.len() > 1 {
@@ -527,7 +545,9 @@ impl Dispatcher {
                 if d != u16::MAX {
                     let mut features = base_features;
                     features.dist_to_nearest_active_item = f64::from(d);
-                    let model_score = maybe_score_pick(mode, features).unwrap_or(0.0);
+                    let model_score = maybe_score_pick(mode, features)
+                        .map(|score| score.combined_expected_score)
+                        .unwrap_or(0.0);
                     let heuristic = -(d as f64);
                     candidates.push(PickupCandidate {
                         item_id: item.id.clone(),

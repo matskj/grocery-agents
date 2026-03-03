@@ -29,6 +29,8 @@ pub struct AssignmentResult {
 pub struct AssignmentRuntimeHints {
     pub late_phase_delivery_streak: u16,
     pub commitment_reassign_count: u16,
+    pub ticks_since_pickup: u16,
+    pub ticks_since_dropoff: u16,
 }
 
 #[derive(Debug, Clone)]
@@ -322,6 +324,41 @@ impl AssignmentEngine {
                     }
                     if matches!(task.kind, TaskKind::PickupStand | TaskKind::ImmediatePickup) {
                         let dist_to_stand = f64::from(dist_to(bot_cell, task.target_cell, dist));
+                        let stand_claimed_by_other = team
+                            .knowledge
+                            .stand_claims
+                            .get(&task.target_cell)
+                            .map(|claim| claim.bot_id != bot.id)
+                            .unwrap_or(false);
+                        let commitment_same_stand = team
+                            .knowledge
+                            .bot_commitments
+                            .values()
+                            .filter(|commitment| commitment.goal_cell == task.target_cell)
+                            .count() as f64;
+                        let commitment_same_kind = task
+                            .item_kind
+                            .as_ref()
+                            .map(|kind| {
+                                team.knowledge
+                                    .bot_commitments
+                                    .values()
+                                    .filter(|commitment| commitment.item_kind.as_ref() == Some(kind))
+                                    .count() as f64
+                            })
+                            .unwrap_or(0.0);
+                        let stand_cooldown = if stand_claimed_by_other { 6.0 } else { 0.0 };
+                        let contention = commitment_same_stand + 0.5 * commitment_same_kind;
+                        let time_since_last_conversion = f64::from(
+                            runtime_hints.ticks_since_pickup.min(runtime_hints.ticks_since_dropoff),
+                        );
+                        let last_conversion_was_pickup = if runtime_hints.ticks_since_pickup
+                            <= runtime_hints.ticks_since_dropoff
+                        {
+                            1.0
+                        } else {
+                            0.0
+                        };
                         let features = CandidateFeatures {
                             dist_to_nearest_active_item: dist_to_stand,
                             dist_to_dropoff: f64::from(task.nearest_drop_dist.min(64)),
@@ -330,10 +367,30 @@ impl AssignmentEngine {
                             teammate_proximity,
                             order_urgency,
                             blocked_ticks,
+                            stand_failure_count_recent: 0.0,
+                            stand_success_count_recent: 0.0,
+                            stand_cooldown_ticks_remaining: stand_cooldown,
+                            kind_failure_count_recent: 0.0,
+                            repeated_same_stand_no_delta_streak: 0.0,
+                            contention_at_stand_proxy: contention,
+                            time_since_last_conversion_tick: time_since_last_conversion,
+                            last_conversion_was_pickup,
+                            last_conversion_was_dropoff: 1.0 - last_conversion_was_pickup,
                         };
                         let mode = team.mode.as_str();
-                        let model_score = maybe_score_pick(mode, features).unwrap_or(0.0);
-                        adjusted -= (model_score * 6.0).round() as i32;
+                        let model_score = maybe_score_pick(mode, features);
+                        if let Some(score) = model_score {
+                            adjusted -= (score.combined_expected_score * 6.0).round() as i32;
+                            if score.pickup_prob < 0.35 {
+                                adjusted += ((0.35 - score.pickup_prob) * 120.0).round() as i32;
+                            }
+                            if stand_cooldown > 0.0 {
+                                adjusted += (stand_cooldown * 4.0).round() as i32;
+                            }
+                            if contention > 0.0 {
+                                adjusted += (contention * 10.0).round() as i32;
+                            }
+                        }
                     }
                     (adjusted, task.task_id)
                 })

@@ -8,6 +8,13 @@ use crate::{
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DemandTier {
+    None,
+    Active,
+    Preview,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BotRole {
     LeadCourier,
     QueueCourier,
@@ -118,6 +125,33 @@ pub struct MovementReservation {
     pub dropoff_control_zone: HashSet<u16>,
 }
 
+#[derive(Debug, Clone)]
+pub struct StandClaim {
+    pub bot_id: String,
+    pub expires_tick: u64,
+    pub demand_tier: DemandTier,
+}
+
+#[derive(Debug, Clone)]
+pub struct BotCommitment {
+    pub goal_cell: u16,
+    pub item_kind: Option<String>,
+    pub created_tick: u64,
+    pub last_progress_tick: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct TeamKnowledge {
+    pub kind_to_stands: HashMap<String, Vec<u16>>,
+    pub stand_to_kind: HashMap<u16, String>,
+    pub area_id_by_cell: Vec<u16>,
+    pub area_load_by_id: HashMap<u16, u16>,
+    pub active_gap_by_kind: HashMap<String, u16>,
+    pub effective_supply_by_kind: HashMap<String, u16>,
+    pub stand_claims: HashMap<u16, StandClaim>,
+    pub bot_commitments: HashMap<String, BotCommitment>,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct TeamContextConfig {
     pub strict_queue: bool,
@@ -169,6 +203,7 @@ pub struct TeamContext {
     pub traffic: TrafficSnapshot,
     pub queue: QueuePlan,
     pub movement: MovementReservation,
+    pub knowledge: TeamKnowledge,
 }
 
 impl TeamContext {
@@ -217,6 +252,7 @@ impl TeamContext {
             prohibited_moves,
             cfg,
         );
+        let knowledge = build_team_knowledge(state, map, dist, &order_snapshot, &bot_snapshot);
         let bot_plan_state_by_bot = state
             .bots
             .iter()
@@ -265,7 +301,26 @@ impl TeamContext {
             traffic,
             queue,
             movement,
+            knowledge,
         }
+    }
+
+    pub fn with_claims(
+        mut self,
+        stand_claims: &HashMap<u16, StandClaim>,
+        bot_commitments: &HashMap<String, BotCommitment>,
+        now_tick: u64,
+    ) -> Self {
+        self.knowledge.stand_claims = stand_claims
+            .iter()
+            .filter(|(_, claim)| claim.expires_tick >= now_tick)
+            .map(|(cell, claim)| (*cell, claim.clone()))
+            .collect();
+        self.knowledge.bot_commitments = bot_commitments
+            .iter()
+            .map(|(bot_id, commitment)| (bot_id.clone(), commitment.clone()))
+            .collect();
+        self
     }
 
     pub fn role_for(&self, bot_id: &str) -> BotRole {
@@ -603,6 +658,10 @@ impl TeamContext {
             "lane_congestion": self.traffic.lane_congestion,
             "blocked_bot_count": self.traffic.blocked_bot_count,
             "stuck_bot_count": self.traffic.stuck_bot_count,
+            "knowledge_active_gap_by_kind": self.knowledge.active_gap_by_kind,
+            "knowledge_effective_supply_by_kind": self.knowledge.effective_supply_by_kind,
+            "knowledge_stand_claim_count": self.knowledge.stand_claims.len(),
+            "knowledge_commitment_count": self.knowledge.bot_commitments.len(),
         })
     }
 }
@@ -644,6 +703,146 @@ fn order_snapshot(state: &GameState) -> OrderSnapshot {
         active_order_items_set,
         pending_order_items_set,
     }
+}
+
+fn build_team_knowledge(
+    state: &GameState,
+    map: &MapCache,
+    dist: &DistanceMap,
+    order_snapshot: &OrderSnapshot,
+    bot_snapshot: &HashMap<String, BotSnapshot>,
+) -> TeamKnowledge {
+    let mut items = state.items.iter().collect::<Vec<_>>();
+    items.sort_by(|a, b| a.id.cmp(&b.id));
+
+    let mut kind_to_stands_set = HashMap::<String, HashSet<u16>>::new();
+    let mut stand_to_kind = HashMap::<u16, String>::new();
+    for item in items {
+        let mut stands = map.stand_cells_for_item(&item.id).to_vec();
+        stands.sort_unstable();
+        for stand in stands {
+            kind_to_stands_set
+                .entry(item.kind.clone())
+                .or_default()
+                .insert(stand);
+            match stand_to_kind.get(&stand) {
+                Some(existing) if existing <= &item.kind => {}
+                _ => {
+                    stand_to_kind.insert(stand, item.kind.clone());
+                }
+            }
+        }
+    }
+    let mut kind_to_stands = HashMap::<String, Vec<u16>>::new();
+    for (kind, set) in kind_to_stands_set {
+        let mut stands = set.into_iter().collect::<Vec<_>>();
+        stands.sort_unstable();
+        kind_to_stands.insert(kind, stands);
+    }
+
+    let area_id_by_cell = build_area_id_by_cell(map);
+    let mut area_load_by_id = HashMap::<u16, u16>::new();
+    for bot in &state.bots {
+        let Some(cell) = map.idx(bot.x, bot.y) else {
+            continue;
+        };
+        let area = area_id_by_cell
+            .get(cell as usize)
+            .copied()
+            .unwrap_or(u16::MAX);
+        *area_load_by_id.entry(area).or_insert(0) += 1;
+    }
+
+    let effective_supply_by_kind = build_effective_supply_by_kind(
+        state,
+        map,
+        dist,
+        bot_snapshot,
+        &order_snapshot.active_order_items_set,
+    );
+    let mut active_gap_by_kind = HashMap::<String, u16>::new();
+    for (kind, missing) in &order_snapshot.active_remaining_by_item {
+        let covered = effective_supply_by_kind.get(kind).copied().unwrap_or(0);
+        active_gap_by_kind.insert(kind.clone(), (*missing as u16).saturating_sub(covered));
+    }
+
+    TeamKnowledge {
+        kind_to_stands,
+        stand_to_kind,
+        area_id_by_cell,
+        area_load_by_id,
+        active_gap_by_kind,
+        effective_supply_by_kind,
+        stand_claims: HashMap::new(),
+        bot_commitments: HashMap::new(),
+    }
+}
+
+fn build_area_id_by_cell(map: &MapCache) -> Vec<u16> {
+    let mut out = vec![u16::MAX; map.neighbors.len()];
+    let mut next_area = 0u16;
+    for start in 0..map.neighbors.len() {
+        if map.wall_mask[start] || out[start] != u16::MAX {
+            continue;
+        }
+        let mut queue = VecDeque::new();
+        out[start] = next_area;
+        queue.push_back(start as u16);
+        while let Some(cell) = queue.pop_front() {
+            for &next in &map.neighbors[cell as usize] {
+                if out[next as usize] != u16::MAX {
+                    continue;
+                }
+                out[next as usize] = next_area;
+                queue.push_back(next);
+            }
+        }
+        next_area = next_area.saturating_add(1);
+    }
+    out
+}
+
+fn build_effective_supply_by_kind(
+    state: &GameState,
+    map: &MapCache,
+    dist: &DistanceMap,
+    bot_snapshot: &HashMap<String, BotSnapshot>,
+    active_items: &HashSet<String>,
+) -> HashMap<String, u16> {
+    const ACTIVE_SUPPLY_NEAR_DROP_MAX: u16 = 10;
+    const ACTIVE_SUPPLY_BLOCKED_NEAR_DROP_MAX: u16 = 16;
+    let mut out = HashMap::<String, u16>::new();
+    for bot in &state.bots {
+        if bot.carrying.is_empty() {
+            continue;
+        }
+        let Some(cell) = map.idx(bot.x, bot.y) else {
+            continue;
+        };
+        let near_drop = map
+            .dropoff_cells
+            .iter()
+            .copied()
+            .map(|drop| dist.dist(cell, drop))
+            .min()
+            .unwrap_or(u16::MAX);
+        let blocked = bot_snapshot
+            .get(&bot.id)
+            .map(|snap| snap.blocked_ticks)
+            .unwrap_or(0);
+        let serviceable = near_drop <= ACTIVE_SUPPLY_NEAR_DROP_MAX
+            || (blocked <= 1 && near_drop <= ACTIVE_SUPPLY_BLOCKED_NEAR_DROP_MAX);
+        if !serviceable {
+            continue;
+        }
+        for item_kind in &bot.carrying {
+            if !active_items.contains(item_kind) {
+                continue;
+            }
+            *out.entry(item_kind.clone()).or_insert(0) += 1;
+        }
+    }
+    out
 }
 
 fn build_dropoff_serviceable_by_bot(
@@ -987,6 +1186,10 @@ fn build_movement(
     let ring_set: HashSet<u16> = queue.ring_cells.iter().copied().collect();
     let lane_head: HashSet<u16> = queue.lane_cells.iter().take(4).copied().collect();
     let strict_forbidden = cfg.strict_queue && !queue.queue_order.is_empty();
+    let active_carrying_count = bot_snapshot
+        .values()
+        .filter(|snap| snap.carrying_active)
+        .count();
 
     for bot in &state.bots {
         let assignment = queue.assignments.get(&bot.id);
@@ -1040,6 +1243,9 @@ fn build_movement(
             let mut blocked_cells = HashSet::new();
             blocked_cells.extend(ring_set.iter().copied());
             blocked_cells.extend(lane_head.iter().copied());
+            if active_carrying_count > 0 {
+                blocked_cells.extend(dropoff_control_zone.iter().copied());
+            }
             blocked_cells.remove(&cell);
             forbidden_cells.insert(bot.id.clone(), blocked_cells);
         }
@@ -1151,7 +1357,7 @@ mod tests {
 
     use crate::{
         dist::DistanceMap,
-        model::{BotState, GameState, Grid, Order, OrderStatus},
+        model::{BotState, GameState, Grid, Item, Order, OrderStatus},
         world::World,
     };
 
@@ -1224,5 +1430,138 @@ mod tests {
             .filter(|assignment| matches!(assignment.role, BotRole::LeadCourier))
             .count();
         assert_eq!(lead_count, 1);
+    }
+
+    #[test]
+    fn kind_to_stands_is_deterministic() {
+        let state = GameState {
+            grid: Grid {
+                width: 8,
+                height: 6,
+                drop_off_tiles: vec![[1, 4]],
+                ..Grid::default()
+            },
+            bots: vec![BotState {
+                id: "0".to_owned(),
+                x: 6,
+                y: 4,
+                carrying: vec![],
+                capacity: 3,
+            }],
+            items: vec![
+                Item {
+                    id: "item_9".to_owned(),
+                    kind: "milk".to_owned(),
+                    x: 3,
+                    y: 2,
+                },
+                Item {
+                    id: "item_2".to_owned(),
+                    kind: "milk".to_owned(),
+                    x: 5,
+                    y: 2,
+                },
+            ],
+            orders: vec![Order {
+                id: "o1".to_owned(),
+                item_id: "milk".to_owned(),
+                status: OrderStatus::InProgress,
+            }],
+            ..GameState::default()
+        };
+        let world = World::new(state.clone());
+        let map = world.map();
+        let dist = DistanceMap::build(map);
+        let a = TeamContext::build(
+            &state,
+            map,
+            &dist,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            TeamContextConfig::default(),
+        );
+        let b = TeamContext::build(
+            &state,
+            map,
+            &dist,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            TeamContextConfig::default(),
+        );
+        assert_eq!(a.knowledge.kind_to_stands, b.knowledge.kind_to_stands);
+        let milk = a
+            .knowledge
+            .kind_to_stands
+            .get("milk")
+            .cloned()
+            .unwrap_or_default();
+        assert!(!milk.is_empty());
+    }
+
+    #[test]
+    fn area_id_assignment_is_stable() {
+        let state = GameState {
+            grid: Grid {
+                width: 10,
+                height: 6,
+                drop_off_tiles: vec![[1, 4]],
+                walls: vec![[4, 0], [4, 1], [4, 2], [4, 3], [4, 4], [4, 5]],
+                ..Grid::default()
+            },
+            bots: vec![BotState {
+                id: "0".to_owned(),
+                x: 2,
+                y: 4,
+                carrying: vec![],
+                capacity: 3,
+            }],
+            items: vec![],
+            orders: vec![],
+            ..GameState::default()
+        };
+        let world = World::new(state.clone());
+        let map = world.map();
+        let dist = DistanceMap::build(map);
+        let ctx = TeamContext::build(
+            &state,
+            map,
+            &dist,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            TeamContextConfig::default(),
+        );
+        let left = map.idx(2, 2).expect("left area");
+        let right = map.idx(7, 2).expect("right area");
+        assert_ne!(
+            ctx.knowledge.area_id_by_cell[left as usize],
+            ctx.knowledge.area_id_by_cell[right as usize]
+        );
     }
 }

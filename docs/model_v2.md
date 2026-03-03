@@ -16,11 +16,11 @@ Each mode can include:
 
 The runtime combined score is:
 
-`combined_expected_score = value_proxy * pickup_prob * dropoff_prob / (eta + 1.0)`
+`combined_expected_score = max(0, value_proxy) * pickup_prob * dropoff_prob / (eta_proxy + 1.0)`
 
 Where:
 - `value_proxy` = `ordering_score` when available, otherwise urgency fallback
-- `eta` = `dist_to_nearest_active_item` (clamped)
+- `eta_proxy` = `dist_to_nearest_active_item + 0.7 * dist_to_dropoff` (clamped)
 
 ## New Features and Labels
 ### Conversion labels
@@ -48,6 +48,7 @@ Labels are inferred with one-tick alignment via carrying deltas.
   "weights": {"bias": 0.0, "...": 0.0},
   "ordering_weights": {"bias": 0.0, "...": 0.0},
   "feature_columns": ["..."],
+  "runtime_feature_columns": ["..."],
   "normalization": {
     "mean": [0.0],
     "std": [1.0]
@@ -85,12 +86,13 @@ Labels are inferred with one-tick alignment via carrying deltas.
 If v2 fields are missing, runtime falls back to v1 behavior:
 - legacy linear pick score (`weights`)
 - unchanged ordering scorer (`ordering_weights`)
+- v2 heads normalize over `runtime_feature_columns` when present, otherwise `feature_columns`
 
 ## Training + Eval Commands
 ```powershell
 python -m training.extract --logs-dir logs --out data/runs.parquet
 python -m training.featurize --data data/runs.parquet --out data/runs_features.parquet --n-step 5
-python -m training.train --mode expert --data data/runs_features.parquet --out models/expert.json --dedup-strategy downweight --signature-kind action
+python -m training.train --mode expert --data data/runs_features.parquet --out models/expert.json --dedup-strategy downweight --signature-kind action --runtime-feature-set strict
 python -m training.evaluate --data data/runs_features.parquet --model models/expert.json --mode expert --reference-score 101 --candidate-score 85
 python -m training.export --models-dir models --out models/policy_artifacts.json
 ```

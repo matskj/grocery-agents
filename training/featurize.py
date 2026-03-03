@@ -22,6 +22,11 @@ MAX_COUNT_CLIP = 20.0
 MAX_STREAK_CLIP = 20.0
 MAX_CONTENTION_CLIP = 8.0
 MAX_TIME_SINCE_CONVERSION = 200.0
+MAX_DELTA_DIST_CLIP = 24.0
+FAR_DIST_THRESHOLD = 8.0
+W_ITEM_PROGRESS = 0.18
+W_DROP_PROGRESS = 0.24
+W_IDLE_FAR = 0.35
 
 
 def col(frame: pd.DataFrame, name: str) -> pd.Series:
@@ -31,12 +36,21 @@ def col(frame: pd.DataFrame, name: str) -> pd.Series:
 
 
 def reward_proxy(frame: pd.DataFrame) -> pd.Series:
+    capacity_available = (col(frame, "carrying_count") < col(frame, "capacity")).astype(float)
+    drop_progress_gate = (
+        (col(frame, "serviceable_dropoff") > 0.5) | (col(frame, "carrying_only_inactive") > 0.5)
+    ).astype(float)
+    item_progress = np.maximum(col(frame, "delta_dist_to_active_item"), 0.0)
+    drop_progress = np.maximum(col(frame, "delta_dist_to_dropoff"), 0.0)
     return (
         col(frame, "delta_score")
         + 0.75 * col(frame, "items_delivered_delta")
         + 3.0 * col(frame, "order_completed_delta")
+        + W_ITEM_PROGRESS * item_progress * capacity_available
+        + W_DROP_PROGRESS * drop_progress * drop_progress_gate
         - 0.50 * col(frame, "invalid_action_count")
         - 0.05 * col(frame, "is_wait")
+        - W_IDLE_FAR * col(frame, "idle_far_from_dropoff")
         - 0.60 * col(frame, "noop_move")
         - 0.20 * col(frame, "move_target_blocked")
         - 0.45 * col(frame, "is_queue_violation")
@@ -289,6 +303,24 @@ def main() -> None:
         (frame["dropoff_attempt"] == 1)
         & (frame["next_carrying_count"] < frame["carrying_count"])
     ).astype(int)
+    frame["prev_dist_to_nearest_active_item"] = frame.groupby(["run_id", "bot_id"], sort=False)[
+        "dist_to_nearest_active_item"
+    ].shift(1)
+    frame["prev_dist_to_dropoff"] = frame.groupby(["run_id", "bot_id"], sort=False)[
+        "dist_to_dropoff"
+    ].shift(1)
+    frame["delta_dist_to_active_item"] = (
+        frame["prev_dist_to_nearest_active_item"] - frame["dist_to_nearest_active_item"]
+    ).fillna(0.0)
+    frame["delta_dist_to_dropoff"] = (
+        frame["prev_dist_to_dropoff"] - frame["dist_to_dropoff"]
+    ).fillna(0.0)
+    frame["delta_dist_to_active_item"] = frame["delta_dist_to_active_item"].clip(
+        lower=-MAX_DELTA_DIST_CLIP, upper=MAX_DELTA_DIST_CLIP
+    )
+    frame["delta_dist_to_dropoff"] = frame["delta_dist_to_dropoff"].clip(
+        lower=-MAX_DELTA_DIST_CLIP, upper=MAX_DELTA_DIST_CLIP
+    )
     frame["contention_at_stand_proxy"] = compute_contention_proxy(frame)
     frame["contention_at_stand_proxy"] = clip_series(
         frame["contention_at_stand_proxy"], MAX_CONTENTION_CLIP
@@ -341,6 +373,16 @@ def main() -> None:
     frame["dropoff_target_in_progress"] = (
         frame["dropoff_target_status"] == "in_progress"
     ).astype(int)
+    frame["carrying_only_inactive"] = (
+        (frame["carrying_count"] > 0)
+        & (frame.get("serviceable_dropoff", 0).astype(float) <= 0.5)
+    ).astype(int)
+    frame["idle_far_from_dropoff"] = (
+        ((frame["is_wait"] == 1) | (frame["noop_move"] == 1))
+        & (frame["dist_to_dropoff"] >= FAR_DIST_THRESHOLD)
+    ).astype(int)
+    # Defragment after the large block of per-column inserts to keep downstream writes fast.
+    frame = frame.copy()
     frame["carrying_active"] = frame.get("serviceable_dropoff", 0).astype(float)
     frame["dist_to_goal_proxy"] = frame.get("queue_distance", frame.get("dist_to_dropoff", 0)).astype(float)
     frame["dropoff_watchdog_pressure"] = (
@@ -375,8 +417,6 @@ def main() -> None:
         [frame, pd.DataFrame(wait_reason_cols, index=frame.index)],
         axis=1,
     )
-    # Defragment before heavy vectorized ops to avoid pandas fragmentation warnings.
-    frame = frame.copy()
     frame["reward_proxy"] = reward_proxy(frame)
     frame = compute_reliability_features(frame)
     frame = ensure_columns(frame, CONVERSION_LABEL_COLUMNS, default=0.0)

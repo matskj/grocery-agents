@@ -21,6 +21,8 @@ pub struct ModeModel {
     #[serde(default)]
     pub feature_columns: Vec<String>,
     #[serde(default)]
+    pub runtime_feature_columns: Vec<String>,
+    #[serde(default)]
     pub normalization: NormalizationModel,
     #[serde(default)]
     pub heads: HashMap<String, HeadModel>,
@@ -92,10 +94,17 @@ pub struct CandidateFeatures {
     pub dist_to_nearest_active_item: f64,
     pub dist_to_dropoff: f64,
     pub inventory_util: f64,
+    pub queue_distance: f64,
     pub local_congestion: f64,
+    pub local_conflict_count: f64,
     pub teammate_proximity: f64,
     pub order_urgency: f64,
     pub blocked_ticks: f64,
+    pub queue_role_lead: f64,
+    pub queue_role_courier: f64,
+    pub queue_role_collector: f64,
+    pub queue_role_yield: f64,
+    pub serviceable_dropoff: f64,
     pub stand_failure_count_recent: f64,
     pub stand_success_count_recent: f64,
     pub stand_cooldown_ticks_remaining: f64,
@@ -147,7 +156,10 @@ pub fn maybe_score_pick(mode: &str, features: CandidateFeatures) -> Option<PickS
 pub fn maybe_score_ordering(mode: &str, features: OrderingFeatures) -> Option<f64> {
     let artifact = load_artifact();
     let model = artifact.modes.get(mode)?;
-    Some(score_with_ordering_weights(&model.ordering_weights, features))
+    Some(score_with_ordering_weights(
+        &model.ordering_weights,
+        features,
+    ))
 }
 
 fn score_pick_with_model(model: &ModeModel, features: CandidateFeatures) -> PickScore {
@@ -177,10 +189,12 @@ fn score_pick_with_model(model: &ModeModel, features: CandidateFeatures) -> Pick
     } else {
         model.calibration.dropoff_temp
     };
-    let pickup_prob = head_probability(&pickup_head, &normalized_features, pickup_temp).unwrap_or(1.0);
-    let dropoff_prob = head_probability(&dropoff_head, &normalized_features, dropoff_temp).unwrap_or(1.0);
-    let ordering_score = head_linear_score(&ordering_head, &normalized_features)
-        .unwrap_or_else(|| {
+    let pickup_prob =
+        head_probability(&pickup_head, &normalized_features, pickup_temp).unwrap_or(1.0);
+    let dropoff_prob =
+        head_probability(&dropoff_head, &normalized_features, dropoff_temp).unwrap_or(1.0);
+    let ordering_score =
+        head_linear_score(&ordering_head, &normalized_features).unwrap_or_else(|| {
             if legacy_pick_score.abs() > 1e-9 {
                 legacy_pick_score
             } else {
@@ -188,12 +202,16 @@ fn score_pick_with_model(model: &ModeModel, features: CandidateFeatures) -> Pick
             }
         });
     let value_proxy = if ordering_score.abs() > 1e-9 {
-        ordering_score
+        ordering_score.max(0.0)
     } else {
-        features.order_urgency
+        features.order_urgency.max(0.0)
     };
-    let eta = clamp(features.dist_to_nearest_active_item, 0.0, 128.0);
-    let combined = value_proxy * pickup_prob * dropoff_prob / (eta + 1.0);
+    let eta_proxy = clamp(
+        features.dist_to_nearest_active_item + 0.7 * features.dist_to_dropoff,
+        0.0,
+        160.0,
+    );
+    let combined = value_proxy * pickup_prob * dropoff_prob / (eta_proxy + 1.0);
 
     PickScore {
         pickup_prob: clamp(pickup_prob, 0.0, 1.0),
@@ -205,11 +223,12 @@ fn score_pick_with_model(model: &ModeModel, features: CandidateFeatures) -> Pick
 }
 
 fn normalized_feature_vector(model: &ModeModel, features: CandidateFeatures) -> Option<Vec<f64>> {
-    if model.feature_columns.is_empty() {
+    let columns = model_feature_columns(model);
+    if columns.is_empty() {
         return None;
     }
-    let mut out = Vec::with_capacity(model.feature_columns.len());
-    for (idx, col) in model.feature_columns.iter().enumerate() {
+    let mut out = Vec::with_capacity(columns.len());
+    for (idx, col) in columns.iter().enumerate() {
         let raw = candidate_feature_value(col, features);
         let mean = model.normalization.mean.get(idx).copied().unwrap_or(0.0);
         let std = model.normalization.std.get(idx).copied().unwrap_or(1.0);
@@ -219,15 +238,30 @@ fn normalized_feature_vector(model: &ModeModel, features: CandidateFeatures) -> 
     Some(out)
 }
 
+fn model_feature_columns(model: &ModeModel) -> &[String] {
+    if !model.runtime_feature_columns.is_empty() {
+        &model.runtime_feature_columns
+    } else {
+        &model.feature_columns
+    }
+}
+
 fn candidate_feature_value(name: &str, features: CandidateFeatures) -> f64 {
     match name {
         "dist_to_nearest_active_item" => features.dist_to_nearest_active_item,
         "dist_to_dropoff" => features.dist_to_dropoff,
         "inventory_util" => features.inventory_util,
+        "queue_distance" => features.queue_distance,
         "local_congestion" => features.local_congestion,
+        "local_conflict_count" => features.local_conflict_count,
         "teammate_proximity" => features.teammate_proximity,
         "order_urgency" => features.order_urgency,
         "blocked_ticks" => features.blocked_ticks,
+        "queue_role_lead" => features.queue_role_lead,
+        "queue_role_courier" => features.queue_role_courier,
+        "queue_role_collector" => features.queue_role_collector,
+        "queue_role_yield" => features.queue_role_yield,
+        "serviceable_dropoff" => features.serviceable_dropoff,
         "stand_failure_count_recent" => features.stand_failure_count_recent,
         "stand_success_count_recent" => features.stand_success_count_recent,
         "stand_cooldown_ticks_remaining" => features.stand_cooldown_ticks_remaining,
@@ -249,7 +283,11 @@ fn head_linear_score(head: &HeadModel, x: &[f64]) -> Option<f64> {
     for (w, xv) in head.weights.iter().zip(x.iter()) {
         value += *w * *xv;
     }
-    let clip = if head.clip <= 0.0 { default_clip() } else { head.clip };
+    let clip = if head.clip <= 0.0 {
+        default_clip()
+    } else {
+        head.clip
+    };
     Some(clamp(value, -clip, clip))
 }
 
@@ -273,26 +311,41 @@ fn score_with_weights(weights: &HashMap<String, f64>, features: CandidateFeature
         * *weights.get("dist_to_nearest_active_item").unwrap_or(&0.0);
     score += features.dist_to_dropoff * *weights.get("dist_to_dropoff").unwrap_or(&0.0);
     score += features.inventory_util * *weights.get("inventory_util").unwrap_or(&0.0);
+    score += features.queue_distance * *weights.get("queue_distance").unwrap_or(&0.0);
     score += features.local_congestion * *weights.get("local_congestion").unwrap_or(&0.0);
+    score += features.local_conflict_count * *weights.get("local_conflict_count").unwrap_or(&0.0);
     score += features.teammate_proximity * *weights.get("teammate_proximity").unwrap_or(&0.0);
     score += features.order_urgency * *weights.get("order_urgency").unwrap_or(&0.0);
     score += features.blocked_ticks * *weights.get("blocked_ticks").unwrap_or(&0.0);
-    score += features.stand_failure_count_recent * *weights.get("stand_failure_count_recent").unwrap_or(&0.0);
-    score += features.stand_success_count_recent * *weights.get("stand_success_count_recent").unwrap_or(&0.0);
+    score += features.queue_role_lead * *weights.get("queue_role_lead").unwrap_or(&0.0);
+    score += features.queue_role_courier * *weights.get("queue_role_courier").unwrap_or(&0.0);
+    score += features.queue_role_collector * *weights.get("queue_role_collector").unwrap_or(&0.0);
+    score += features.queue_role_yield * *weights.get("queue_role_yield").unwrap_or(&0.0);
+    score += features.serviceable_dropoff * *weights.get("serviceable_dropoff").unwrap_or(&0.0);
+    score += features.stand_failure_count_recent
+        * *weights.get("stand_failure_count_recent").unwrap_or(&0.0);
+    score += features.stand_success_count_recent
+        * *weights.get("stand_success_count_recent").unwrap_or(&0.0);
     score += features.stand_cooldown_ticks_remaining
-        * *weights.get("stand_cooldown_ticks_remaining").unwrap_or(&0.0);
-    score += features.kind_failure_count_recent * *weights.get("kind_failure_count_recent").unwrap_or(&0.0);
+        * *weights
+            .get("stand_cooldown_ticks_remaining")
+            .unwrap_or(&0.0);
+    score += features.kind_failure_count_recent
+        * *weights.get("kind_failure_count_recent").unwrap_or(&0.0);
     score += features.repeated_same_stand_no_delta_streak
         * *weights
             .get("repeated_same_stand_no_delta_streak")
             .unwrap_or(&0.0);
-    score += features.contention_at_stand_proxy * *weights.get("contention_at_stand_proxy").unwrap_or(&0.0);
+    score += features.contention_at_stand_proxy
+        * *weights.get("contention_at_stand_proxy").unwrap_or(&0.0);
     score += features.time_since_last_conversion_tick
         * *weights
             .get("time_since_last_conversion_tick")
             .unwrap_or(&0.0);
-    score += features.last_conversion_was_pickup * *weights.get("last_conversion_was_pickup").unwrap_or(&0.0);
-    score += features.last_conversion_was_dropoff * *weights.get("last_conversion_was_dropoff").unwrap_or(&0.0);
+    score += features.last_conversion_was_pickup
+        * *weights.get("last_conversion_was_pickup").unwrap_or(&0.0);
+    score += features.last_conversion_was_dropoff
+        * *weights.get("last_conversion_was_dropoff").unwrap_or(&0.0);
     score
 }
 
@@ -329,7 +382,9 @@ fn load_artifact() -> &'static PolicyArtifact {
 mod tests {
     use crate::model::{BotState, GameState, Grid};
 
-    use super::{detect_mode_label, score_pick_with_model, CandidateFeatures, HeadModel, ModeModel};
+    use super::{
+        detect_mode_label, score_pick_with_model, CandidateFeatures, HeadModel, ModeModel,
+    };
 
     fn state(width: i32, height: i32, bots: usize) -> GameState {
         GameState {
@@ -368,7 +423,9 @@ mod tests {
     fn v1_fallback_uses_legacy_score() {
         let mut model = ModeModel::default();
         model.weights.insert("bias".to_owned(), 7.0);
-        model.weights.insert("dist_to_nearest_active_item".to_owned(), -1.0);
+        model
+            .weights
+            .insert("dist_to_nearest_active_item".to_owned(), -1.0);
         let features = CandidateFeatures {
             dist_to_nearest_active_item: 2.0,
             ..CandidateFeatures::default()
@@ -382,7 +439,7 @@ mod tests {
     #[test]
     fn v2_combined_score_is_deterministic_and_clamped() {
         let mut model = ModeModel {
-            feature_columns: vec![
+            runtime_feature_columns: vec![
                 "dist_to_nearest_active_item".to_owned(),
                 "order_urgency".to_owned(),
             ],
@@ -431,5 +488,159 @@ mod tests {
         assert!(a.combined_expected_score.is_finite());
         assert!(a.ordering_score <= 12.0);
         assert!((0.0..=1.0).contains(&a.pickup_prob));
+    }
+
+    #[test]
+    fn v2_uses_runtime_feature_columns_when_present() {
+        let mut model = ModeModel {
+            feature_columns: vec!["dist_to_nearest_active_item".to_owned()],
+            runtime_feature_columns: vec![
+                "dist_to_nearest_active_item".to_owned(),
+                "dist_to_dropoff".to_owned(),
+            ],
+            ..ModeModel::default()
+        };
+        model.normalization.mean = vec![0.0, 0.0];
+        model.normalization.std = vec![1.0, 1.0];
+        model.heads.insert(
+            "pickup".to_owned(),
+            HeadModel {
+                kind: "ridge_logit".to_owned(),
+                bias: 1.0,
+                weights: vec![0.0, 0.0],
+                clip: 8.0,
+                temperature: 1.0,
+            },
+        );
+        model.heads.insert(
+            "dropoff".to_owned(),
+            HeadModel {
+                kind: "ridge_logit".to_owned(),
+                bias: 1.0,
+                weights: vec![0.0, 0.0],
+                clip: 8.0,
+                temperature: 1.0,
+            },
+        );
+        model.heads.insert(
+            "ordering".to_owned(),
+            HeadModel {
+                kind: "ridge".to_owned(),
+                bias: 2.0,
+                weights: vec![0.0, 0.0],
+                clip: 12.0,
+                temperature: 1.0,
+            },
+        );
+        let score = score_pick_with_model(
+            &model,
+            CandidateFeatures {
+                dist_to_nearest_active_item: 2.0,
+                dist_to_dropoff: 2.0,
+                ..CandidateFeatures::default()
+            },
+        );
+        assert!(score.combined_expected_score > 0.0);
+    }
+
+    #[test]
+    fn combined_score_uses_roundtrip_eta_proxy() {
+        let mut model = ModeModel {
+            runtime_feature_columns: vec![
+                "dist_to_nearest_active_item".to_owned(),
+                "dist_to_dropoff".to_owned(),
+            ],
+            ..ModeModel::default()
+        };
+        model.normalization.mean = vec![0.0, 0.0];
+        model.normalization.std = vec![1.0, 1.0];
+        model.heads.insert(
+            "pickup".to_owned(),
+            HeadModel {
+                kind: "ridge_logit".to_owned(),
+                bias: 8.0,
+                weights: vec![0.0, 0.0],
+                clip: 8.0,
+                temperature: 1.0,
+            },
+        );
+        model.heads.insert(
+            "dropoff".to_owned(),
+            HeadModel {
+                kind: "ridge_logit".to_owned(),
+                bias: 8.0,
+                weights: vec![0.0, 0.0],
+                clip: 8.0,
+                temperature: 1.0,
+            },
+        );
+        model.heads.insert(
+            "ordering".to_owned(),
+            HeadModel {
+                kind: "ridge".to_owned(),
+                bias: 10.0,
+                weights: vec![0.0, 0.0],
+                clip: 12.0,
+                temperature: 1.0,
+            },
+        );
+        let score = score_pick_with_model(
+            &model,
+            CandidateFeatures {
+                dist_to_nearest_active_item: 0.0,
+                dist_to_dropoff: 20.0,
+                ..CandidateFeatures::default()
+            },
+        );
+        assert!(score.combined_expected_score < 1.0);
+    }
+
+    #[test]
+    fn negative_ordering_score_clamped_from_value_proxy() {
+        let mut model = ModeModel {
+            runtime_feature_columns: vec!["order_urgency".to_owned()],
+            ..ModeModel::default()
+        };
+        model.normalization.mean = vec![0.0];
+        model.normalization.std = vec![1.0];
+        model.heads.insert(
+            "pickup".to_owned(),
+            HeadModel {
+                kind: "ridge_logit".to_owned(),
+                bias: 4.0,
+                weights: vec![0.0],
+                clip: 8.0,
+                temperature: 1.0,
+            },
+        );
+        model.heads.insert(
+            "dropoff".to_owned(),
+            HeadModel {
+                kind: "ridge_logit".to_owned(),
+                bias: 4.0,
+                weights: vec![0.0],
+                clip: 8.0,
+                temperature: 1.0,
+            },
+        );
+        model.heads.insert(
+            "ordering".to_owned(),
+            HeadModel {
+                kind: "ridge".to_owned(),
+                bias: -5.0,
+                weights: vec![0.0],
+                clip: 12.0,
+                temperature: 1.0,
+            },
+        );
+        let score = score_pick_with_model(
+            &model,
+            CandidateFeatures {
+                order_urgency: 1.0,
+                ..CandidateFeatures::default()
+            },
+        );
+        assert!(score.ordering_score < 0.0);
+        assert_eq!(score.combined_expected_score, 0.0);
     }
 }

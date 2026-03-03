@@ -27,6 +27,7 @@ def main() -> None:
             "weights": payload.get("weights", {}),
             "ordering_weights": payload.get("ordering_weights", {}),
             "feature_columns": payload.get("feature_columns", []),
+            "runtime_feature_columns": payload.get("runtime_feature_columns", []),
             "normalization": payload.get("normalization", {}),
             "heads": payload.get("heads", {}),
             "calibration": payload.get("calibration", {}),

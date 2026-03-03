@@ -481,7 +481,12 @@ impl MotionPlanner {
                 }
                 let mut penalty = 0u16;
                 if t == 0 {
-                    penalty = 18u16.saturating_mul(u16::from(blocked_move_count(start, next, map, blocked_moves)));
+                    penalty = 18u16.saturating_mul(u16::from(blocked_move_count(
+                        start,
+                        next,
+                        map,
+                        blocked_moves,
+                    )));
                 }
                 let ng = g.saturating_add(1).saturating_add(penalty);
                 let key = (next, nt);
@@ -566,8 +571,7 @@ impl MotionPlanner {
                 result.timeout = true;
                 break;
             }
-            let conflicts =
-                detect_zone_conflicts(&zone_bots, &start_cells, planned, state, map);
+            let conflicts = detect_zone_conflicts(&zone_bots, &start_cells, planned, state, map);
             if conflicts.is_empty() {
                 break;
             }
@@ -854,7 +858,9 @@ fn has_alternate_exit(start: u16, chosen: u16, map: &MapCache, blocked: &[Blocke
     map.neighbors[start as usize]
         .iter()
         .copied()
-        .any(|candidate| candidate != chosen && blocked_move_count(start, candidate, map, blocked) < 2)
+        .any(|candidate| {
+            candidate != chosen && blocked_move_count(start, candidate, map, blocked) < 2
+        })
 }
 
 fn is_hard_prohibited_step(
@@ -1114,17 +1120,19 @@ mod tests {
         reservation.priorities.insert("b".to_owned(), 1);
         reservation.reserve_horizon.insert("a".to_owned(), 2);
         reservation.reserve_horizon.insert("b".to_owned(), 2);
-        reservation.dropoff_control_zone.extend([
-            map.idx(1, 1).expect("z1"),
-            map.idx(2, 1).expect("z2"),
-        ]);
+        reservation
+            .dropoff_control_zone
+            .extend([map.idx(1, 1).expect("z1"), map.idx(2, 1).expect("z2")]);
 
         let result = planner.plan(&state, map, &dist, &goals, &reservation, &[], None, 1);
         let a_action = result.actions.get("a").expect("a action");
         let b_action = result.actions.get("b").expect("b action");
         let is_swap = matches!(a_action.action, Action::Move { dx: 1, dy: 0, .. })
             && matches!(b_action.action, Action::Move { dx: -1, dy: 0, .. });
-        assert!(!is_swap, "planner must avoid direct edge swap in control zone");
+        assert!(
+            !is_swap,
+            "planner must avoid direct edge swap in control zone"
+        );
     }
 
     #[test]

@@ -362,7 +362,14 @@ impl Policy {
                             legacy_intents.clone()
                         } else {
                             assignment_source = "hybrid_assignment";
-                            merge_hybrid_intents(state, &team_ctx, result.intents, &legacy_intents)
+                            merge_hybrid_intents(
+                                state,
+                                &team_ctx,
+                                map,
+                                &dist,
+                                result.intents,
+                                &legacy_intents,
+                            )
                         }
                     } else {
                         assignment_source = "legacy_dispatcher_timeout_fallback";
@@ -2080,6 +2087,8 @@ fn active_item_set(state: &GameState) -> HashSet<&str> {
 fn merge_hybrid_intents(
     state: &GameState,
     team_ctx: &TeamContext,
+    map: &crate::world::MapCache,
+    dist: &DistanceMap,
     global: Vec<BotIntent>,
     legacy: &[BotIntent],
 ) -> Vec<BotIntent> {
@@ -2123,6 +2132,8 @@ fn merge_hybrid_intents(
                     &legacy_intent,
                     team_ctx,
                     &item_kind_by_id,
+                    map,
+                    dist,
                 )
             } else {
                 prefer_non_wait(legacy_intent, global_intent)
@@ -2149,6 +2160,8 @@ fn merge_hybrid_active_phase(
     legacy: &Intent,
     team_ctx: &TeamContext,
     item_kind_by_id: &HashMap<&str, &str>,
+    map: &crate::world::MapCache,
+    dist: &DistanceMap,
 ) -> Intent {
     let global_active = intent_is_active_aligned(bot, global, team_ctx, item_kind_by_id);
     let legacy_active = intent_is_active_aligned(bot, legacy, team_ctx, item_kind_by_id);
@@ -2160,11 +2173,30 @@ fn merge_hybrid_active_phase(
             .any(|item| team_ctx.active_order_items_set.contains(item));
 
     if bot_carrying_only_inactive && bot.carrying.len() >= bot.capacity {
-        return if global_active {
-            global.clone()
-        } else {
-            Intent::Wait
+        if global_active {
+            return global.clone();
+        }
+        let Some(bot_cell) = map.idx(bot.x, bot.y) else {
+            return Intent::Wait;
         };
+        let nearest_drop_dist = map
+            .dropoff_cells
+            .iter()
+            .copied()
+            .map(|drop| dist.dist(bot_cell, drop))
+            .min()
+            .unwrap_or(u16::MAX);
+        let in_dropoff_zone = team_ctx.dropoff_control_zone.contains(&bot_cell)
+            || map.dropoff_cells.contains(&bot_cell);
+        if nearest_drop_dist <= full_inactive_stage_trigger_dist() && in_dropoff_zone {
+            return Intent::Wait;
+        }
+        if let Some(stage) = nearest_dropoff_stage_cell(bot_cell, map, dist, team_ctx) {
+            if stage != bot_cell {
+                return Intent::MoveTo { cell: stage };
+            }
+        }
+        return Intent::Wait;
     }
 
     match (global_active, legacy_active) {
@@ -2189,6 +2221,43 @@ fn merge_hybrid_active_phase(
     legacy.clone()
 }
 
+fn nearest_dropoff_stage_cell(
+    bot_cell: u16,
+    map: &crate::world::MapCache,
+    dist: &DistanceMap,
+    team_ctx: &TeamContext,
+) -> Option<u16> {
+    let mut candidates = Vec::<u16>::new();
+    candidates.extend(team_ctx.queue.lane_cells.iter().copied());
+    candidates.extend(team_ctx.queue.ring_cells.iter().copied());
+    candidates.extend(map.dropoff_cells.iter().copied());
+    candidates.sort_unstable();
+    candidates.dedup();
+    candidates
+        .into_iter()
+        .filter_map(|cell| {
+            let d_bot = dist.dist(bot_cell, cell);
+            if d_bot == u16::MAX {
+                return None;
+            }
+            let d_drop = map
+                .dropoff_cells
+                .iter()
+                .copied()
+                .map(|drop| dist.dist(cell, drop))
+                .filter(|&d| d != u16::MAX)
+                .min()
+                .unwrap_or(u16::MAX);
+            Some((d_bot, d_drop, cell))
+        })
+        .min_by(|a, b| {
+            a.0.cmp(&b.0)
+                .then_with(|| a.1.cmp(&b.1))
+                .then_with(|| a.2.cmp(&b.2))
+        })
+        .map(|(_, _, cell)| cell)
+}
+
 fn intent_targets_preview(
     intent: &Intent,
     team_ctx: &TeamContext,
@@ -2207,6 +2276,10 @@ fn intent_targets_preview(
             .unwrap_or(false),
         _ => false,
     }
+}
+
+fn full_inactive_stage_trigger_dist() -> u16 {
+    6
 }
 
 fn intent_is_active_aligned(
@@ -3491,7 +3564,7 @@ mod tests {
                 },
             },
         ];
-        let merged = merge_hybrid_intents(&state, &ctx, global, &legacy);
+        let merged = merge_hybrid_intents(&state, &ctx, map, &dist, global, &legacy);
         let by_bot = merged
             .into_iter()
             .map(|entry| (entry.bot_id, entry.intent))
@@ -3582,7 +3655,7 @@ mod tests {
                 item_id: "item_bread".to_owned(),
             },
         }];
-        let merged = merge_hybrid_intents(&state, &team, global, &legacy);
+        let merged = merge_hybrid_intents(&state, &team, map, &dist, global, &legacy);
         assert_eq!(merged.len(), 1);
         assert!(matches!(
             merged[0].intent,
@@ -3591,7 +3664,7 @@ mod tests {
     }
 
     #[test]
-    fn hybrid_merge_waits_for_full_inactive_carrier_during_active_gap() {
+    fn hybrid_merge_stages_full_inactive_carrier_during_active_gap() {
         let state = GameState {
             grid: Grid {
                 width: 9,
@@ -3601,7 +3674,94 @@ mod tests {
             },
             bots: vec![BotState {
                 id: "0".to_owned(),
-                x: 5,
+                x: 8,
+                y: 1,
+                carrying: vec!["bread".to_owned()],
+                capacity: 1,
+            }],
+            items: vec![
+                Item {
+                    id: "item_milk".to_owned(),
+                    kind: "milk".to_owned(),
+                    x: 4,
+                    y: 3,
+                },
+                Item {
+                    id: "item_bread".to_owned(),
+                    kind: "bread".to_owned(),
+                    x: 7,
+                    y: 3,
+                },
+            ],
+            orders: vec![
+                Order {
+                    id: "o_active".to_owned(),
+                    item_id: "milk".to_owned(),
+                    status: OrderStatus::InProgress,
+                },
+                Order {
+                    id: "o_preview".to_owned(),
+                    item_id: "bread".to_owned(),
+                    status: OrderStatus::Pending,
+                },
+            ],
+            ..GameState::default()
+        };
+        let world = World::new(state.clone());
+        let map = world.map();
+        let dist = DistanceMap::build(map);
+        let team = TeamContext::build(
+            &state,
+            map,
+            &dist,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            TeamContextConfig::default(),
+        );
+        let preview_stand = map.stand_cells_for_item("item_bread")[0];
+        let global = vec![BotIntent {
+            bot_id: "0".to_owned(),
+            intent: Intent::Wait,
+        }];
+        let legacy = vec![BotIntent {
+            bot_id: "0".to_owned(),
+            intent: Intent::MoveTo {
+                cell: preview_stand,
+            },
+        }];
+        let merged = merge_hybrid_intents(&state, &team, map, &dist, global, &legacy);
+        assert_eq!(merged.len(), 1);
+        assert!(matches!(merged[0].intent, Intent::MoveTo { .. }));
+        if let Intent::MoveTo { cell } = merged[0].intent {
+            assert!(
+                team.queue.ring_cells.contains(&cell)
+                    || team.queue.lane_cells.contains(&cell)
+                    || map.dropoff_cells.contains(&cell)
+            );
+        }
+    }
+
+    #[test]
+    fn hybrid_merge_allows_wait_for_full_inactive_inside_dropoff_zone() {
+        let state = GameState {
+            grid: Grid {
+                width: 9,
+                height: 7,
+                drop_off_tiles: vec![[1, 5]],
+                ..Grid::default()
+            },
+            bots: vec![BotState {
+                id: "0".to_owned(),
+                x: 1,
                 y: 5,
                 carrying: vec!["bread".to_owned()],
                 capacity: 1,
@@ -3665,7 +3825,7 @@ mod tests {
                 cell: preview_stand,
             },
         }];
-        let merged = merge_hybrid_intents(&state, &team, global, &legacy);
+        let merged = merge_hybrid_intents(&state, &team, map, &dist, global, &legacy);
         assert_eq!(merged.len(), 1);
         assert!(matches!(merged[0].intent, Intent::Wait));
     }

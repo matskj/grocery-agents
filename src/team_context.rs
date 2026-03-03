@@ -239,8 +239,7 @@ impl TeamContext {
             &active_items,
         );
         let queue = build_queue_plan(state, map, dist, &bot_snapshot, sticky, cfg);
-        let dropoff_control_zone =
-            build_dropoff_control_zone(map, &queue, cfg.control_zone_radius);
+        let dropoff_control_zone = build_dropoff_control_zone(map, &queue, cfg.control_zone_radius);
         let traffic = build_traffic(state, map, &queue, &bot_snapshot);
         let movement = build_movement(
             state,
@@ -370,7 +369,9 @@ impl TeamContext {
             );
             queue_distance.insert(
                 bot_id.clone(),
-                serde_json::Value::Number(serde_json::Number::from(assignment.queue_distance as i64)),
+                serde_json::Value::Number(serde_json::Number::from(
+                    assignment.queue_distance as i64,
+                )),
             );
             queue_violation.insert(
                 bot_id.clone(),
@@ -434,10 +435,7 @@ impl TeamContext {
             coverage_gain_by_bot.insert(
                 bot_id.clone(),
                 serde_json::Value::Number(serde_json::Number::from(
-                    self.coverage_gain_by_bot
-                        .get(bot_id)
-                        .copied()
-                        .unwrap_or(0) as i64,
+                    self.coverage_gain_by_bot.get(bot_id).copied().unwrap_or(0) as i64,
                 )),
             );
             dropoff_watchdog_triggered_by_bot.insert(
@@ -454,7 +452,9 @@ impl TeamContext {
         for (bot_id, snap) in &self.bot_snapshot {
             repeated_failed_move_count.insert(
                 bot_id.clone(),
-                serde_json::Value::Number(serde_json::Number::from(snap.repeated_failed_moves as i64)),
+                serde_json::Value::Number(serde_json::Number::from(
+                    snap.repeated_failed_moves as i64,
+                )),
             );
             in_corner.insert(
                 bot_id.clone(),
@@ -472,11 +472,7 @@ impl TeamContext {
             let plan_state = self.bot_plan_state_by_bot.get(bot_id);
             escape_macro_active.insert(
                 bot_id.clone(),
-                serde_json::Value::Bool(
-                    plan_state
-                        .map(|s| s.escape_macro_active)
-                        .unwrap_or(false),
-                ),
+                serde_json::Value::Bool(plan_state.map(|s| s.escape_macro_active).unwrap_or(false)),
             );
             escape_macro_ticks_remaining.insert(
                 bot_id.clone(),
@@ -1009,7 +1005,13 @@ fn build_queue_plan(
     ring_cells.dedup();
     plan.ring_cells = ring_cells.clone();
 
-    let lane_cells = build_queue_lane_cells(map, dist, dropoff, state.bots.len().saturating_add(3), &ring_cells);
+    let lane_cells = build_queue_lane_cells(
+        map,
+        dist,
+        dropoff,
+        state.bots.len().saturating_add(3),
+        &ring_cells,
+    );
     plan.lane_cells = lane_cells.clone();
 
     couriers.sort_by(|a, b| {
@@ -1156,7 +1158,11 @@ fn build_queue_lane_cells(
         candidates.push((d, y, x, idx));
     }
     candidates.sort_by(|a, b| a.cmp(b));
-    candidates.into_iter().take(count).map(|(_, _, _, idx)| idx).collect()
+    candidates
+        .into_iter()
+        .take(count)
+        .map(|(_, _, _, idx)| idx)
+        .collect()
 }
 
 fn build_traffic(
@@ -1211,8 +1217,14 @@ fn build_traffic(
         .filter(|(idx, _)| lane_set.contains(idx) || ring_set.contains(idx))
         .map(|(_, count)| *count)
         .sum();
-    let blocked_bot_count = bot_snapshot.values().filter(|s| s.blocked_ticks >= 1).count() as u16;
-    let stuck_bot_count = bot_snapshot.values().filter(|s| s.blocked_ticks >= 2).count() as u16;
+    let blocked_bot_count = bot_snapshot
+        .values()
+        .filter(|s| s.blocked_ticks >= 1)
+        .count() as u16;
+    let stuck_bot_count = bot_snapshot
+        .values()
+        .filter(|s| s.blocked_ticks >= 2)
+        .count() as u16;
 
     TrafficSnapshot {
         conflict_degree_by_bot,
@@ -1380,11 +1392,7 @@ fn build_topology(map: &MapCache) -> (Vec<u8>, Vec<u8>, HashSet<u16>, HashSet<u1
     (degree, dead_end_depth, junction_cells, corner_cells)
 }
 
-fn build_dropoff_control_zone(
-    map: &MapCache,
-    queue: &QueuePlan,
-    radius: u8,
-) -> HashSet<u16> {
+fn build_dropoff_control_zone(map: &MapCache, queue: &QueuePlan, radius: u8) -> HashSet<u16> {
     let mut zone = HashSet::new();
     if map.dropoff_cells.is_empty() {
         return zone;

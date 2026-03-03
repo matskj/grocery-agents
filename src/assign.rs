@@ -157,14 +157,15 @@ impl AssignmentEngine {
             .count();
         let stand_task_count = tasks
             .iter()
-            .filter(|task| {
-                matches!(task.kind, TaskKind::PickupStand | TaskKind::ImmediatePickup)
-            })
+            .filter(|task| matches!(task.kind, TaskKind::PickupStand | TaskKind::ImmediatePickup))
             .count();
         let dropoff_task_count = tasks
             .iter()
             .filter(|task| {
-                matches!(task.kind, TaskKind::ImmediateDropOff | TaskKind::CarryToDropoff)
+                matches!(
+                    task.kind,
+                    TaskKind::ImmediateDropOff | TaskKind::CarryToDropoff
+                )
             })
             .count();
 
@@ -193,6 +194,12 @@ impl AssignmentEngine {
             let bot_has_capacity = bot.carrying.len() < bot.capacity;
             let role = team.role_for(&bot.id);
             let queue_goal = team.queue_goal_for(&bot.id);
+            let queue_distance = team
+                .queue
+                .assignments
+                .get(&bot.id)
+                .map(|assignment| f64::from(assignment.queue_distance))
+                .unwrap_or(99.0);
             let inventory_util = if bot.capacity == 0 {
                 0.0
             } else {
@@ -206,11 +213,22 @@ impl AssignmentEngine {
                 .copied()
                 .map(f64::from)
                 .unwrap_or(0.0);
+            let local_conflict_count = local_congestion;
             let blocked_ticks = team
                 .bot_snapshot
                 .get(&bot.id)
                 .map(|snap| f64::from(snap.blocked_ticks))
                 .unwrap_or(0.0);
+            let serviceable_dropoff = if team
+                .dropoff_serviceable_by_bot
+                .get(&bot.id)
+                .copied()
+                .unwrap_or(false)
+            {
+                1.0
+            } else {
+                0.0
+            };
             let on_dropoff = map
                 .idx(bot.x, bot.y)
                 .map(|cell| map.dropoff_cells.contains(&cell))
@@ -324,6 +342,10 @@ impl AssignmentEngine {
                     }
                     if matches!(task.kind, TaskKind::PickupStand | TaskKind::ImmediatePickup) {
                         let dist_to_stand = f64::from(dist_to(bot_cell, task.target_cell, dist));
+                        let bot_dropoff_dist =
+                            f64::from(nearest_drop_dist(bot_cell, map, dist).min(64));
+                        let roundtrip_eta =
+                            dist_to_stand + 0.7 * f64::from(task.nearest_drop_dist.min(64));
                         let stand_claimed_by_other = team
                             .knowledge
                             .stand_claims
@@ -343,14 +365,18 @@ impl AssignmentEngine {
                                 team.knowledge
                                     .bot_commitments
                                     .values()
-                                    .filter(|commitment| commitment.item_kind.as_ref() == Some(kind))
+                                    .filter(|commitment| {
+                                        commitment.item_kind.as_ref() == Some(kind)
+                                    })
                                     .count() as f64
                             })
                             .unwrap_or(0.0);
                         let stand_cooldown = if stand_claimed_by_other { 6.0 } else { 0.0 };
                         let contention = commitment_same_stand + 0.5 * commitment_same_kind;
                         let time_since_last_conversion = f64::from(
-                            runtime_hints.ticks_since_pickup.min(runtime_hints.ticks_since_dropoff),
+                            runtime_hints
+                                .ticks_since_pickup
+                                .min(runtime_hints.ticks_since_dropoff),
                         );
                         let last_conversion_was_pickup = if runtime_hints.ticks_since_pickup
                             <= runtime_hints.ticks_since_dropoff
@@ -363,10 +389,33 @@ impl AssignmentEngine {
                             dist_to_nearest_active_item: dist_to_stand,
                             dist_to_dropoff: f64::from(task.nearest_drop_dist.min(64)),
                             inventory_util,
+                            queue_distance,
                             local_congestion,
+                            local_conflict_count,
                             teammate_proximity,
                             order_urgency,
                             blocked_ticks,
+                            queue_role_lead: if matches!(role, BotRole::LeadCourier) {
+                                1.0
+                            } else {
+                                0.0
+                            },
+                            queue_role_courier: if matches!(role, BotRole::QueueCourier) {
+                                1.0
+                            } else {
+                                0.0
+                            },
+                            queue_role_collector: if matches!(role, BotRole::Collector) {
+                                1.0
+                            } else {
+                                0.0
+                            },
+                            queue_role_yield: if matches!(role, BotRole::Yield) {
+                                1.0
+                            } else {
+                                0.0
+                            },
+                            serviceable_dropoff,
                             stand_failure_count_recent: 0.0,
                             stand_success_count_recent: 0.0,
                             stand_cooldown_ticks_remaining: stand_cooldown,
@@ -390,6 +439,14 @@ impl AssignmentEngine {
                             if contention > 0.0 {
                                 adjusted += (contention * 10.0).round() as i32;
                             }
+                        }
+                        let pickup_stall_ticks = runtime_hints.ticks_since_pickup.saturating_sub(8);
+                        if pickup_stall_ticks > 0 {
+                            adjusted += roundtrip_idle_pressure_penalty(
+                                roundtrip_eta,
+                                bot_dropoff_dist,
+                                f64::from(pickup_stall_ticks),
+                            );
                         }
                     }
                     (adjusted, task.task_id)
@@ -452,7 +509,10 @@ impl AssignmentEngine {
                 continue;
             }
             if !task.shareable {
-                let used = target_cell_taken.get(&task.target_cell).copied().unwrap_or(0);
+                let used = target_cell_taken
+                    .get(&task.target_cell)
+                    .copied()
+                    .unwrap_or(0);
                 let cap = task.target_share_cap(sparse_active_stands);
                 if used >= cap {
                     continue;
@@ -472,7 +532,10 @@ impl AssignmentEngine {
             bot_taken.insert(edge.bot_id.clone());
             if !task.shareable {
                 task_taken.insert(edge.task_id);
-                let used = target_cell_taken.get(&task.target_cell).copied().unwrap_or(0);
+                let used = target_cell_taken
+                    .get(&task.target_cell)
+                    .copied()
+                    .unwrap_or(0);
                 target_cell_taken.insert(task.target_cell, used.saturating_add(1));
             }
             if matches!(task.demand_tier, DemandTier::Active)
@@ -562,7 +625,11 @@ fn build_tasks(
     for kind in active_missing.keys() {
         active_gap_by_kind.entry(kind.clone()).or_insert(0);
     }
-    let active_gap_total = active_gap_by_kind.values().copied().map(usize::from).sum::<usize>();
+    let active_gap_total = active_gap_by_kind
+        .values()
+        .copied()
+        .map(usize::from)
+        .sum::<usize>();
     let preview_enabled = active_gap_total == 0;
 
     let mut active_orders = state
@@ -757,7 +824,11 @@ fn build_tasks(
         }
     }
 
-    tasks.sort_by(|a, b| a.sort_key.cmp(&b.sort_key).then_with(|| a.task_id.cmp(&b.task_id)));
+    tasks.sort_by(|a, b| {
+        a.sort_key
+            .cmp(&b.sort_key)
+            .then_with(|| a.task_id.cmp(&b.task_id))
+    });
     Some(TaskBuildResult {
         tasks,
         active_gap_by_kind,
@@ -868,8 +939,7 @@ fn task_cost(
                 DemandTier::Preview => 30.0,
                 DemandTier::None => 0.0,
             };
-            (d
-                + 0.45 * f64::from(task.nearest_drop_dist.min(64))
+            (d + 0.45 * f64::from(task.nearest_drop_dist.min(64))
                 + lambda_density * density
                 + lambda_choke * choke
                 + demand_bias)
@@ -924,6 +994,24 @@ fn nearest_drop_dist(cell: u16, map: &MapCache, dist: &DistanceMap) -> u16 {
         .map(|drop| dist_to(cell, drop, dist))
         .min()
         .unwrap_or(256)
+}
+
+fn roundtrip_idle_pressure_penalty(
+    roundtrip_eta: f64,
+    bot_dropoff_dist: f64,
+    stall_ticks: f64,
+) -> i32 {
+    let eta_pressure = if roundtrip_eta > 18.0 {
+        (roundtrip_eta - 18.0) * 0.7
+    } else {
+        0.0
+    };
+    let far_pressure = if bot_dropoff_dist > 12.0 {
+        (bot_dropoff_dist - 12.0) * 1.2
+    } else {
+        0.0
+    };
+    ((eta_pressure + far_pressure) * (1.0 + stall_ticks / 16.0)).round() as i32
 }
 
 fn avg_teammate_distance(bot: &BotState, bots: &[BotState]) -> f64 {
@@ -987,7 +1075,9 @@ mod tests {
         world::World,
     };
 
-    use super::{compare_item_ids, AssignmentEngine, AssignmentRuntimeHints};
+    use super::{
+        compare_item_ids, roundtrip_idle_pressure_penalty, AssignmentEngine, AssignmentRuntimeHints,
+    };
 
     #[test]
     fn deterministic_assignment_ordering() {
@@ -1076,7 +1166,10 @@ mod tests {
                 Duration::from_millis(200),
             )
             .expect("assignment");
-        assert_eq!(format!("{:?}", first.intents), format!("{:?}", second.intents));
+        assert_eq!(
+            format!("{:?}", first.intents),
+            format!("{:?}", second.intents)
+        );
     }
 
     #[test]
@@ -1174,7 +1267,10 @@ mod tests {
             .into_iter()
             .find(|intent| intent.bot_id == "0")
             .expect("bot intent");
-        assert!(matches!(first.intent, crate::dispatcher::Intent::PickUp { .. }));
+        assert!(matches!(
+            first.intent,
+            crate::dispatcher::Intent::PickUp { .. }
+        ));
         if let crate::dispatcher::Intent::PickUp { item_id } = first.intent {
             assert_eq!(item_id, "item_12");
         }
@@ -1256,5 +1352,12 @@ mod tests {
         assert!(result.active_task_count > 0);
         assert!(result.active_gap_total > 0);
         assert!(!result.preview_enabled);
+    }
+
+    #[test]
+    fn roundtrip_idle_pressure_penalty_increases_for_far_and_slow_paths() {
+        let low = roundtrip_idle_pressure_penalty(12.0, 6.0, 4.0);
+        let high = roundtrip_idle_pressure_penalty(28.0, 20.0, 24.0);
+        assert!(high > low);
     }
 }

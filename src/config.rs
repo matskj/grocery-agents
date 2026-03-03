@@ -103,11 +103,7 @@ pub struct ConfigArgs {
     )]
     pub coord_goal_collapse_threshold: usize,
 
-    #[arg(
-        long,
-        env = "GROCERY_COORD_MAX_BOTS_PER_STAND",
-        default_value_t = 1
-    )]
+    #[arg(long, env = "GROCERY_COORD_MAX_BOTS_PER_STAND", default_value_t = 1)]
     pub coord_max_bots_per_stand: u8,
 
     #[arg(
@@ -117,11 +113,7 @@ pub struct ConfigArgs {
     )]
     pub coord_post_dropoff_retask_ticks: u8,
 
-    #[arg(
-        long,
-        env = "GROCERY_COORD_AREA_BALANCE_WEIGHT",
-        default_value_t = 1.0
-    )]
+    #[arg(long, env = "GROCERY_COORD_AREA_BALANCE_WEIGHT", default_value_t = 1.0)]
     pub coord_area_balance_weight: f64,
 }
 
@@ -147,9 +139,7 @@ impl ConfigArgs {
             ascii_render: self.ascii_render,
             replay_dump_path: self.replay_dump_path,
             coord_claim_ttl_ticks: self.coord_claim_ttl_ticks.clamp(2, 60),
-            coord_reassign_no_progress_ticks: self
-                .coord_reassign_no_progress_ticks
-                .clamp(2, 64),
+            coord_reassign_no_progress_ticks: self.coord_reassign_no_progress_ticks.clamp(2, 64),
             coord_goal_collapse_threshold: self.coord_goal_collapse_threshold.clamp(2, 32),
             coord_max_bots_per_stand: self.coord_max_bots_per_stand.clamp(1, 3),
             coord_post_dropoff_retask_ticks: self.coord_post_dropoff_retask_ticks.clamp(1, 24),

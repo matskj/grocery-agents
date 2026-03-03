@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -108,6 +108,11 @@ struct EpisodeMetrics {
     pickup_successes: u64,
     dropoff_attempts: u64,
     dropoff_successes: u64,
+    far_no_conversion_ticks: u64,
+    collector_waits: u64,
+    collector_far_waits: u64,
+    full_inactive_waits: u64,
+    full_inactive_far_waits: u64,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -340,7 +345,10 @@ fn parse_metrics(path: &Path) -> Result<EpisodeMetrics, Box<dyn std::error::Erro
                 metrics.moves = counters.get("moves").and_then(Value::as_u64).unwrap_or(0);
                 metrics.waits = counters.get("waits").and_then(Value::as_u64).unwrap_or(0);
                 metrics.pickups = counters.get("pickups").and_then(Value::as_u64).unwrap_or(0);
-                metrics.dropoffs = counters.get("dropoffs").and_then(Value::as_u64).unwrap_or(0);
+                metrics.dropoffs = counters
+                    .get("dropoffs")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
                 metrics.blocked_events = counters
                     .get("blocked_events")
                     .and_then(Value::as_u64)
@@ -364,17 +372,51 @@ fn parse_metrics(path: &Path) -> Result<EpisodeMetrics, Box<dyn std::error::Erro
             }
             let team_summary = data.get("team_summary").cloned().unwrap_or(Value::Null);
             let tick_outcome = data.get("tick_outcome").cloned().unwrap_or(Value::Null);
-            if let Some(actions) = data.get("actions").and_then(Value::as_array) {
-                for action in actions {
-                    match action.get("kind").and_then(Value::as_str).unwrap_or("") {
-                        "move" => metrics.moves = metrics.moves.saturating_add(1),
-                        "wait" => metrics.waits = metrics.waits.saturating_add(1),
-                        "pick_up" => metrics.pickups = metrics.pickups.saturating_add(1),
-                        "drop_off" => metrics.dropoffs = metrics.dropoffs.saturating_add(1),
-                        _ => {}
-                    }
-                }
-            }
+            let queue_roles = team_summary.get("queue_roles").and_then(Value::as_object);
+            let active_order_items_set = data
+                .get("game_state")
+                .and_then(|s| s.get("orders"))
+                .and_then(Value::as_array)
+                .map(|orders| {
+                    orders
+                        .iter()
+                        .filter_map(|order| {
+                            let in_progress = order
+                                .get("status")
+                                .and_then(Value::as_str)
+                                .map(|status| status.eq_ignore_ascii_case("in_progress"))
+                                .unwrap_or(false);
+                            if !in_progress {
+                                return None;
+                            }
+                            order
+                                .get("item_id")
+                                .and_then(Value::as_str)
+                                .map(|item| item.to_owned())
+                        })
+                        .collect::<HashSet<_>>()
+                })
+                .unwrap_or_default();
+            let dropoff_tiles = data
+                .get("game_state")
+                .and_then(|s| s.get("grid"))
+                .and_then(|g| g.get("drop_off_tiles"))
+                .and_then(Value::as_array)
+                .map(|tiles| {
+                    tiles
+                        .iter()
+                        .filter_map(|tile| {
+                            let arr = tile.as_array()?;
+                            if arr.len() != 2 {
+                                return None;
+                            }
+                            let x = arr[0].as_i64()?;
+                            let y = arr[1].as_i64()?;
+                            Some((x, y))
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
             let mut action_by_bot = HashMap::<String, String>::new();
             if let Some(actions) = data.get("actions").and_then(Value::as_array) {
                 for action in actions {
@@ -388,12 +430,22 @@ fn parse_metrics(path: &Path) -> Result<EpisodeMetrics, Box<dyn std::error::Erro
                         .and_then(Value::as_str)
                         .unwrap_or("wait")
                         .to_owned();
+                    match kind.as_str() {
+                        "move" => metrics.moves = metrics.moves.saturating_add(1),
+                        "wait" => metrics.waits = metrics.waits.saturating_add(1),
+                        "pick_up" => metrics.pickups = metrics.pickups.saturating_add(1),
+                        "drop_off" => metrics.dropoffs = metrics.dropoffs.saturating_add(1),
+                        _ => {}
+                    }
                     if !bot_id.is_empty() {
-                        action_by_bot.insert(bot_id, kind);
+                        action_by_bot.insert(bot_id.clone(), kind.clone());
                     }
                 }
             }
             let mut carrying_by_bot = HashMap::<String, i64>::new();
+            let mut carrying_items_by_bot = HashMap::<String, Vec<String>>::new();
+            let mut capacity_by_bot = HashMap::<String, usize>::new();
+            let mut bot_dropoff_dist_by_bot = HashMap::<String, f64>::new();
             if let Some(bots) = data
                 .get("game_state")
                 .and_then(|s| s.get("bots"))
@@ -408,14 +460,84 @@ fn parse_metrics(path: &Path) -> Result<EpisodeMetrics, Box<dyn std::error::Erro
                     if bot_id.is_empty() {
                         continue;
                     }
-                    let carrying = bot
+                    let carrying_items = bot
                         .get("carrying")
                         .and_then(Value::as_array)
-                        .map(|c| c.len() as i64)
-                        .unwrap_or(0);
+                        .map(|items| {
+                            items
+                                .iter()
+                                .filter_map(Value::as_str)
+                                .map(|item| item.to_owned())
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
+                    let carrying = carrying_items.len() as i64;
+                    let capacity = bot
+                        .get("capacity")
+                        .and_then(Value::as_u64)
+                        .map(|v| v as usize)
+                        .unwrap_or(3);
+                    let x = bot.get("x").and_then(Value::as_i64).unwrap_or(0);
+                    let y = bot.get("y").and_then(Value::as_i64).unwrap_or(0);
+                    let bot_dropoff_dist = nearest_dropoff_distance(x, y, &dropoff_tiles);
+                    bot_dropoff_dist_by_bot.insert(bot_id.clone(), bot_dropoff_dist);
+                    carrying_items_by_bot.insert(bot_id.clone(), carrying_items);
+                    capacity_by_bot.insert(bot_id.clone(), capacity);
                     carrying_by_bot.insert(bot_id, carrying);
                 }
             }
+            if let Some(actions) = data.get("actions").and_then(Value::as_array) {
+                for action in actions {
+                    let bot_id = action
+                        .get("bot_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_owned();
+                    let kind = action
+                        .get("kind")
+                        .and_then(Value::as_str)
+                        .unwrap_or("wait")
+                        .to_owned();
+                    if kind != "wait" || bot_id.is_empty() {
+                        continue;
+                    }
+                    let role = queue_roles
+                        .and_then(|roles| roles.get(bot_id.as_str()))
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown");
+                    let bot_dropoff_dist = bot_dropoff_dist_by_bot
+                        .get(&bot_id)
+                        .copied()
+                        .unwrap_or(f64::INFINITY);
+                    if role == "collector" {
+                        metrics.collector_waits = metrics.collector_waits.saturating_add(1);
+                        if bot_dropoff_dist >= far_distance_threshold() {
+                            metrics.collector_far_waits =
+                                metrics.collector_far_waits.saturating_add(1);
+                        }
+                    }
+                    let carrying_items = carrying_items_by_bot
+                        .get(&bot_id)
+                        .cloned()
+                        .unwrap_or_default();
+                    let carrying_count = carrying_items.len();
+                    let capacity = capacity_by_bot.get(&bot_id).copied().unwrap_or(3);
+                    let full = capacity > 0 && carrying_count >= capacity;
+                    let carrying_active = carrying_items
+                        .iter()
+                        .any(|item| active_order_items_set.contains(item));
+                    let full_inactive = full && !carrying_active;
+                    if full_inactive {
+                        metrics.full_inactive_waits = metrics.full_inactive_waits.saturating_add(1);
+                        if bot_dropoff_dist >= far_distance_threshold() {
+                            metrics.full_inactive_far_waits =
+                                metrics.full_inactive_far_waits.saturating_add(1);
+                        }
+                    }
+                }
+            }
+            let mut tick_pickup_successes = 0u64;
+            let mut tick_dropoff_successes = 0u64;
             for (bot_id, prev_action) in &prev_action_by_bot {
                 let Some(&prev_carrying) = prev_carrying_by_bot.get(bot_id) else {
                     continue;
@@ -427,13 +549,26 @@ fn parse_metrics(path: &Path) -> Result<EpisodeMetrics, Box<dyn std::error::Erro
                     metrics.pickup_attempts = metrics.pickup_attempts.saturating_add(1);
                     if current_carrying > prev_carrying {
                         metrics.pickup_successes = metrics.pickup_successes.saturating_add(1);
+                        tick_pickup_successes = tick_pickup_successes.saturating_add(1);
                     }
                 } else if prev_action == "drop_off" {
                     metrics.dropoff_attempts = metrics.dropoff_attempts.saturating_add(1);
                     if current_carrying < prev_carrying {
                         metrics.dropoff_successes = metrics.dropoff_successes.saturating_add(1);
+                        tick_dropoff_successes = tick_dropoff_successes.saturating_add(1);
                     }
                 }
+            }
+            let mean_dropoff_dist = if bot_dropoff_dist_by_bot.is_empty() {
+                0.0
+            } else {
+                bot_dropoff_dist_by_bot.values().copied().sum::<f64>()
+                    / bot_dropoff_dist_by_bot.len() as f64
+            };
+            if tick_pickup_successes + tick_dropoff_successes == 0
+                && mean_dropoff_dist >= far_distance_threshold()
+            {
+                metrics.far_no_conversion_ticks = metrics.far_no_conversion_ticks.saturating_add(1);
             }
             prev_action_by_bot = action_by_bot;
             prev_carrying_by_bot = carrying_by_bot;
@@ -517,7 +652,9 @@ fn parse_metrics(path: &Path) -> Result<EpisodeMetrics, Box<dyn std::error::Erro
                 .get("items_delivered_delta")
                 .and_then(Value::as_u64)
                 .unwrap_or(0);
-            metrics.items_delivered = metrics.items_delivered.saturating_add(items_delivered_delta);
+            metrics.items_delivered = metrics
+                .items_delivered
+                .saturating_add(items_delivered_delta);
             let order_completed_delta = tick_outcome
                 .get("order_completed_delta")
                 .and_then(Value::as_u64)
@@ -596,47 +733,55 @@ fn parse_metrics(path: &Path) -> Result<EpisodeMetrics, Box<dyn std::error::Erro
 fn print_summary(metrics: &[EpisodeMetrics]) {
     let mut scores = metrics.iter().map(|m| m.final_score).collect::<Vec<_>>();
     scores.sort_unstable();
-    let mean_score = metrics.iter().map(|m| m.final_score as f64).sum::<f64>() / metrics.len() as f64;
+    let mean_score =
+        metrics.iter().map(|m| m.final_score as f64).sum::<f64>() / metrics.len() as f64;
     let p50 = percentile(&scores, 50.0);
     let p90 = percentile(&scores, 90.0);
 
-    let totals = metrics.iter().fold(EpisodeMetrics::default(), |mut acc, item| {
-        acc.waits += item.waits;
-        acc.moves += item.moves;
-        acc.pickups += item.pickups;
-        acc.dropoffs += item.dropoffs;
-        acc.blocked_events += item.blocked_events;
-        acc.near_dropoff_congestion_events += item.near_dropoff_congestion_events;
-        acc.assignment_ms_sum += item.assignment_ms_sum;
-        acc.assignment_ticks += item.assignment_ticks;
-        acc.repeated_goal_concentration += item.repeated_goal_concentration;
-        acc.tick_count += item.tick_count;
-        acc.late_no_delivery_streak += item.late_no_delivery_streak;
-        acc.goal_collapse_ticks += item.goal_collapse_ticks;
-        acc.guard_fallback_ticks += item.guard_fallback_ticks;
-        acc.guard_fallback_ratio += item.guard_fallback_ratio;
-        acc.items_delivered += item.items_delivered;
-        acc.pickup_attempts += item.pickup_attempts;
-        acc.pickup_successes += item.pickup_successes;
-        acc.dropoff_attempts += item.dropoff_attempts;
-        acc.dropoff_successes += item.dropoff_successes;
-        for phase_idx in 0..PHASE_COUNT {
-            let src = item.phase[phase_idx];
-            let dst = &mut acc.phase[phase_idx];
-            dst.score_gain += src.score_gain;
-            dst.items_delivered = dst.items_delivered.saturating_add(src.items_delivered);
-            dst.order_completions = dst.order_completions.saturating_add(src.order_completions);
-            dst.blocked_sum = dst.blocked_sum.saturating_add(src.blocked_sum);
-            dst.stuck_sum = dst.stuck_sum.saturating_add(src.stuck_sum);
-            dst.unique_goal_sum += src.unique_goal_sum;
-            dst.unique_goal_samples = dst
-                .unique_goal_samples
-                .saturating_add(src.unique_goal_samples);
-            dst.goal_concentration_sum += src.goal_concentration_sum;
-            dst.tick_count = dst.tick_count.saturating_add(src.tick_count);
-        }
-        acc
-    });
+    let totals = metrics
+        .iter()
+        .fold(EpisodeMetrics::default(), |mut acc, item| {
+            acc.waits += item.waits;
+            acc.moves += item.moves;
+            acc.pickups += item.pickups;
+            acc.dropoffs += item.dropoffs;
+            acc.blocked_events += item.blocked_events;
+            acc.near_dropoff_congestion_events += item.near_dropoff_congestion_events;
+            acc.assignment_ms_sum += item.assignment_ms_sum;
+            acc.assignment_ticks += item.assignment_ticks;
+            acc.repeated_goal_concentration += item.repeated_goal_concentration;
+            acc.tick_count += item.tick_count;
+            acc.late_no_delivery_streak += item.late_no_delivery_streak;
+            acc.goal_collapse_ticks += item.goal_collapse_ticks;
+            acc.guard_fallback_ticks += item.guard_fallback_ticks;
+            acc.guard_fallback_ratio += item.guard_fallback_ratio;
+            acc.items_delivered += item.items_delivered;
+            acc.pickup_attempts += item.pickup_attempts;
+            acc.pickup_successes += item.pickup_successes;
+            acc.dropoff_attempts += item.dropoff_attempts;
+            acc.dropoff_successes += item.dropoff_successes;
+            acc.far_no_conversion_ticks += item.far_no_conversion_ticks;
+            acc.collector_waits += item.collector_waits;
+            acc.collector_far_waits += item.collector_far_waits;
+            acc.full_inactive_waits += item.full_inactive_waits;
+            acc.full_inactive_far_waits += item.full_inactive_far_waits;
+            for phase_idx in 0..PHASE_COUNT {
+                let src = item.phase[phase_idx];
+                let dst = &mut acc.phase[phase_idx];
+                dst.score_gain += src.score_gain;
+                dst.items_delivered = dst.items_delivered.saturating_add(src.items_delivered);
+                dst.order_completions = dst.order_completions.saturating_add(src.order_completions);
+                dst.blocked_sum = dst.blocked_sum.saturating_add(src.blocked_sum);
+                dst.stuck_sum = dst.stuck_sum.saturating_add(src.stuck_sum);
+                dst.unique_goal_sum += src.unique_goal_sum;
+                dst.unique_goal_samples = dst
+                    .unique_goal_samples
+                    .saturating_add(src.unique_goal_samples);
+                dst.goal_concentration_sum += src.goal_concentration_sum;
+                dst.tick_count = dst.tick_count.saturating_add(src.tick_count);
+            }
+            acc
+        });
     let total_actions = totals.waits + totals.moves + totals.pickups + totals.dropoffs;
     let wait_ratio = if total_actions == 0 {
         0.0
@@ -679,6 +824,21 @@ fn print_summary(metrics: &[EpisodeMetrics]) {
     } else {
         totals.dropoff_successes as f64 / totals.dropoff_attempts as f64
     };
+    let far_no_conversion_tick_ratio = if totals.tick_count == 0 {
+        0.0
+    } else {
+        totals.far_no_conversion_ticks as f64 / totals.tick_count as f64
+    };
+    let collector_far_wait_ratio = if totals.collector_waits == 0 {
+        0.0
+    } else {
+        totals.collector_far_waits as f64 / totals.collector_waits as f64
+    };
+    let full_inactive_far_wait_ratio = if totals.full_inactive_waits == 0 {
+        0.0
+    } else {
+        totals.full_inactive_far_waits as f64 / totals.full_inactive_waits as f64
+    };
     println!(
         "conversion delivered_per_100_ticks={:.3} pickup_success_ratio={:.3} ({}/{}) dropoff_success_ratio={:.3} ({}/{})",
         delivered_per_100_ticks,
@@ -688,6 +848,16 @@ fn print_summary(metrics: &[EpisodeMetrics]) {
         dropoff_success_ratio,
         totals.dropoff_successes,
         totals.dropoff_attempts
+    );
+    println!(
+        "spatial far_no_conversion_tick_ratio={:.3} collector_far_wait_ratio={:.3} ({}/{}) full_inactive_far_wait_ratio={:.3} ({}/{})",
+        far_no_conversion_tick_ratio,
+        collector_far_wait_ratio,
+        totals.collector_far_waits,
+        totals.collector_waits,
+        full_inactive_far_wait_ratio,
+        totals.full_inactive_far_waits,
+        totals.full_inactive_waits
     );
     println!(
         "collapse_alarms late_no_delivery_streak_avg={:.2} goal_collapse_ratio={:.3} guard_fallback_ratio={:.3}",
@@ -819,10 +989,16 @@ fn evaluate_gates(metrics: &[EpisodeMetrics], profile: GateProfile) -> bool {
         let dropoff_attempts = rows.iter().map(|r| r.dropoff_attempts).sum::<u64>();
         let dropoff_successes = rows.iter().map(|r| r.dropoff_successes).sum::<u64>();
         let guard_ticks = rows.iter().map(|r| r.guard_fallback_ticks).sum::<u64>();
-        let repeated_goal_concentration =
-            rows.iter().map(|r| r.repeated_goal_concentration).sum::<f64>() / rows.len() as f64;
-        let late_no_delivery_streak =
-            rows.iter().map(|r| r.late_no_delivery_streak as f64).sum::<f64>() / rows.len() as f64;
+        let repeated_goal_concentration = rows
+            .iter()
+            .map(|r| r.repeated_goal_concentration)
+            .sum::<f64>()
+            / rows.len() as f64;
+        let late_no_delivery_streak = rows
+            .iter()
+            .map(|r| r.late_no_delivery_streak as f64)
+            .sum::<f64>()
+            / rows.len() as f64;
 
         let delivered_per_100_ticks = if ticks == 0 {
             0.0
@@ -898,6 +1074,20 @@ fn percentile(sorted: &[i64], p: f64) -> i64 {
     }
     let rank = ((p / 100.0) * (sorted.len().saturating_sub(1) as f64)).round() as usize;
     sorted[rank.min(sorted.len() - 1)]
+}
+
+fn far_distance_threshold() -> f64 {
+    8.0
+}
+
+fn nearest_dropoff_distance(bot_x: i64, bot_y: i64, dropoffs: &[(i64, i64)]) -> f64 {
+    if dropoffs.is_empty() {
+        return f64::INFINITY;
+    }
+    dropoffs
+        .iter()
+        .map(|(x, y)| (bot_x - *x).abs() as f64 + (bot_y - *y).abs() as f64)
+        .fold(f64::INFINITY, f64::min)
 }
 
 fn mode_matches(mode: &str, filter: Option<&str>) -> bool {
@@ -1002,6 +1192,79 @@ mod tests {
         assert_eq!(parsed.dropoff_attempts, 1);
         assert_eq!(parsed.dropoff_successes, 1);
         assert!(parsed.items_delivered >= 1);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn parse_metrics_reports_spatial_wait_diagnostics() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let path = std::env::temp_dir().join(format!("run-eval-spatial-test-{suffix}.jsonl"));
+        let content = vec![
+            serde_json::json!({
+                "event": "tick",
+                "data": {
+                    "mode": "easy",
+                    "tick": 0,
+                    "actions": [{"bot_id":"0", "kind":"wait"}],
+                    "game_state": {
+                        "grid": {"drop_off_tiles": [[0,0]]},
+                        "bots": [{"id":"0","x":9,"y":9,"capacity":1,"carrying":["bread"]}],
+                        "orders": [{"id":"o_active","item_id":"milk","status":"in_progress"}]
+                    },
+                    "team_summary": {
+                        "queue_roles": {"0":"collector"},
+                        "assignment_source": "hybrid_assignment",
+                        "assignment_guard_reason": "none",
+                        "assignment_goal_concentration_top3": 0.1,
+                        "dropoff_congestion": 0,
+                        "blocked_bot_count": 0,
+                        "stuck_bot_count": 0
+                    },
+                    "tick_outcome": {"delta_score":0,"items_delivered_delta":0,"order_completed_delta":0}
+                }
+            })
+            .to_string(),
+            serde_json::json!({
+                "event": "tick",
+                "data": {
+                    "mode": "easy",
+                    "tick": 1,
+                    "actions": [{"bot_id":"0", "kind":"wait"}],
+                    "game_state": {
+                        "grid": {"drop_off_tiles": [[0,0]]},
+                        "bots": [{"id":"0","x":9,"y":9,"capacity":1,"carrying":["bread"]}],
+                        "orders": [{"id":"o_active","item_id":"milk","status":"in_progress"}]
+                    },
+                    "team_summary": {
+                        "queue_roles": {"0":"collector"},
+                        "assignment_source": "hybrid_assignment",
+                        "assignment_guard_reason": "none",
+                        "assignment_goal_concentration_top3": 0.1,
+                        "dropoff_congestion": 0,
+                        "blocked_bot_count": 0,
+                        "stuck_bot_count": 0
+                    },
+                    "tick_outcome": {"delta_score":0,"items_delivered_delta":0,"order_completed_delta":0}
+                }
+            })
+            .to_string(),
+            serde_json::json!({
+                "event": "game_over",
+                "data": {"final_score": 0}
+            })
+            .to_string(),
+        ]
+        .join("\n");
+        fs::write(&path, content).expect("write fixture");
+        let parsed = parse_metrics(&path).expect("parsed metrics");
+        assert!(parsed.collector_waits >= 2);
+        assert!(parsed.collector_far_waits >= 2);
+        assert!(parsed.full_inactive_waits >= 2);
+        assert!(parsed.full_inactive_far_waits >= 2);
+        assert!(parsed.far_no_conversion_ticks >= 1);
         let _ = fs::remove_file(path);
     }
 }

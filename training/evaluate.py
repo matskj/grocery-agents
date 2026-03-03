@@ -269,10 +269,16 @@ def main() -> None:
             }
 
     feature_columns = model.get("feature_columns", [])
+    runtime_feature_columns = model.get("runtime_feature_columns", [])
     heads = model.get("heads", {})
     normalization = model.get("normalization", {})
-    if isinstance(feature_columns, list) and feature_columns and isinstance(heads, dict):
-        eval_cols = [str(c) for c in feature_columns]
+    eval_cols: list[str] = []
+    if isinstance(heads, dict):
+        if isinstance(runtime_feature_columns, list) and runtime_feature_columns:
+            eval_cols = [str(c) for c in runtime_feature_columns]
+        elif isinstance(feature_columns, list) and feature_columns:
+            eval_cols = [str(c) for c in feature_columns]
+    if eval_cols and isinstance(heads, dict):
         frame = ensure_columns(frame, eval_cols, default=0.0)
         x = frame[eval_cols].to_numpy(dtype=float)
         mean = np.array(normalization.get("mean", [0.0] * len(eval_cols)), dtype=float)
@@ -292,10 +298,20 @@ def main() -> None:
             ordering_score = float(ordering_head.get("bias", 0.0)) + x_norm @ ordering_weights
         else:
             ordering_score = frame.get("ordering_score", pd.Series(np.zeros(len(frame)))).to_numpy(dtype=float)
-        eta = frame.get("dist_to_dropoff", pd.Series(np.ones(len(frame)))).to_numpy(dtype=float)
-        eta = np.clip(eta, 0.0, 99.0)
-        expected_score = ordering_score * pickup_probs * dropoff_probs / (eta + 1.0)
+        value_proxy = np.maximum(ordering_score, 0.0)
+        eta_item = frame.get("dist_to_nearest_active_item", pd.Series(np.ones(len(frame)))).to_numpy(dtype=float)
+        eta_drop = frame.get("dist_to_dropoff", pd.Series(np.ones(len(frame)))).to_numpy(dtype=float)
+        eta_proxy = np.clip(eta_item + 0.7 * eta_drop, 0.0, 160.0)
+        expected_score = value_proxy * pickup_probs * dropoff_probs / (eta_proxy + 1.0)
         realized = frame.get("items_delivered_delta", pd.Series(np.zeros(len(frame)))).to_numpy(dtype=float)
+        idle_far = frame.get("idle_far_from_dropoff", pd.Series(np.zeros(len(frame)))).to_numpy(dtype=float)
+        carrying_only_inactive = frame.get(
+            "carrying_only_inactive", pd.Series(np.zeros(len(frame)))
+        ).to_numpy(dtype=float)
+        idle_far_inactive = (
+            ((idle_far > 0.5) & (carrying_only_inactive > 0.5)).sum()
+            / max(1, int((carrying_only_inactive > 0.5).sum()))
+        )
 
         pickup_mask = frame["pickup_attempt"].to_numpy(dtype=float) > 0.5
         dropoff_mask = frame["dropoff_attempt"].to_numpy(dtype=float) > 0.5
@@ -315,6 +331,13 @@ def main() -> None:
                 "auc": auc_roc(dropoff_true, dropoff_eval),
             },
             "expected_score_delivery_corr": pearson_corr(expected_score, realized),
+            "spatial_idle": {
+                "idle_far_from_dropoff_rate": float((idle_far > 0.5).mean()) if idle_far.size else 0.0,
+                "carrying_only_inactive_rate": float((carrying_only_inactive > 0.5).mean())
+                if carrying_only_inactive.size
+                else 0.0,
+                "idle_far_given_carrying_only_inactive_rate": float(idle_far_inactive),
+            },
         }
     print(json.dumps(result, indent=2))
 

@@ -117,12 +117,25 @@ impl Dispatcher {
             let blocked = blocked_ticks.get(&bot.id).copied().unwrap_or(0);
             let blocked_f = blocked as f64;
             let role = team.role_for(&bot.id);
+            let queue_distance = team
+                .queue
+                .assignments
+                .get(&bot.id)
+                .map(|assignment| f64::from(assignment.queue_distance))
+                .unwrap_or(99.0);
             let local_congestion = state
                 .bots
                 .iter()
                 .filter(|other| other.id != bot.id)
                 .filter(|other| (other.x - bot.x).abs() + (other.y - bot.y).abs() <= 1)
                 .count() as f64;
+            let local_conflict_count = team
+                .traffic
+                .local_conflict_count_by_bot
+                .get(&bot.id)
+                .copied()
+                .map(f64::from)
+                .unwrap_or(0.0);
             let conflict_degree = team
                 .traffic
                 .conflict_degree_by_bot
@@ -142,6 +155,16 @@ impl Dispatcher {
                 .filter(|v| *v < u16::MAX as f64)
                 .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
                 .unwrap_or(99.0);
+            let serviceable_dropoff = if team
+                .dropoff_serviceable_by_bot
+                .get(&bot.id)
+                .copied()
+                .unwrap_or(false)
+            {
+                1.0
+            } else {
+                0.0
+            };
 
             let mut candidates = Vec::new();
 
@@ -207,71 +230,46 @@ impl Dispatcher {
                 if matches!(role, BotRole::QueueCourier) {
                     // Queue couriers should avoid over-picking while lining up for dropoff.
                 } else {
-                let mut active_pickups = self.choose_pickup_candidates(
-                    bot,
-                    state,
-                    map,
-                    dist,
-                    &active_missing,
-                    &carried_supply,
-                    5,
-                    mode,
-                    CandidateFeatures {
-                        dist_to_nearest_active_item: 0.0,
-                        dist_to_dropoff: nearest_drop_dist,
-                        inventory_util,
-                        local_congestion,
-                        teammate_proximity,
-                        order_urgency,
-                        blocked_ticks: blocked_f,
-                        stand_failure_count_recent: 0.0,
-                        stand_success_count_recent: 0.0,
-                        stand_cooldown_ticks_remaining: 0.0,
-                        kind_failure_count_recent: 0.0,
-                        repeated_same_stand_no_delta_streak: 0.0,
-                        contention_at_stand_proxy: 0.0,
-                        time_since_last_conversion_tick: 0.0,
-                        last_conversion_was_pickup: 0.0,
-                        last_conversion_was_dropoff: 0.0,
-                    },
-                );
-                if blocked >= 2 && active_pickups.len() > 1 {
-                    active_pickups.rotate_left(1);
-                }
-                for pick in active_pickups {
-                    let intent = if pick.cell == bot_idx {
-                        Intent::PickUp {
-                            item_id: pick.item_id,
-                        }
-                    } else {
-                        Intent::MoveTo { cell: pick.cell }
-                    };
-                    candidates.push(IntentCandidate {
-                        bot_id: bot.id.clone(),
-                        target_cell: Some(pick.cell),
-                        score: 600.0 + pick.score + blocked_f * 0.5,
-                        intent,
-                    });
-                }
-
-                if preview_enabled {
-                    let mut preview_pickups = self.choose_pickup_candidates(
+                    let mut active_pickups = self.choose_pickup_candidates(
                         bot,
                         state,
                         map,
                         dist,
-                        &preview_missing,
+                        &active_missing,
                         &carried_supply,
-                        3,
+                        5,
                         mode,
                         CandidateFeatures {
                             dist_to_nearest_active_item: 0.0,
                             dist_to_dropoff: nearest_drop_dist,
                             inventory_util,
+                            queue_distance,
                             local_congestion,
+                            local_conflict_count,
                             teammate_proximity,
-                            order_urgency: order_urgency * 0.5,
+                            order_urgency,
                             blocked_ticks: blocked_f,
+                            queue_role_lead: if matches!(role, BotRole::LeadCourier) {
+                                1.0
+                            } else {
+                                0.0
+                            },
+                            queue_role_courier: if matches!(role, BotRole::QueueCourier) {
+                                1.0
+                            } else {
+                                0.0
+                            },
+                            queue_role_collector: if matches!(role, BotRole::Collector) {
+                                1.0
+                            } else {
+                                0.0
+                            },
+                            queue_role_yield: if matches!(role, BotRole::Yield) {
+                                1.0
+                            } else {
+                                0.0
+                            },
+                            serviceable_dropoff,
                             stand_failure_count_recent: 0.0,
                             stand_success_count_recent: 0.0,
                             stand_cooldown_ticks_remaining: 0.0,
@@ -283,10 +281,10 @@ impl Dispatcher {
                             last_conversion_was_dropoff: 0.0,
                         },
                     );
-                    if blocked >= 2 && preview_pickups.len() > 1 {
-                        preview_pickups.rotate_left(1);
+                    if blocked >= 2 && active_pickups.len() > 1 {
+                        active_pickups.rotate_left(1);
                     }
-                    for pick in preview_pickups {
+                    for pick in active_pickups {
                         let intent = if pick.cell == bot_idx {
                             Intent::PickUp {
                                 item_id: pick.item_id,
@@ -297,11 +295,82 @@ impl Dispatcher {
                         candidates.push(IntentCandidate {
                             bot_id: bot.id.clone(),
                             target_cell: Some(pick.cell),
-                            score: 300.0 + pick.score + blocked_f * 0.25,
+                            score: 600.0 + pick.score + blocked_f * 0.5,
                             intent,
                         });
                     }
-                }
+
+                    if preview_enabled {
+                        let mut preview_pickups = self.choose_pickup_candidates(
+                            bot,
+                            state,
+                            map,
+                            dist,
+                            &preview_missing,
+                            &carried_supply,
+                            3,
+                            mode,
+                            CandidateFeatures {
+                                dist_to_nearest_active_item: 0.0,
+                                dist_to_dropoff: nearest_drop_dist,
+                                inventory_util,
+                                queue_distance,
+                                local_congestion,
+                                local_conflict_count,
+                                teammate_proximity,
+                                order_urgency: order_urgency * 0.5,
+                                blocked_ticks: blocked_f,
+                                queue_role_lead: if matches!(role, BotRole::LeadCourier) {
+                                    1.0
+                                } else {
+                                    0.0
+                                },
+                                queue_role_courier: if matches!(role, BotRole::QueueCourier) {
+                                    1.0
+                                } else {
+                                    0.0
+                                },
+                                queue_role_collector: if matches!(role, BotRole::Collector) {
+                                    1.0
+                                } else {
+                                    0.0
+                                },
+                                queue_role_yield: if matches!(role, BotRole::Yield) {
+                                    1.0
+                                } else {
+                                    0.0
+                                },
+                                serviceable_dropoff,
+                                stand_failure_count_recent: 0.0,
+                                stand_success_count_recent: 0.0,
+                                stand_cooldown_ticks_remaining: 0.0,
+                                kind_failure_count_recent: 0.0,
+                                repeated_same_stand_no_delta_streak: 0.0,
+                                contention_at_stand_proxy: 0.0,
+                                time_since_last_conversion_tick: 0.0,
+                                last_conversion_was_pickup: 0.0,
+                                last_conversion_was_dropoff: 0.0,
+                            },
+                        );
+                        if blocked >= 2 && preview_pickups.len() > 1 {
+                            preview_pickups.rotate_left(1);
+                        }
+                        for pick in preview_pickups {
+                            let intent = if pick.cell == bot_idx {
+                                Intent::PickUp {
+                                    item_id: pick.item_id,
+                                }
+                            } else {
+                                Intent::MoveTo { cell: pick.cell }
+                            };
+                            candidates.push(IntentCandidate {
+                                bot_id: bot.id.clone(),
+                                target_cell: Some(pick.cell),
+                                score: 300.0 + pick.score + blocked_f * 0.25,
+                                intent,
+                            });
+                        }
+                    }
                 }
             }
 
@@ -317,9 +386,7 @@ impl Dispatcher {
                     .get(&bot.id)
                     .copied()
                     .unwrap_or(0) as f64;
-                let mut move_score = 50.0
-                    - congestion * 8.0
-                    + blocked_f * 3.0
+                let mut move_score = 50.0 - congestion * 8.0 + blocked_f * 3.0
                     - conflict_degree * 0.5
                     - visit_heat * 1.5
                     - loop_pressure.min(24.0) * 0.2;

@@ -13,6 +13,7 @@ from .common import (
     CONVERSION_LABEL_COLUMNS,
     FEATURE_COLUMNS,
     ORDERING_FEATURE_COLUMNS,
+    RUNTIME_FEATURE_COLUMNS,
     SCHEMA_VERSION,
     STATE_ACTION_SIGNATURE_EXTRA_COLUMNS,
     build_run_signature_map,
@@ -261,6 +262,12 @@ def main() -> None:
         default="action",
         help="Signature basis for run deduplication.",
     )
+    parser.add_argument(
+        "--runtime-feature-set",
+        choices=["strict", "extended"],
+        default="strict",
+        help="Feature contract for v2 runtime heads.",
+    )
     args = parser.parse_args()
 
     frame = read_table(Path(args.data))
@@ -276,6 +283,12 @@ def main() -> None:
 
     frame = ensure_columns(frame, FEATURE_COLUMNS, default=0.0)
     frame = ensure_columns(frame, ORDERING_FEATURE_COLUMNS, default=0.0)
+    runtime_feature_columns = (
+        list(RUNTIME_FEATURE_COLUMNS)
+        if args.runtime_feature_set == "strict"
+        else list(FEATURE_COLUMNS)
+    )
+    frame = ensure_columns(frame, runtime_feature_columns, default=0.0)
     frame = frame.replace([np.inf, -np.inf], np.nan).fillna(0.0)
     frame, dedup = apply_run_dedup(frame, args.dedup_strategy, args.signature_kind)
     if frame.empty or len(frame) < args.min_rows:
@@ -309,11 +322,11 @@ def main() -> None:
     for idx, name in enumerate(ORDERING_FEATURE_COLUMNS, start=1):
         named_ordering_weights[name] = float(ordering_weights_raw[idx])
 
-    x_train_v2_raw = train[FEATURE_COLUMNS].to_numpy(dtype=float)
+    x_train_v2_raw = train[runtime_feature_columns].to_numpy(dtype=float)
     x_val_v2_raw = (
-        val[FEATURE_COLUMNS].to_numpy(dtype=float)
+        val[runtime_feature_columns].to_numpy(dtype=float)
         if not val.empty
-        else np.zeros((0, len(FEATURE_COLUMNS)))
+        else np.zeros((0, len(runtime_feature_columns)))
     )
     mean, std = fit_normalization(x_train_v2_raw)
     x_train_v2 = apply_normalization(x_train_v2_raw, mean, std)
@@ -327,7 +340,7 @@ def main() -> None:
     pickup_head, pickup_metrics = fit_binary_prob_head(
         x_train_v2[pickup_train_mask],
         train["pickup_success"].to_numpy(dtype=float)[pickup_train_mask],
-        x_val_v2[pickup_val_mask] if x_val_v2.size else np.zeros((0, len(FEATURE_COLUMNS))),
+        x_val_v2[pickup_val_mask] if x_val_v2.size else np.zeros((0, len(runtime_feature_columns))),
         val["pickup_success"].to_numpy(dtype=float)[pickup_val_mask] if not val.empty else np.zeros((0,)),
         alpha=args.alpha,
         sample_weight_train=train_weights[pickup_train_mask],
@@ -335,7 +348,7 @@ def main() -> None:
     dropoff_head, dropoff_metrics = fit_binary_prob_head(
         x_train_v2[dropoff_train_mask],
         train["dropoff_success"].to_numpy(dtype=float)[dropoff_train_mask],
-        x_val_v2[dropoff_val_mask] if x_val_v2.size else np.zeros((0, len(FEATURE_COLUMNS))),
+        x_val_v2[dropoff_val_mask] if x_val_v2.size else np.zeros((0, len(runtime_feature_columns))),
         val["dropoff_success"].to_numpy(dtype=float)[dropoff_val_mask] if not val.empty else np.zeros((0,)),
         alpha=args.alpha,
         sample_weight_train=train_weights[dropoff_train_mask],
@@ -364,6 +377,7 @@ def main() -> None:
         "schema_version": SCHEMA_VERSION,
         "mode": args.mode,
         "feature_columns": FEATURE_COLUMNS,
+        "runtime_feature_columns": runtime_feature_columns,
         "normalization": {
             "mean": [float(v) for v in mean],
             "std": [float(v) for v in std],

@@ -29,7 +29,11 @@ RELIABILITY_FEATURE_COLUMNS = [
 FEATURE_COLUMNS = [
     "dist_to_nearest_active_item",
     "dist_to_dropoff",
+    "delta_dist_to_active_item",
+    "delta_dist_to_dropoff",
     "inventory_util",
+    "carrying_only_inactive",
+    "idle_far_from_dropoff",
     "local_congestion",
     "teammate_proximity",
     "order_urgency",
@@ -74,6 +78,28 @@ FEATURE_COLUMNS = [
     "wait_reason_no_path_with_constraints",
     "wait_reason_timeout_fallback",
     *RELIABILITY_FEATURE_COLUMNS,
+]
+
+RUNTIME_FEATURE_COLUMNS = [
+    "dist_to_nearest_active_item",
+    "dist_to_dropoff",
+    "inventory_util",
+    "local_congestion",
+    "teammate_proximity",
+    "order_urgency",
+    "blocked_ticks",
+    "queue_distance",
+    "local_conflict_count",
+    "queue_role_lead",
+    "queue_role_courier",
+    "queue_role_collector",
+    "queue_role_yield",
+    "serviceable_dropoff",
+    "stand_cooldown_ticks_remaining",
+    "contention_at_stand_proxy",
+    "time_since_last_conversion_tick",
+    "last_conversion_was_pickup",
+    "last_conversion_was_dropoff",
 ]
 
 ORDERING_FEATURE_COLUMNS = [

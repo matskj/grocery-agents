@@ -359,9 +359,14 @@ impl Policy {
             }
             if self.global_no_progress_streak >= assignment_no_progress_trigger_ticks() {
                 self.global_no_progress_streak = 0;
-                self.forced_legacy_ticks_remaining = assignment_forced_legacy_ticks();
-                intents = legacy_intents.clone();
-                assignment_source = "legacy_forced_watchdog_trigger";
+                self.forced_legacy_ticks_remaining = 0;
+                self.stand_claims.clear();
+                self.bot_commitments.clear();
+                assignment_source = if assignment_source == "global_assignment" {
+                    "global_watchdog_reassign"
+                } else {
+                    "hybrid_watchdog_reassign"
+                };
                 assignment_guard_trigger_reason = Some("global_move_loop_watchdog");
             }
         } else {
@@ -1841,6 +1846,19 @@ fn merge_hybrid_intents(
         .iter()
         .map(|intent| (intent.bot_id.clone(), intent.intent.clone()))
         .collect::<HashMap<_, _>>();
+    let item_kind_by_id = state
+        .items
+        .iter()
+        .map(|item| (item.id.as_str(), item.kind.as_str()))
+        .collect::<HashMap<_, _>>();
+    let active_gap_total = team_ctx
+        .knowledge
+        .active_gap_by_kind
+        .values()
+        .copied()
+        .map(usize::from)
+        .sum::<usize>();
+    let active_phase = active_gap_total > 0;
     let mut bots = state.bots.iter().collect::<Vec<_>>();
     bots.sort_by(|a, b| a.id.cmp(&b.id));
     bots.into_iter()
@@ -1849,25 +1867,134 @@ fn merge_hybrid_intents(
                 .carrying
                 .iter()
                 .any(|item| team_ctx.active_order_items_set.contains(item));
+            let global_intent = global_by_bot
+                .get(&bot.id)
+                .cloned()
+                .unwrap_or(Intent::Wait);
+            let legacy_intent = legacy_by_bot
+                .get(&bot.id)
+                .cloned()
+                .unwrap_or(Intent::Wait);
             let intent = if carrying_active {
-                global_by_bot
-                    .get(&bot.id)
-                    .cloned()
-                    .or_else(|| legacy_by_bot.get(&bot.id).cloned())
-                    .unwrap_or(Intent::Wait)
+                prefer_non_wait(global_intent, legacy_intent)
+            } else if active_phase {
+                merge_hybrid_active_phase(
+                    bot,
+                    &global_intent,
+                    &legacy_intent,
+                    team_ctx,
+                    &item_kind_by_id,
+                )
             } else {
-                legacy_by_bot
-                    .get(&bot.id)
-                    .cloned()
-                    .or_else(|| global_by_bot.get(&bot.id).cloned())
-                    .unwrap_or(Intent::Wait)
+                prefer_non_wait(legacy_intent, global_intent)
             };
             BotIntent {
                 bot_id: bot.id.clone(),
-                intent,
+                intent: intent.clone(),
             }
         })
         .collect()
+}
+
+fn prefer_non_wait(primary: Intent, fallback: Intent) -> Intent {
+    if !matches!(primary, Intent::Wait) {
+        primary
+    } else {
+        fallback
+    }
+}
+
+fn merge_hybrid_active_phase(
+    bot: &crate::model::BotState,
+    global: &Intent,
+    legacy: &Intent,
+    team_ctx: &TeamContext,
+    item_kind_by_id: &HashMap<&str, &str>,
+) -> Intent {
+    let global_active = intent_is_active_aligned(bot, global, team_ctx, item_kind_by_id);
+    let legacy_active = intent_is_active_aligned(bot, legacy, team_ctx, item_kind_by_id);
+    let legacy_preview = intent_targets_preview(legacy, team_ctx, item_kind_by_id);
+    let bot_carrying_only_inactive = !bot.carrying.is_empty()
+        && !bot
+            .carrying
+            .iter()
+            .any(|item| team_ctx.active_order_items_set.contains(item));
+
+    if bot_carrying_only_inactive && bot.carrying.len() >= bot.capacity {
+        return if global_active {
+            global.clone()
+        } else {
+            Intent::Wait
+        };
+    }
+
+    match (global_active, legacy_active) {
+        (true, false) => return global.clone(),
+        (false, true) => return legacy.clone(),
+        (true, true) => return prefer_non_wait(global.clone(), legacy.clone()),
+        (false, false) => {}
+    }
+
+    if legacy_preview {
+        return if !matches!(global, Intent::Wait) {
+            global.clone()
+        } else {
+            Intent::Wait
+        };
+    }
+
+    if !matches!(global, Intent::Wait) && matches!(legacy, Intent::Wait) {
+        return global.clone();
+    }
+
+    legacy.clone()
+}
+
+fn intent_targets_preview(
+    intent: &Intent,
+    team_ctx: &TeamContext,
+    item_kind_by_id: &HashMap<&str, &str>,
+) -> bool {
+    match intent {
+        Intent::PickUp { item_id } => item_kind_by_id
+            .get(item_id.as_str())
+            .map(|kind| !team_ctx.active_order_items_set.contains(*kind))
+            .unwrap_or(false),
+        Intent::MoveTo { cell } => team_ctx
+            .knowledge
+            .stand_to_kind
+            .get(cell)
+            .map(|kind| !team_ctx.active_order_items_set.contains(kind))
+            .unwrap_or(false),
+        _ => false,
+    }
+}
+
+fn intent_is_active_aligned(
+    bot: &crate::model::BotState,
+    intent: &Intent,
+    team_ctx: &TeamContext,
+    item_kind_by_id: &HashMap<&str, &str>,
+) -> bool {
+    match intent {
+        Intent::DropOff { .. } => true,
+        Intent::PickUp { item_id } => item_kind_by_id
+            .get(item_id.as_str())
+            .map(|kind| team_ctx.active_order_items_set.contains(*kind))
+            .unwrap_or(false),
+        Intent::MoveTo { cell } => {
+            if let Some(kind) = team_ctx.knowledge.stand_to_kind.get(cell) {
+                team_ctx.active_order_items_set.contains(kind)
+            } else if team_ctx.queue.ring_cells.contains(cell) || team_ctx.queue.lane_cells.contains(cell) {
+                bot.carrying
+                    .iter()
+                    .any(|item| team_ctx.active_order_items_set.contains(item))
+            } else {
+                false
+            }
+        }
+        Intent::Wait => false,
+    }
 }
 
 fn rebalance_pickup_goal_crowding(
@@ -3070,6 +3197,167 @@ mod tests {
     }
 
     #[test]
+    fn hybrid_merge_blocks_preview_pickups_when_active_gap_exists() {
+        let state = GameState {
+            grid: Grid {
+                width: 9,
+                height: 7,
+                drop_off_tiles: vec![[1, 5]],
+                ..Grid::default()
+            },
+            bots: vec![BotState {
+                id: "0".to_owned(),
+                x: 5,
+                y: 5,
+                carrying: vec![],
+                capacity: 3,
+            }],
+            items: vec![
+                Item {
+                    id: "item_milk".to_owned(),
+                    kind: "milk".to_owned(),
+                    x: 4,
+                    y: 3,
+                },
+                Item {
+                    id: "item_bread".to_owned(),
+                    kind: "bread".to_owned(),
+                    x: 7,
+                    y: 3,
+                },
+            ],
+            orders: vec![
+                Order {
+                    id: "o_active".to_owned(),
+                    item_id: "milk".to_owned(),
+                    status: OrderStatus::InProgress,
+                },
+                Order {
+                    id: "o_preview".to_owned(),
+                    item_id: "bread".to_owned(),
+                    status: OrderStatus::Pending,
+                },
+            ],
+            ..GameState::default()
+        };
+        let world = World::new(state.clone());
+        let map = world.map();
+        let dist = DistanceMap::build(map);
+        let team = TeamContext::build(
+            &state,
+            map,
+            &dist,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            TeamContextConfig::default(),
+        );
+        let milk_stand = map.stand_cells_for_item("item_milk")[0];
+        let global = vec![BotIntent {
+            bot_id: "0".to_owned(),
+            intent: Intent::MoveTo { cell: milk_stand },
+        }];
+        let legacy = vec![BotIntent {
+            bot_id: "0".to_owned(),
+            intent: Intent::PickUp {
+                item_id: "item_bread".to_owned(),
+            },
+        }];
+        let merged = merge_hybrid_intents(&state, &team, global, &legacy);
+        assert_eq!(merged.len(), 1);
+        assert!(matches!(
+            merged[0].intent,
+            Intent::MoveTo { cell } if cell == milk_stand
+        ));
+    }
+
+    #[test]
+    fn hybrid_merge_waits_for_full_inactive_carrier_during_active_gap() {
+        let state = GameState {
+            grid: Grid {
+                width: 9,
+                height: 7,
+                drop_off_tiles: vec![[1, 5]],
+                ..Grid::default()
+            },
+            bots: vec![BotState {
+                id: "0".to_owned(),
+                x: 5,
+                y: 5,
+                carrying: vec!["bread".to_owned()],
+                capacity: 1,
+            }],
+            items: vec![
+                Item {
+                    id: "item_milk".to_owned(),
+                    kind: "milk".to_owned(),
+                    x: 4,
+                    y: 3,
+                },
+                Item {
+                    id: "item_bread".to_owned(),
+                    kind: "bread".to_owned(),
+                    x: 7,
+                    y: 3,
+                },
+            ],
+            orders: vec![
+                Order {
+                    id: "o_active".to_owned(),
+                    item_id: "milk".to_owned(),
+                    status: OrderStatus::InProgress,
+                },
+                Order {
+                    id: "o_preview".to_owned(),
+                    item_id: "bread".to_owned(),
+                    status: OrderStatus::Pending,
+                },
+            ],
+            ..GameState::default()
+        };
+        let world = World::new(state.clone());
+        let map = world.map();
+        let dist = DistanceMap::build(map);
+        let team = TeamContext::build(
+            &state,
+            map,
+            &dist,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            TeamContextConfig::default(),
+        );
+        let preview_stand = map.stand_cells_for_item("item_bread")[0];
+        let global = vec![BotIntent {
+            bot_id: "0".to_owned(),
+            intent: Intent::Wait,
+        }];
+        let legacy = vec![BotIntent {
+            bot_id: "0".to_owned(),
+            intent: Intent::MoveTo { cell: preview_stand },
+        }];
+        let merged = merge_hybrid_intents(&state, &team, global, &legacy);
+        assert_eq!(merged.len(), 1);
+        assert!(matches!(merged[0].intent, Intent::Wait));
+    }
+
+    #[test]
     fn move_loop_watchdog_requires_conversion_stall() {
         let intents = vec![
             BotIntent {
@@ -3210,11 +3498,7 @@ fn queue_max_ring_entrants() -> usize {
 }
 
 fn assignment_no_progress_trigger_ticks() -> u8 {
-    6
-}
-
-fn assignment_forced_legacy_ticks() -> u8 {
-    12
+    10
 }
 
 fn assignment_goal_history_window() -> usize {

@@ -6,7 +6,7 @@ use crate::dispatcher::{BotIntent, Intent};
 use crate::dist::DistanceMap;
 use crate::model::{BotState, GameState, OrderStatus};
 use crate::scoring::{maybe_score_pick, CandidateFeatures};
-use crate::team_context::{BotRole, TeamContext};
+use crate::team_context::{BotRole, DemandTier as TeamDemandTier, TeamContext};
 use crate::world::MapCache;
 
 #[derive(Debug, Clone)]
@@ -20,6 +20,15 @@ pub struct AssignmentResult {
     pub dropoff_task_count: usize,
     pub active_gap_total: usize,
     pub preview_enabled: bool,
+    pub goal_concentration_top3: f64,
+    pub late_phase_delivery_streak: u16,
+    pub commitment_reassign_count: u16,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AssignmentRuntimeHints {
+    pub late_phase_delivery_streak: u16,
+    pub commitment_reassign_count: u16,
 }
 
 #[derive(Debug, Clone)]
@@ -105,6 +114,8 @@ impl AssignmentEngine {
         candidate_k: usize,
         lambda_density: f64,
         lambda_choke: f64,
+        area_balance_weight: f64,
+        runtime_hints: AssignmentRuntimeHints,
         soft_budget: Duration,
     ) -> Option<AssignmentResult> {
         let started = Instant::now();
@@ -128,6 +139,9 @@ impl AssignmentEngine {
                 dropoff_task_count: 0,
                 active_gap_total: built.active_gap_total,
                 preview_enabled: built.preview_enabled,
+                goal_concentration_top3: 0.0,
+                late_phase_delivery_streak: runtime_hints.late_phase_delivery_streak,
+                commitment_reassign_count: runtime_hints.commitment_reassign_count,
             });
         }
 
@@ -248,6 +262,39 @@ impl AssignmentEngine {
                         lambda_choke,
                     );
                     let mut adjusted = base;
+                    if matches!(task.kind, TaskKind::PickupStand | TaskKind::ImmediatePickup) {
+                        let target_area = team
+                            .knowledge
+                            .area_id_by_cell
+                            .get(task.target_cell as usize)
+                            .copied()
+                            .unwrap_or(u16::MAX);
+                        let area_load = team
+                            .knowledge
+                            .area_load_by_id
+                            .get(&target_area)
+                            .copied()
+                            .unwrap_or(0);
+                        adjusted += (area_balance_weight * f64::from(area_load)).round() as i32;
+                        if let Some(claim) = team.knowledge.stand_claims.get(&task.target_cell) {
+                            if claim.bot_id != bot.id && claim.expires_tick >= state.tick {
+                                adjusted += match claim.demand_tier {
+                                    TeamDemandTier::Active => 120,
+                                    TeamDemandTier::Preview => 80,
+                                    TeamDemandTier::None => 40,
+                                };
+                            }
+                        }
+                        if let Some(commitment) = team.knowledge.bot_commitments.get(&bot.id) {
+                            if commitment.goal_cell == task.target_cell {
+                                adjusted -= 22;
+                            } else if commitment.item_kind.as_deref() == task.item_kind.as_deref() {
+                                adjusted -= 8;
+                            } else {
+                                adjusted += 10;
+                            }
+                        }
+                    }
                     if carrying_active && matches!(task.kind, TaskKind::CarryToDropoff) {
                         adjusted -= 30;
                     }
@@ -390,6 +437,7 @@ impl AssignmentEngine {
                 intent: assigned.remove(&bot.id).unwrap_or(Intent::Wait),
             })
             .collect::<Vec<_>>();
+        let goal_concentration_top3 = goal_concentration_top3(&intents);
 
         Some(AssignmentResult {
             intents,
@@ -401,6 +449,9 @@ impl AssignmentEngine {
             dropoff_task_count,
             active_gap_total: built.active_gap_total,
             preview_enabled: built.preview_enabled,
+            goal_concentration_top3,
+            late_phase_delivery_streak: runtime_hints.late_phase_delivery_streak,
+            commitment_reassign_count: runtime_hints.commitment_reassign_count,
         })
     }
 }
@@ -440,11 +491,19 @@ fn build_tasks(
             OrderStatus::Delivered | OrderStatus::Cancelled => {}
         }
     }
-    let effective_supply = build_effective_active_supply(state, map, dist, team);
-    let mut active_gap_by_kind = HashMap::<String, u16>::new();
-    for (kind, missing) in &active_missing {
-        let covered = effective_supply.get(kind).copied().unwrap_or(0);
-        active_gap_by_kind.insert(kind.clone(), missing.saturating_sub(covered));
+    let mut active_gap_by_kind = if team.knowledge.active_gap_by_kind.is_empty() {
+        let effective_supply = build_effective_active_supply(state, map, dist, team);
+        let mut computed = HashMap::<String, u16>::new();
+        for (kind, missing) in &active_missing {
+            let covered = effective_supply.get(kind).copied().unwrap_or(0);
+            computed.insert(kind.clone(), missing.saturating_sub(covered));
+        }
+        computed
+    } else {
+        team.knowledge.active_gap_by_kind.clone()
+    };
+    for kind in active_missing.keys() {
+        active_gap_by_kind.entry(kind.clone()).or_insert(0);
     }
     let active_gap_total = active_gap_by_kind.values().copied().map(usize::from).sum::<usize>();
     let preview_enabled = active_gap_total == 0;
@@ -840,6 +899,25 @@ fn compare_item_ids(a: &str, b: &str) -> Ordering {
     }
 }
 
+fn goal_concentration_top3(intents: &[BotIntent]) -> f64 {
+    let mut counts = HashMap::<u16, u64>::new();
+    let mut total = 0u64;
+    for intent in intents {
+        let Intent::MoveTo { cell } = intent.intent else {
+            continue;
+        };
+        *counts.entry(cell).or_insert(0) += 1;
+        total = total.saturating_add(1);
+    }
+    if total == 0 {
+        return 0.0;
+    }
+    let mut top = counts.values().copied().collect::<Vec<_>>();
+    top.sort_unstable_by(|a, b| b.cmp(a));
+    let top3 = top.into_iter().take(3).sum::<u64>();
+    top3 as f64 / total as f64
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -852,7 +930,7 @@ mod tests {
         world::World,
     };
 
-    use super::{compare_item_ids, AssignmentEngine};
+    use super::{compare_item_ids, AssignmentEngine, AssignmentRuntimeHints};
 
     #[test]
     fn deterministic_assignment_ordering() {
@@ -922,6 +1000,8 @@ mod tests {
                 6,
                 1.0,
                 1.5,
+                1.0,
+                AssignmentRuntimeHints::default(),
                 Duration::from_millis(200),
             )
             .expect("assignment");
@@ -934,6 +1014,8 @@ mod tests {
                 6,
                 1.0,
                 1.5,
+                1.0,
+                AssignmentRuntimeHints::default(),
                 Duration::from_millis(200),
             )
             .expect("assignment");
@@ -1021,6 +1103,8 @@ mod tests {
                 8,
                 1.0,
                 1.5,
+                1.0,
+                AssignmentRuntimeHints::default(),
                 Duration::from_millis(200),
             )
             .expect("assignment");
@@ -1107,6 +1191,8 @@ mod tests {
                 8,
                 1.0,
                 1.5,
+                1.0,
+                AssignmentRuntimeHints::default(),
                 Duration::from_millis(200),
             )
             .expect("assignment");

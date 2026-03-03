@@ -7,14 +7,17 @@ use std::{
 use tracing::info;
 
 use crate::{
-    assign::AssignmentEngine,
+    assign::{AssignmentEngine, AssignmentRuntimeHints},
     config::{AssignmentMode, Config},
     dispatcher::{BotIntent, Dispatcher, Intent},
     dist::DistanceMap,
     model::{Action, GameState},
     motion::{MotionPlanner, PlannedAction},
     scoring::{detect_mode_label, maybe_score_ordering, OrderingFeatures},
-    team_context::{BlockedMove, BotRole, StickyQueueRole, TeamContext, TeamContextConfig},
+    team_context::{
+        BlockedMove, BotCommitment, BotRole, DemandTier, StandClaim, StickyQueueRole, TeamContext,
+        TeamContextConfig,
+    },
     world::World,
 };
 
@@ -37,6 +40,8 @@ struct BotMemory {
     dropoff_ban_ticks_by_order: HashMap<String, u8>,
     prev_carrying: Vec<String>,
     dropoff_watchdog_triggered: bool,
+    post_dropoff_retask_ticks_remaining: u8,
+    egress_ticks_remaining: u8,
 }
 
 #[derive(Debug)]
@@ -53,6 +58,8 @@ pub struct Policy {
     recent_goal_cells: VecDeque<u16>,
     global_no_progress_streak: u8,
     forced_legacy_ticks_remaining: u8,
+    stand_claims: HashMap<u16, StandClaim>,
+    bot_commitments: HashMap<String, BotCommitment>,
 }
 
 impl Policy {
@@ -70,6 +77,8 @@ impl Policy {
             recent_goal_cells: VecDeque::new(),
             global_no_progress_streak: 0,
             forced_legacy_ticks_remaining: 0,
+            stand_claims: HashMap::new(),
+            bot_commitments: HashMap::new(),
         }
     }
 
@@ -88,6 +97,7 @@ impl Policy {
         }
 
         self.update_memory(state, map);
+        self.prune_coordination_state(state, map);
         let blocked_snapshot = self
             .memory
             .iter()
@@ -155,7 +165,8 @@ impl Policy {
             &prohibited_moves,
             &self.sticky_roles,
             cfg,
-        );
+        )
+        .with_claims(&self.stand_claims, &self.bot_commitments, state.tick);
 
         let mut relax_changed = false;
         let mut escape_changed = false;
@@ -214,7 +225,8 @@ impl Policy {
                 &prohibited_moves,
                 &self.sticky_roles,
                 cfg,
-            );
+            )
+            .with_claims(&self.stand_claims, &self.bot_commitments, state.tick);
         }
         self.sticky_roles = team_ctx.queue.next_sticky.clone();
 
@@ -228,6 +240,9 @@ impl Policy {
         let mut assignment_dropoff_task_count = 0usize;
         let mut assignment_active_gap_total = 0usize;
         let mut assignment_preview_enabled = true;
+        let mut assignment_goal_concentration_top3 = 0.0f64;
+        let mut assignment_late_phase_delivery_streak = 0u16;
+        let mut assignment_commitment_reassign_count = 0u16;
         let mut assignment_guard_trigger_reason: Option<&'static str> = None;
         let assignment_mode = if self.config.assignment_enabled {
             self.config.assignment_mode
@@ -248,6 +263,11 @@ impl Policy {
                 self.config.candidate_k,
                 self.config.lambda_density,
                 self.config.lambda_choke,
+                self.config.coord_area_balance_weight,
+                AssignmentRuntimeHints {
+                    late_phase_delivery_streak: self.ticks_since_dropoff,
+                    commitment_reassign_count: 0,
+                },
                 remaining,
             )
         };
@@ -285,6 +305,7 @@ impl Policy {
                             self.ticks_since_pickup,
                             self.ticks_since_dropoff,
                             self.unique_goal_cells_recent(),
+                            self.config.coord_goal_collapse_threshold,
                         ) {
                             assignment_guard_trigger_reason = Some(reason);
                             assignment_source = "legacy_dispatcher_guard";
@@ -309,6 +330,7 @@ impl Policy {
                             self.ticks_since_pickup,
                             self.ticks_since_dropoff,
                             self.unique_goal_cells_recent(),
+                            self.config.coord_goal_collapse_threshold,
                         ) {
                             assignment_guard_trigger_reason = Some(reason);
                             assignment_source = "legacy_dispatcher_guard";
@@ -345,7 +367,24 @@ impl Policy {
         } else {
             self.global_no_progress_streak = 0;
         };
-        rebalance_pickup_goal_crowding(state, map, &dist, &team_ctx, &active_items, &mut intents);
+        rebalance_pickup_goal_crowding(
+            state,
+            map,
+            &dist,
+            &team_ctx,
+            &active_items,
+            &mut intents,
+        );
+        let post_dropoff_retasked_bots =
+            self.apply_post_dropoff_retask(state, map, &dist, &team_ctx, &active_items, &mut intents);
+        let claim_conflicts_resolved =
+            self.apply_stand_commitments(state, map, &dist, &team_ctx, &active_items, &mut intents);
+        let egress_forced_bots =
+            self.apply_recent_dropoff_egress(state, map, &dist, &team_ctx, &mut intents);
+        assignment_commitment_reassign_count =
+            self.invalidate_stale_commitments(state, &team_ctx, assignment_source);
+        assignment_goal_concentration_top3 = goal_concentration_top3(&intents);
+        assignment_late_phase_delivery_streak = self.ticks_since_dropoff;
         let assign_ms = assign_started.elapsed().as_millis() as u64;
         let mut goals = HashMap::new();
         let mut immediate = HashMap::new();
@@ -1108,6 +1147,25 @@ impl Policy {
                 serde_json::Value::Bool(assignment_preview_enabled),
             );
             obj.insert(
+                "assignment_goal_concentration_top3".to_owned(),
+                serde_json::Value::Number(
+                    serde_json::Number::from_f64(assignment_goal_concentration_top3)
+                        .unwrap_or_else(|| serde_json::Number::from(0)),
+                ),
+            );
+            obj.insert(
+                "assignment_late_phase_delivery_streak".to_owned(),
+                serde_json::Value::Number(serde_json::Number::from(
+                    assignment_late_phase_delivery_streak as i64
+                )),
+            );
+            obj.insert(
+                "assignment_commitment_reassign_count".to_owned(),
+                serde_json::Value::Number(serde_json::Number::from(
+                    assignment_commitment_reassign_count as i64
+                )),
+            );
+            obj.insert(
                 "assignment_guard_triggered".to_owned(),
                 serde_json::Value::Bool(assignment_guard_trigger_reason.is_some()),
             );
@@ -1154,6 +1212,18 @@ impl Policy {
                 serde_json::Value::Number(serde_json::Number::from(
                     self.global_no_progress_streak as i64
                 )),
+            );
+            obj.insert(
+                "post_dropoff_retasked_bots".to_owned(),
+                serde_json::Value::Number(serde_json::Number::from(post_dropoff_retasked_bots as i64)),
+            );
+            obj.insert(
+                "claim_conflicts_resolved".to_owned(),
+                serde_json::Value::Number(serde_json::Number::from(claim_conflicts_resolved as i64)),
+            );
+            obj.insert(
+                "egress_forced_bots".to_owned(),
+                serde_json::Value::Number(serde_json::Number::from(egress_forced_bots as i64)),
             );
         }
         self.last_team_telemetry = telemetry;
@@ -1236,6 +1306,405 @@ impl Policy {
             .len()
     }
 
+    fn prune_coordination_state(&mut self, state: &GameState, map: &crate::world::MapCache) {
+        let now = state.tick;
+        let mut valid_stands = HashSet::<u16>::new();
+        for item in &state.items {
+            for &stand in map.stand_cells_for_item(&item.id) {
+                valid_stands.insert(stand);
+            }
+        }
+        self.stand_claims
+            .retain(|cell, claim| claim.expires_tick >= now && valid_stands.contains(cell));
+        let known_bots = state
+            .bots
+            .iter()
+            .map(|bot| bot.id.as_str())
+            .collect::<HashSet<_>>();
+        self.bot_commitments
+            .retain(|bot_id, _| known_bots.contains(bot_id.as_str()));
+        let valid_goal_cells = self
+            .stand_claims
+            .keys()
+            .copied()
+            .collect::<HashSet<_>>();
+        self.bot_commitments
+            .retain(|_, c| valid_goal_cells.contains(&c.goal_cell));
+    }
+
+    fn invalidate_stale_commitments(
+        &mut self,
+        state: &GameState,
+        team: &TeamContext,
+        assignment_source: &str,
+    ) -> u16 {
+        if !matches!(assignment_source, "hybrid_assignment" | "global_assignment") {
+            return 0;
+        }
+        let mut removed = Vec::<String>::new();
+        let mut removed_count = 0u16;
+        for bot in &state.bots {
+            let Some(commitment) = self.bot_commitments.get(&bot.id) else {
+                continue;
+            };
+            let carrying_active = bot
+                .carrying
+                .iter()
+                .any(|item| team.active_order_items_set.contains(item));
+            if carrying_active || bot.carrying.len() >= bot.capacity {
+                continue;
+            }
+            if matches!(team.role_for(&bot.id), BotRole::LeadCourier | BotRole::QueueCourier) {
+                continue;
+            }
+            let since = state.tick.saturating_sub(commitment.last_progress_tick);
+            if since < u64::from(self.config.coord_reassign_no_progress_ticks) {
+                continue;
+            }
+            removed.push(bot.id.clone());
+        }
+        for bot_id in removed {
+            if let Some(c) = self.bot_commitments.remove(&bot_id) {
+                self.stand_claims
+                    .retain(|cell, claim| *cell != c.goal_cell && claim.bot_id != bot_id);
+                removed_count = removed_count.saturating_add(1);
+            }
+        }
+        removed_count
+    }
+
+    fn apply_post_dropoff_retask(
+        &mut self,
+        state: &GameState,
+        map: &crate::world::MapCache,
+        dist: &DistanceMap,
+        team: &TeamContext,
+        active_items: &HashSet<&str>,
+        intents: &mut [BotIntent],
+    ) -> u16 {
+        if active_items.is_empty() {
+            return 0;
+        }
+        let active_stand_count = team
+            .knowledge
+            .active_gap_by_kind
+            .iter()
+            .filter(|(_, gap)| **gap > 0)
+            .filter_map(|(kind, _)| team.knowledge.kind_to_stands.get(kind))
+            .flat_map(|stands| stands.iter().copied())
+            .collect::<HashSet<_>>()
+            .len();
+        let sparse_stands = active_stand_count <= state.bots.len().saturating_add(1) / 2;
+        let max_per_stand = if sparse_stands {
+            self.config.coord_max_bots_per_stand.max(2)
+        } else {
+            self.config.coord_max_bots_per_stand
+        };
+        let mut idx_by_bot = HashMap::<String, usize>::new();
+        for (idx, entry) in intents.iter().enumerate() {
+            idx_by_bot.insert(entry.bot_id.clone(), idx);
+        }
+        let mut retasked = 0u16;
+        let mut bot_ids = state.bots.iter().map(|b| b.id.clone()).collect::<Vec<_>>();
+        bot_ids.sort();
+        for bot_id in bot_ids {
+            let Some(mem) = self.memory.get_mut(&bot_id) else {
+                continue;
+            };
+            if mem.post_dropoff_retask_ticks_remaining == 0 {
+                continue;
+            }
+            let Some(bot) = state.bots.iter().find(|b| b.id == bot_id) else {
+                continue;
+            };
+            let carrying_active = bot
+                .carrying
+                .iter()
+                .any(|item| team.active_order_items_set.contains(item));
+            if carrying_active || bot.carrying.len() >= bot.capacity {
+                continue;
+            }
+            if matches!(team.role_for(&bot.id), BotRole::LeadCourier | BotRole::QueueCourier) {
+                continue;
+            }
+            let Some(start) = map.idx(bot.x, bot.y) else {
+                continue;
+            };
+            let Some((goal_cell, item_kind)) =
+                choose_best_active_stand(
+                    start,
+                    team,
+                    map,
+                    dist,
+                    &self.stand_claims,
+                    &bot_id,
+                    self.config.coord_area_balance_weight,
+                    max_per_stand,
+                    state.tick,
+                )
+            else {
+                continue;
+            };
+            let Some(&idx) = idx_by_bot.get(&bot.id) else {
+                continue;
+            };
+            intents[idx].intent = build_pick_or_move_intent(state, map, start, goal_cell, &item_kind);
+            self.bot_commitments.insert(
+                bot.id.clone(),
+                BotCommitment {
+                    goal_cell,
+                    item_kind: Some(item_kind),
+                    created_tick: state.tick,
+                    last_progress_tick: state.tick,
+                },
+            );
+            self.stand_claims.insert(
+                goal_cell,
+                StandClaim {
+                    bot_id: bot.id.clone(),
+                    expires_tick: state
+                        .tick
+                        .saturating_add(u64::from(self.config.coord_claim_ttl_ticks)),
+                    demand_tier: DemandTier::Active,
+                },
+            );
+            retasked = retasked.saturating_add(1);
+        }
+        retasked
+    }
+
+    fn apply_stand_commitments(
+        &mut self,
+        state: &GameState,
+        map: &crate::world::MapCache,
+        dist: &DistanceMap,
+        team: &TeamContext,
+        active_items: &HashSet<&str>,
+        intents: &mut [BotIntent],
+    ) -> u16 {
+        if active_items.is_empty() {
+            return 0;
+        }
+        let mut idx_by_bot = HashMap::<String, usize>::new();
+        for (idx, entry) in intents.iter().enumerate() {
+            idx_by_bot.insert(entry.bot_id.clone(), idx);
+        }
+        let mut active_stands = HashSet::<u16>::new();
+        for item in &state.items {
+            if !active_items.contains(item.kind.as_str()) {
+                continue;
+            }
+            for &stand in map.stand_cells_for_item(&item.id) {
+                active_stands.insert(stand);
+            }
+        }
+        if active_stands.is_empty() {
+            self.stand_claims.clear();
+            self.bot_commitments.clear();
+            return 0;
+        }
+        let sparse_stands = active_stands.len() <= state.bots.len().saturating_add(1) / 2;
+        let max_per_stand = if sparse_stands {
+            self.config.coord_max_bots_per_stand.max(2)
+        } else {
+            self.config.coord_max_bots_per_stand
+        };
+
+        let mut conflicts_resolved = 0u16;
+        let mut bots = state.bots.iter().collect::<Vec<_>>();
+        bots.sort_by(|a, b| a.id.cmp(&b.id));
+        for bot in bots {
+            if matches!(team.role_for(&bot.id), BotRole::LeadCourier | BotRole::QueueCourier) {
+                continue;
+            }
+            let Some(&intent_idx) = idx_by_bot.get(&bot.id) else {
+                continue;
+            };
+            let carries_active = bot
+                .carrying
+                .iter()
+                .any(|item| team.active_order_items_set.contains(item));
+            if carries_active || bot.carrying.len() >= bot.capacity {
+                continue;
+            }
+            let Some(start) = map.idx(bot.x, bot.y) else {
+                continue;
+            };
+            let chosen = match intents[intent_idx].intent {
+                Intent::MoveTo { cell } if active_stands.contains(&cell) => {
+                    let claimed_by_other = self
+                        .stand_claims
+                        .get(&cell)
+                        .map(|claim| claim.bot_id != bot.id && claim.expires_tick >= state.tick)
+                        .unwrap_or(false);
+                    if claimed_by_other {
+                        conflicts_resolved = conflicts_resolved.saturating_add(1);
+                        choose_best_active_stand(
+                            start,
+                            team,
+                            map,
+                            dist,
+                            &self.stand_claims,
+                            &bot.id,
+                            self.config.coord_area_balance_weight,
+                            max_per_stand,
+                            state.tick,
+                        )
+                        .map(|(cell, kind)| (cell, kind, true))
+                    } else {
+                        team.knowledge
+                            .stand_to_kind
+                            .get(&cell)
+                            .cloned()
+                            .map(|kind| (cell, kind, false))
+                    }
+                }
+                _ => {
+                    if let Some(commitment) = self.bot_commitments.get(&bot.id) {
+                        if active_stands.contains(&commitment.goal_cell) {
+                            commitment
+                                .item_kind
+                                .clone()
+                                .or_else(|| {
+                                    team.knowledge
+                                        .stand_to_kind
+                                        .get(&commitment.goal_cell)
+                                        .cloned()
+                                })
+                                .map(|kind| (commitment.goal_cell, kind, false))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                }
+            };
+            let Some((mut goal, mut kind, rerouted)) = chosen else {
+                continue;
+            };
+            let current_load = self
+                .stand_claims
+                .iter()
+                .filter(|(cell, claim)| {
+                    **cell == goal && claim.expires_tick >= state.tick && claim.bot_id != bot.id
+                })
+                .count() as u8;
+            if current_load >= max_per_stand {
+                if !rerouted {
+                    conflicts_resolved = conflicts_resolved.saturating_add(1);
+                }
+                if let Some((alt_goal, alt_kind)) = choose_best_active_stand(
+                    start,
+                    team,
+                    map,
+                    dist,
+                    &self.stand_claims,
+                    &bot.id,
+                    self.config.coord_area_balance_weight,
+                    max_per_stand,
+                    state.tick,
+                ) {
+                    goal = alt_goal;
+                    kind = alt_kind;
+                } else {
+                    continue;
+                }
+            }
+            intents[intent_idx].intent = build_pick_or_move_intent(state, map, start, goal, &kind);
+            self.stand_claims.insert(
+                goal,
+                StandClaim {
+                    bot_id: bot.id.clone(),
+                    expires_tick: state
+                        .tick
+                        .saturating_add(u64::from(self.config.coord_claim_ttl_ticks)),
+                    demand_tier: DemandTier::Active,
+                },
+            );
+            self.bot_commitments.insert(
+                bot.id.clone(),
+                BotCommitment {
+                    goal_cell: goal,
+                    item_kind: Some(kind),
+                    created_tick: state.tick,
+                    last_progress_tick: state.tick,
+                },
+            );
+        }
+        conflicts_resolved
+    }
+
+    fn apply_recent_dropoff_egress(
+        &mut self,
+        state: &GameState,
+        map: &crate::world::MapCache,
+        dist: &DistanceMap,
+        team: &TeamContext,
+        intents: &mut [BotIntent],
+    ) -> u16 {
+        let mut idx_by_bot = HashMap::<String, usize>::new();
+        for (idx, entry) in intents.iter().enumerate() {
+            idx_by_bot.insert(entry.bot_id.clone(), idx);
+        }
+        let ring = team.queue.ring_cells.iter().copied().collect::<HashSet<_>>();
+        let lane = team
+            .queue
+            .lane_cells
+            .iter()
+            .take(6)
+            .copied()
+            .collect::<HashSet<_>>();
+        if ring.is_empty() && lane.is_empty() {
+            return 0;
+        }
+        let mut forced = 0u16;
+        for bot in &state.bots {
+            let Some(mem) = self.memory.get(&bot.id) else {
+                continue;
+            };
+            if mem.egress_ticks_remaining == 0 || !bot.carrying.is_empty() {
+                continue;
+            }
+            if matches!(team.role_for(&bot.id), BotRole::LeadCourier | BotRole::QueueCourier) {
+                continue;
+            }
+            let Some(cell) = map.idx(bot.x, bot.y) else {
+                continue;
+            };
+            if !(ring.contains(&cell) || lane.contains(&cell)) {
+                continue;
+            }
+            let Some(&idx) = idx_by_bot.get(&bot.id) else {
+                continue;
+            };
+            let candidate = map.neighbors[cell as usize]
+                .iter()
+                .copied()
+                .filter(|next| !ring.contains(next) && !lane.contains(next))
+                .max_by(|a, b| {
+                    let da = map
+                        .dropoff_cells
+                        .iter()
+                        .map(|drop| dist.dist(*a, *drop))
+                        .min()
+                        .unwrap_or(u16::MAX);
+                    let db = map
+                        .dropoff_cells
+                        .iter()
+                        .map(|drop| dist.dist(*b, *drop))
+                        .min()
+                        .unwrap_or(u16::MAX);
+                    da.cmp(&db).then_with(|| a.cmp(b))
+                });
+            if let Some(next) = candidate {
+                intents[idx].intent = Intent::MoveTo { cell: next };
+                forced = forced.saturating_add(1);
+            }
+        }
+        forced
+    }
+
     fn update_memory(&mut self, state: &GameState, map: &crate::world::MapCache) {
         for bot in &state.bots {
             let cell = map.idx(bot.x, bot.y).unwrap_or(0);
@@ -1243,6 +1712,9 @@ impl Policy {
             mem.constraint_relax_ticks_remaining =
                 mem.constraint_relax_ticks_remaining.saturating_sub(1);
             mem.escape_macro_ticks_remaining = mem.escape_macro_ticks_remaining.saturating_sub(1);
+            mem.post_dropoff_retask_ticks_remaining =
+                mem.post_dropoff_retask_ticks_remaining.saturating_sub(1);
+            mem.egress_ticks_remaining = mem.egress_ticks_remaining.saturating_sub(1);
             mem.dropoff_watchdog_triggered = false;
             if mem.escape_macro_ticks_remaining == 0 {
                 mem.escape_macro_goal = None;
@@ -1284,6 +1756,17 @@ impl Policy {
                 mem.last_dropoff_order_id = None;
                 mem.last_successful_drop_tick = Some(state.tick);
                 mem.dropoff_ban_ticks_by_order.clear();
+                mem.post_dropoff_retask_ticks_remaining = self.config.coord_post_dropoff_retask_ticks;
+                mem.egress_ticks_remaining = 2;
+                if let Some(commitment) = self.bot_commitments.get_mut(&bot.id) {
+                    commitment.last_progress_tick = state.tick;
+                }
+                self.bot_commitments.remove(&bot.id);
+                self.stand_claims.retain(|_, claim| claim.bot_id != bot.id);
+            } else if bot.carrying.len() > mem.prev_carrying.len() {
+                if let Some(commitment) = self.bot_commitments.get_mut(&bot.id) {
+                    commitment.last_progress_tick = state.tick;
+                }
             }
 
             mem.failed_move_history.retain(|_, count| *count > 0);
@@ -1530,6 +2013,125 @@ fn rebalance_pickup_goal_crowding(
     }
 }
 
+fn build_pick_or_move_intent(
+    state: &GameState,
+    map: &crate::world::MapCache,
+    bot_cell: u16,
+    goal_cell: u16,
+    item_kind: &str,
+) -> Intent {
+    if bot_cell != goal_cell {
+        return Intent::MoveTo { cell: goal_cell };
+    }
+    let mut item_ids = state
+        .items
+        .iter()
+        .filter(|item| item.kind == item_kind)
+        .filter_map(|item| {
+            let stands = map.stand_cells_for_item(&item.id);
+            if stands.contains(&goal_cell) {
+                Some(item.id.clone())
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    item_ids.sort();
+    if let Some(item_id) = item_ids.first() {
+        Intent::PickUp {
+            item_id: item_id.clone(),
+        }
+    } else {
+        Intent::MoveTo { cell: goal_cell }
+    }
+}
+
+fn choose_best_active_stand(
+    start: u16,
+    team: &TeamContext,
+    map: &crate::world::MapCache,
+    dist: &DistanceMap,
+    stand_claims: &HashMap<u16, StandClaim>,
+    bot_id: &str,
+    area_balance_weight: f64,
+    max_per_stand: u8,
+    now_tick: u64,
+) -> Option<(u16, String)> {
+    let mut kinds = team
+        .knowledge
+        .active_gap_by_kind
+        .iter()
+        .filter(|(_, gap)| **gap > 0)
+        .map(|(kind, _)| kind.clone())
+        .collect::<Vec<_>>();
+    kinds.sort();
+    let mut best = None::<(i32, u16, String)>;
+    for kind in kinds {
+        let Some(stands) = team.knowledge.kind_to_stands.get(&kind) else {
+            continue;
+        };
+        for &stand in stands {
+            let claim_load = stand_claims
+                .iter()
+                .filter(|(cell, claim)| {
+                    **cell == stand && claim.expires_tick >= now_tick && claim.bot_id != bot_id
+                })
+                .count() as u8;
+            if claim_load >= max_per_stand {
+                continue;
+            }
+            let d = i32::from(dist.dist(start, stand).min(255));
+            let area = team
+                .knowledge
+                .area_id_by_cell
+                .get(stand as usize)
+                .copied()
+                .unwrap_or(u16::MAX);
+            let area_load = team
+                .knowledge
+                .area_load_by_id
+                .get(&area)
+                .copied()
+                .unwrap_or(0);
+            let choke = 4u16
+                .saturating_sub(map.neighbors[stand as usize].len().min(4) as u16);
+            let score = d
+                + (area_balance_weight * f64::from(area_load)).round() as i32
+                + i32::from(claim_load) * 2
+                + i32::from(choke);
+            match best {
+                Some((best_score, best_cell, ref best_kind))
+                    if score > best_score
+                        || (score == best_score
+                            && (stand > best_cell || (stand == best_cell && kind > *best_kind))) => {}
+                _ => {
+                    best = Some((score, stand, kind.clone()));
+                }
+            }
+        }
+    }
+    best.map(|(_, cell, kind)| (cell, kind))
+}
+
+fn goal_concentration_top3(intents: &[BotIntent]) -> f64 {
+    let mut counts = HashMap::<u16, u64>::new();
+    let mut total = 0u64;
+    for intent in intents {
+        let Intent::MoveTo { cell } = intent.intent else {
+            continue;
+        };
+        *counts.entry(cell).or_insert(0) += 1;
+        total = total.saturating_add(1);
+    }
+    if total == 0 {
+        return 0.0;
+    }
+    let mut top = counts.values().copied().collect::<Vec<_>>();
+    top.sort_unstable_by(|a, b| b.cmp(a));
+    let top3 = top.into_iter().take(3).sum::<u64>();
+    top3 as f64 / total as f64
+}
+
 fn should_trigger_assignment_move_loop_watchdog(
     intents: &[BotIntent],
     ticks_since_pickup: u16,
@@ -1697,6 +2299,7 @@ fn assignment_guard_reason(
     ticks_since_pickup: u16,
     ticks_since_dropoff: u16,
     unique_goal_cells_last_n: usize,
+    goal_collapse_threshold: usize,
 ) -> Option<&'static str> {
     let active_orders_exist = state
         .orders
@@ -1777,7 +2380,7 @@ fn assignment_guard_reason(
         && stand_move_intents > 0
         && ticks_since_pickup >= 12
         && ticks_since_dropoff >= 16
-        && unique_goal_cells_last_n <= 4
+        && unique_goal_cells_last_n <= goal_collapse_threshold.max(2)
     {
         return Some("move_loop_no_conversion");
     }
@@ -2289,7 +2892,7 @@ mod tests {
                 intent: Intent::MoveTo { cell: drop },
             },
         ];
-        let reason = assignment_guard_reason(&state, map, &ctx, &intents, 0, 0, 8);
+        let reason = assignment_guard_reason(&state, map, &ctx, &intents, 0, 0, 8, 4);
         assert_eq!(reason, Some("empty_dropoff_cluster"));
     }
 
@@ -2362,7 +2965,7 @@ mod tests {
                 intent: Intent::MoveTo { cell: stand },
             },
         ];
-        let reason = assignment_guard_reason(&state, map, &ctx, &intents, 20, 20, 3);
+        let reason = assignment_guard_reason(&state, map, &ctx, &intents, 20, 20, 3, 4);
         assert_ne!(reason, Some("no_pickup_progress"));
     }
 

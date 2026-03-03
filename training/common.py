@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 from typing import Dict, Iterable, Iterator, Optional, Sequence
@@ -86,12 +87,83 @@ ORDERING_FEATURE_COLUMNS = [
     "choke_occupancy_proxy",
 ]
 
+ACTION_SIGNATURE_COLUMNS = [
+    "tick",
+    "bot_id",
+    "action_kind",
+    "action_dx",
+    "action_dy",
+    "action_item_kind",
+    "action_order_id",
+    "goal_cell_x",
+    "goal_cell_y",
+]
+
+STATE_ACTION_SIGNATURE_EXTRA_COLUMNS = [
+    "bot_x",
+    "bot_y",
+    "carrying_count",
+]
+
 
 def ensure_columns(frame: pd.DataFrame, columns: Sequence[str], default: float = 0.0) -> pd.DataFrame:
     for col in columns:
         if col not in frame.columns:
             frame[col] = default
     return frame
+
+
+def build_run_signature_map(frame: pd.DataFrame, signature_kind: str = "action") -> Dict[str, str]:
+    if frame.empty or "run_id" not in frame.columns:
+        return {}
+
+    normalized_kind = signature_kind.strip().lower()
+    if normalized_kind not in {"action", "state_action"}:
+        normalized_kind = "action"
+
+    signature_columns = list(ACTION_SIGNATURE_COLUMNS)
+    if normalized_kind == "state_action":
+        signature_columns.extend(STATE_ACTION_SIGNATURE_EXTRA_COLUMNS)
+    context_columns = ["mode", "map_id", "grid_width", "grid_height", "bot_count"]
+    all_columns = context_columns + signature_columns
+
+    work = ensure_columns(frame.copy(), [*all_columns, "tick", "bot_id"], default=0.0)
+    work = work.sort_values(["run_id", "tick", "bot_id"], kind="mergesort")
+
+    numeric_columns = {
+        "tick",
+        "action_dx",
+        "action_dy",
+        "goal_cell_x",
+        "goal_cell_y",
+        "bot_x",
+        "bot_y",
+        "carrying_count",
+        "grid_width",
+        "grid_height",
+        "bot_count",
+    }
+    for col in all_columns:
+        if col in numeric_columns:
+            work[col] = pd.to_numeric(work[col], errors="coerce").fillna(0).astype(int)
+        else:
+            work[col] = work[col].fillna("").astype(str)
+
+    out: Dict[str, str] = {}
+    for run_id, group in work.groupby("run_id", sort=False):
+        hasher = hashlib.blake2b(digest_size=16)
+        for row in group[all_columns].itertuples(index=False, name=None):
+            hasher.update("|".join(str(v) for v in row).encode("utf-8"))
+            hasher.update(b"\n")
+        out[str(run_id)] = hasher.hexdigest()
+    return out
+
+
+def signature_cluster_sizes(signature_by_run: Dict[str, str]) -> Dict[str, int]:
+    counts: Dict[str, int] = {}
+    for signature in signature_by_run.values():
+        counts[signature] = counts.get(signature, 0) + 1
+    return counts
 
 
 def iter_jsonl(path: Path) -> Iterator[Dict]:

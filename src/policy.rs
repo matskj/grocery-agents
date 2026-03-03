@@ -13,7 +13,9 @@ use crate::{
     dist::DistanceMap,
     model::{Action, GameState},
     motion::{MotionPlanner, PlannedAction},
-    scoring::{detect_mode_label, maybe_score_ordering, OrderingFeatures},
+    scoring::{
+        detect_mode_label, maybe_score_ordering, maybe_score_ordering_sequence, OrderingFeatures,
+    },
     team_context::{
         BlockedMove, BotCommitment, BotRole, DemandTier, StandClaim, StickyQueueRole, TeamContext,
         TeamContextConfig,
@@ -3201,6 +3203,29 @@ fn compute_ordering_sequence(
         )
         .unwrap_or(0.0);
         score += model_score;
+        let sequence_score = maybe_score_ordering_sequence(
+            mode,
+            OrderingFeatures {
+                carrying_active: if carrying_active { 1.0 } else { 0.0 },
+                queue_role_lead: if matches!(role, BotRole::LeadCourier) {
+                    1.0
+                } else {
+                    0.0
+                },
+                queue_role_courier: if matches!(role, BotRole::QueueCourier) {
+                    1.0
+                } else {
+                    0.0
+                },
+                blocked_ticks,
+                local_conflict_count: local_conflict,
+                dist_to_goal,
+                dropoff_watchdog_pressure: watchdog_pressure,
+                choke_occupancy,
+            },
+        )
+        .unwrap_or(0.0);
+        score += sequence_score;
         scores.insert(bot.id.clone(), score);
         scored.push((bot.id.clone(), score));
     }

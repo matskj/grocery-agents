@@ -136,9 +136,8 @@ impl MotionPlanner {
         let cbs_start = Instant::now();
         let cbs_budget = Duration::from_millis(3);
         let cbs_node_cap: u16 = 80;
-        let _ = explicit_order;
         let mut bots = state.bots.iter().collect::<Vec<_>>();
-        bots.sort_by(|a, b| a.id.cmp(&b.id));
+        sort_bots_for_planning(&mut bots, explicit_order);
 
         for (ix, bot) in bots.iter().enumerate() {
             if soft_deadline
@@ -731,6 +730,27 @@ impl MotionPlanner {
     }
 }
 
+fn sort_bots_for_planning<'a>(
+    bots: &mut Vec<&'a crate::model::BotState>,
+    explicit_order: &[String],
+) {
+    let explicit_rank = explicit_order
+        .iter()
+        .enumerate()
+        .map(|(idx, bot_id)| (bot_id.as_str(), idx))
+        .collect::<HashMap<_, _>>();
+    bots.sort_by(|a, b| {
+        let a_rank = explicit_rank.get(a.id.as_str()).copied();
+        let b_rank = explicit_rank.get(b.id.as_str()).copied();
+        match (a_rank, b_rank) {
+            (Some(ra), Some(rb)) => ra.cmp(&rb).then_with(|| a.id.cmp(&b.id)),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => a.id.cmp(&b.id),
+        }
+    });
+}
+
 #[derive(Debug, Clone, Default)]
 struct CbsResolution {
     local_conflict_count_by_bot: HashMap<String, u16>,
@@ -1042,7 +1062,7 @@ mod tests {
         world::World,
     };
 
-    use super::{is_hard_prohibited_step, MotionPlanner};
+    use super::{is_hard_prohibited_step, sort_bots_for_planning, MotionPlanner};
 
     #[test]
     fn repeat_move_hard_forbid_does_not_block_only_exit() {
@@ -1099,7 +1119,7 @@ mod tests {
                 },
                 BotState {
                     id: "b".to_owned(),
-                    x: 2,
+                    x: 3,
                     y: 1,
                     carrying: vec![],
                     capacity: 3,
@@ -1211,5 +1231,36 @@ mod tests {
             format!("{:?}", b2.action),
             "explicit ordering must produce deterministic action for bot b"
         );
+    }
+
+    #[test]
+    fn explicit_order_changes_priority_when_goals_conflict() {
+        let bots = vec![
+            BotState {
+                id: "a".to_owned(),
+                x: 0,
+                y: 0,
+                carrying: vec![],
+                capacity: 3,
+            },
+            BotState {
+                id: "b".to_owned(),
+                x: 0,
+                y: 1,
+                carrying: vec![],
+                capacity: 3,
+            },
+            BotState {
+                id: "c".to_owned(),
+                x: 0,
+                y: 2,
+                carrying: vec![],
+                capacity: 3,
+            },
+        ];
+        let mut refs = bots.iter().collect::<Vec<_>>();
+        sort_bots_for_planning(&mut refs, &["b".to_owned(), "a".to_owned()]);
+        let ordered = refs.iter().map(|bot| bot.id.as_str()).collect::<Vec<_>>();
+        assert_eq!(ordered, vec!["b", "a", "c"]);
     }
 }

@@ -9,6 +9,12 @@ pub enum AssignmentMode {
     LegacyOnly,
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq, ValueEnum)]
+pub enum PlannerBudgetMode {
+    Fixed,
+    Adaptive,
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub horizon: u8,
@@ -20,7 +26,12 @@ pub struct Config {
     pub dropoff_capacity: u8,
     pub lambda_density: f64,
     pub lambda_choke: f64,
+    pub planner_budget_mode: PlannerBudgetMode,
     pub planner_soft_budget_ms: u64,
+    pub planner_soft_budget_min_ms: u64,
+    pub planner_soft_budget_max_ms: u64,
+    pub planner_hard_budget_ms: u64,
+    pub planner_deadline_slack_ms: u64,
     pub log_level: String,
     pub structured_bot_log: bool,
     pub ascii_render: bool,
@@ -71,8 +82,36 @@ pub struct ConfigArgs {
     #[arg(long, env = "GROCERY_LAMBDA_CHOKE", default_value_t = 1.5)]
     pub lambda_choke: f64,
 
+    #[arg(
+        long,
+        env = "GROCERY_PLANNER_BUDGET_MODE",
+        value_enum,
+        default_value_t = PlannerBudgetMode::Adaptive
+    )]
+    pub planner_budget_mode: PlannerBudgetMode,
+
     #[arg(long, env = "GROCERY_PLANNER_SOFT_BUDGET_MS", default_value_t = 1_200)]
     pub planner_soft_budget_ms: u64,
+
+    #[arg(
+        long,
+        env = "GROCERY_PLANNER_SOFT_BUDGET_MIN_MS",
+        default_value_t = 1_350
+    )]
+    pub planner_soft_budget_min_ms: u64,
+
+    #[arg(
+        long,
+        env = "GROCERY_PLANNER_SOFT_BUDGET_MAX_MS",
+        default_value_t = 1_900
+    )]
+    pub planner_soft_budget_max_ms: u64,
+
+    #[arg(long, env = "GROCERY_PLANNER_HARD_BUDGET_MS", default_value_t = 1_950)]
+    pub planner_hard_budget_ms: u64,
+
+    #[arg(long, env = "GROCERY_PLANNER_DEADLINE_SLACK_MS", default_value_t = 80)]
+    pub planner_deadline_slack_ms: u64,
 
     #[arg(long, env = "GROCERY_LOG_LEVEL", default_value = "info")]
     pub log_level: String,
@@ -119,6 +158,17 @@ pub struct ConfigArgs {
 
 impl ConfigArgs {
     pub fn build(self) -> Config {
+        let hard_budget = self.planner_hard_budget_ms.clamp(200, 1_980);
+        let slack = self.planner_deadline_slack_ms.clamp(20, 250);
+        let mut soft_min = self.planner_soft_budget_min_ms.clamp(100, 1_900);
+        let mut soft_max = self.planner_soft_budget_max_ms.clamp(100, 1_950);
+        if soft_min > soft_max {
+            std::mem::swap(&mut soft_min, &mut soft_max);
+        }
+        let max_soft_allowed = hard_budget.saturating_sub(slack).max(100);
+        soft_min = soft_min.min(max_soft_allowed);
+        soft_max = soft_max.min(max_soft_allowed).max(soft_min);
+
         Config {
             horizon: self.horizon.clamp(8, 32),
             candidate_k: self.candidate_k.clamp(1, 32),
@@ -133,7 +183,12 @@ impl ConfigArgs {
             dropoff_capacity: self.dropoff_capacity.clamp(1, 4),
             lambda_density: self.lambda_density.clamp(0.0, 10.0),
             lambda_choke: self.lambda_choke.clamp(0.0, 10.0),
-            planner_soft_budget_ms: self.planner_soft_budget_ms.clamp(100, 1_390),
+            planner_budget_mode: self.planner_budget_mode,
+            planner_soft_budget_ms: self.planner_soft_budget_ms.clamp(100, max_soft_allowed),
+            planner_soft_budget_min_ms: soft_min,
+            planner_soft_budget_max_ms: soft_max,
+            planner_hard_budget_ms: hard_budget,
+            planner_deadline_slack_ms: slack,
             log_level: self.log_level,
             structured_bot_log: self.structured_bot_log,
             ascii_render: self.ascii_render,

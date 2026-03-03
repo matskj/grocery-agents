@@ -3,3 +3,5 @@
 numpy>=1.26
 pandas>=2.2
 pyarrow>=15.0
+# Optional but recommended for PMAT-lite pairwise ordering head training.
+torch>=2.2

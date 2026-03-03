@@ -28,6 +28,8 @@ pub struct ModeModel {
     pub heads: HashMap<String, HeadModel>,
     #[serde(default)]
     pub calibration: CalibrationModel,
+    #[serde(default)]
+    pub ordering_sequence_head: OrderingSequenceHead,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -81,6 +83,36 @@ impl Default for CalibrationModel {
     }
 }
 
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct OrderingSequenceHead {
+    #[serde(default, rename = "type")]
+    pub kind: String,
+    #[serde(default)]
+    pub feature_columns: Vec<String>,
+    #[serde(default)]
+    pub normalization: NormalizationModel,
+    #[serde(default)]
+    pub bias: f64,
+    #[serde(default)]
+    pub weights: Vec<f64>,
+    #[serde(default = "default_temperature")]
+    pub temperature: f64,
+}
+
+#[derive(Debug, Clone)]
+struct LoadedArtifact {
+    artifact: PolicyArtifact,
+    status: ArtifactLoadStatus,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ArtifactLoadStatus {
+    pub artifact_path: String,
+    pub artifact_loaded: bool,
+    pub artifact_schema_version: String,
+    pub artifact_mode_count: usize,
+}
+
 fn default_clip() -> f64 {
     8.0
 }
@@ -88,6 +120,8 @@ fn default_clip() -> f64 {
 fn default_temperature() -> f64 {
     1.0
 }
+
+const DEFAULT_POLICY_ARTIFACT_PATH: &str = "models/policy_artifacts.json";
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CandidateFeatures {
@@ -160,6 +194,16 @@ pub fn maybe_score_ordering(mode: &str, features: OrderingFeatures) -> Option<f6
         &model.ordering_weights,
         features,
     ))
+}
+
+pub fn maybe_score_ordering_sequence(mode: &str, features: OrderingFeatures) -> Option<f64> {
+    let artifact = load_artifact();
+    let model = artifact.modes.get(mode)?;
+    score_ordering_sequence_with_model(model, features)
+}
+
+pub fn artifact_load_status() -> ArtifactLoadStatus {
+    load_artifact_bundle().status.clone()
 }
 
 fn score_pick_with_model(model: &ModeModel, features: CandidateFeatures) -> PickScore {
@@ -363,27 +407,113 @@ fn score_with_ordering_weights(weights: &HashMap<String, f64>, features: Orderin
     score
 }
 
+fn score_ordering_sequence_with_model(
+    model: &ModeModel,
+    features: OrderingFeatures,
+) -> Option<f64> {
+    let head = &model.ordering_sequence_head;
+    if head.feature_columns.is_empty() || head.weights.len() != head.feature_columns.len() {
+        return None;
+    }
+    let mut value = head.bias;
+    for (idx, col) in head.feature_columns.iter().enumerate() {
+        let raw = ordering_feature_value(col, features);
+        let mean = head.normalization.mean.get(idx).copied().unwrap_or(0.0);
+        let std = head.normalization.std.get(idx).copied().unwrap_or(1.0);
+        let safe_std = if std.abs() <= 1e-9 { 1.0 } else { std };
+        value += ((raw - mean) / safe_std) * head.weights[idx];
+    }
+    let temp = clamp(head.temperature, 0.25, 8.0);
+    Some(clamp(value / temp, -256.0, 256.0))
+}
+
+fn ordering_feature_value(name: &str, features: OrderingFeatures) -> f64 {
+    match name {
+        "carrying_active" => features.carrying_active,
+        "queue_role_lead" => features.queue_role_lead,
+        "queue_role_courier" => features.queue_role_courier,
+        "blocked_ticks" => features.blocked_ticks,
+        "local_conflict_count" => features.local_conflict_count,
+        "dist_to_goal" | "dist_to_goal_proxy" => features.dist_to_goal,
+        "dropoff_watchdog_pressure" => features.dropoff_watchdog_pressure,
+        "choke_occupancy" | "choke_occupancy_proxy" => features.choke_occupancy,
+        _ => 0.0,
+    }
+}
+
 fn load_artifact() -> &'static PolicyArtifact {
-    static MODEL: OnceLock<PolicyArtifact> = OnceLock::new();
+    &load_artifact_bundle().artifact
+}
+
+fn load_artifact_bundle() -> &'static LoadedArtifact {
+    static MODEL: OnceLock<LoadedArtifact> = OnceLock::new();
     MODEL.get_or_init(|| {
-        let path = match std::env::var("POLICY_ARTIFACT_PATH") {
-            Ok(v) => v,
-            Err(_) => return PolicyArtifact::default(),
-        };
-        let content = match fs::read_to_string(path) {
-            Ok(v) => v,
-            Err(_) => return PolicyArtifact::default(),
-        };
-        serde_json::from_str::<PolicyArtifact>(&content).unwrap_or_default()
+        let attempts = artifact_load_attempts();
+        load_artifact_with_attempts(&attempts)
     })
+}
+
+fn artifact_load_attempts() -> Vec<String> {
+    let mut attempts = Vec::<String>::new();
+    if let Ok(path) = std::env::var("POLICY_ARTIFACT_PATH") {
+        let trimmed = path.trim().to_owned();
+        if !trimmed.is_empty() {
+            attempts.push(trimmed);
+        }
+    }
+    if !attempts
+        .iter()
+        .any(|path| path.eq_ignore_ascii_case(DEFAULT_POLICY_ARTIFACT_PATH))
+    {
+        attempts.push(DEFAULT_POLICY_ARTIFACT_PATH.to_owned());
+    }
+    attempts
+}
+
+fn load_artifact_with_attempts(attempts: &[String]) -> LoadedArtifact {
+    for path in attempts {
+        let content = match fs::read_to_string(path) {
+            Ok(content) => content,
+            Err(_) => continue,
+        };
+        let parsed = match serde_json::from_str::<PolicyArtifact>(&content) {
+            Ok(parsed) => parsed,
+            Err(_) => continue,
+        };
+        let status = ArtifactLoadStatus {
+            artifact_path: path.clone(),
+            artifact_loaded: true,
+            artifact_schema_version: parsed.schema_version.clone(),
+            artifact_mode_count: parsed.modes.len(),
+        };
+        return LoadedArtifact {
+            artifact: parsed,
+            status,
+        };
+    }
+    LoadedArtifact {
+        artifact: PolicyArtifact::default(),
+        status: ArtifactLoadStatus {
+            artifact_path: attempts
+                .first()
+                .cloned()
+                .unwrap_or_else(|| DEFAULT_POLICY_ARTIFACT_PATH.to_owned()),
+            artifact_loaded: false,
+            artifact_schema_version: String::new(),
+            artifact_mode_count: 0,
+        },
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::{fs, path::PathBuf, time::SystemTime};
+
     use crate::model::{BotState, GameState, Grid};
 
     use super::{
-        detect_mode_label, score_pick_with_model, CandidateFeatures, HeadModel, ModeModel,
+        detect_mode_label, load_artifact_with_attempts, score_ordering_sequence_with_model,
+        score_pick_with_model, CandidateFeatures, HeadModel, ModeModel, OrderingFeatures,
     };
 
     fn state(width: i32, height: i32, bots: usize) -> GameState {
@@ -642,5 +772,83 @@ mod tests {
         );
         assert!(score.ordering_score < 0.0);
         assert_eq!(score.combined_expected_score, 0.0);
+    }
+
+    fn unique_temp_path(name: &str) -> PathBuf {
+        let ts = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        std::env::temp_dir().join(format!("grocery_scoring_{name}_{ts}.json"))
+    }
+
+    #[test]
+    fn falls_back_cleanly_when_missing_file() {
+        let loaded =
+            load_artifact_with_attempts(
+                &["C:/definitely/missing/policy_artifacts.json".to_owned()],
+            );
+        assert!(!loaded.status.artifact_loaded);
+        assert_eq!(loaded.status.artifact_mode_count, 0);
+    }
+
+    #[test]
+    fn loads_default_artifact_when_env_missing() {
+        let path = unique_temp_path("default");
+        let payload = r#"{"schema_version":"1.2.0","modes":{"easy":{"weights":{"bias":1.0}}}}"#;
+        fs::write(&path, payload).expect("write fixture");
+        let loaded = load_artifact_with_attempts(&[path.to_string_lossy().to_string()]);
+        assert!(loaded.status.artifact_loaded);
+        assert_eq!(loaded.status.artifact_schema_version, "1.2.0");
+        assert_eq!(loaded.status.artifact_mode_count, 1);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn prefers_env_artifact_over_default() {
+        let env_path = unique_temp_path("env");
+        let default_path = unique_temp_path("fallback");
+        fs::write(
+            &env_path,
+            r#"{"schema_version":"1.2.0","modes":{"expert":{"weights":{"bias":2.0}}}}"#,
+        )
+        .expect("write env fixture");
+        fs::write(
+            &default_path,
+            r#"{"schema_version":"1.2.0","modes":{"easy":{"weights":{"bias":1.0}}}}"#,
+        )
+        .expect("write default fixture");
+        let loaded = load_artifact_with_attempts(&[
+            env_path.to_string_lossy().to_string(),
+            default_path.to_string_lossy().to_string(),
+        ]);
+        assert!(loaded.status.artifact_loaded);
+        assert_eq!(loaded.status.artifact_mode_count, 1);
+        assert!(loaded.artifact.modes.contains_key("expert"));
+        assert!(!loaded.artifact.modes.contains_key("easy"));
+        let _ = fs::remove_file(env_path);
+        let _ = fs::remove_file(default_path);
+    }
+
+    #[test]
+    fn ordering_sequence_head_scores_when_present() {
+        let mut model = ModeModel::default();
+        model.ordering_sequence_head.kind = "pairwise_linear".to_owned();
+        model.ordering_sequence_head.feature_columns =
+            vec!["blocked_ticks".to_owned(), "dist_to_goal".to_owned()];
+        model.ordering_sequence_head.normalization.mean = vec![0.0, 0.0];
+        model.ordering_sequence_head.normalization.std = vec![1.0, 1.0];
+        model.ordering_sequence_head.weights = vec![1.5, -1.0];
+        model.ordering_sequence_head.temperature = 1.0;
+        let value = score_ordering_sequence_with_model(
+            &model,
+            OrderingFeatures {
+                blocked_ticks: 3.0,
+                dist_to_goal: 2.0,
+                ..OrderingFeatures::default()
+            },
+        )
+        .unwrap_or(0.0);
+        assert!(value > 2.0);
     }
 }

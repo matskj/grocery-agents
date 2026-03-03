@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -71,7 +72,11 @@ def main() -> None:
         raise SystemExit(2)
 
     cmd = build_cmd(args.target, cargo_args)
-    rc = subprocess.call(cmd, cwd=str(ROOT_DIR))
+    env = dict(os.environ)
+    env.setdefault(
+        "POLICY_ARTIFACT_PATH", str((ROOT_DIR / "models" / "policy_artifacts.json").resolve())
+    )
+    rc = subprocess.call(cmd, cwd=str(ROOT_DIR), env=env)
     if rc == 0 and not args.no_batch_train:
         batch_cmd = [
             sys.executable,
@@ -86,7 +91,7 @@ def main() -> None:
             "--modes",
             args.train_modes,
         ]
-        batch_rc = subprocess.call(batch_cmd, cwd=str(ROOT_DIR))
+        batch_rc = subprocess.call(batch_cmd, cwd=str(ROOT_DIR), env=env)
         if batch_rc != 0:
             print(f"Batch training failed with exit code {batch_rc}", file=sys.stderr)
             rc = batch_rc

@@ -30,6 +30,7 @@ def main() -> None:
             "runtime_feature_columns": payload.get("runtime_feature_columns", []),
             "normalization": payload.get("normalization", {}),
             "heads": payload.get("heads", {}),
+            "ordering_sequence_head": payload.get("ordering_sequence_head", {}),
             "calibration": payload.get("calibration", {}),
         }
 

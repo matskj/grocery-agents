@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
@@ -13,6 +13,7 @@ from .common import (
     CONVERSION_LABEL_COLUMNS,
     FEATURE_COLUMNS,
     ORDERING_FEATURE_COLUMNS,
+    ORDERING_SEQUENCE_FEATURE_COLUMNS,
     RUNTIME_FEATURE_COLUMNS,
     SCHEMA_VERSION,
     STATE_ACTION_SIGNATURE_EXTRA_COLUMNS,
@@ -170,6 +171,171 @@ def fit_binary_prob_head(
     return head, head_metrics
 
 
+def extract_ordering_sequence_matrix(frame: pd.DataFrame) -> np.ndarray:
+    columns: List[np.ndarray] = []
+    for name in ORDERING_SEQUENCE_FEATURE_COLUMNS:
+        if name == "dist_to_goal":
+            series = frame.get("dist_to_goal_proxy", pd.Series(np.zeros(len(frame))))
+        elif name == "choke_occupancy":
+            series = frame.get("choke_occupancy_proxy", pd.Series(np.zeros(len(frame))))
+        else:
+            series = frame.get(name, pd.Series(np.zeros(len(frame))))
+        columns.append(series.astype(float).to_numpy(dtype=float))
+    if not columns:
+        return np.zeros((len(frame), 0), dtype=float)
+    return np.stack(columns, axis=1)
+
+
+def ordering_preference_target(frame: pd.DataFrame) -> np.ndarray:
+    pickup = frame.get("pickup_success", pd.Series(np.zeros(len(frame)))).to_numpy(dtype=float)
+    dropoff = frame.get("dropoff_success", pd.Series(np.zeros(len(frame)))).to_numpy(dtype=float)
+    conflict_reduction = frame.get(
+        "conflict_reduction", pd.Series(np.zeros(len(frame)))
+    ).to_numpy(dtype=float)
+    queue_eta_improve = frame.get(
+        "queue_eta_improve", pd.Series(np.zeros(len(frame)))
+    ).to_numpy(dtype=float)
+    delta_item = np.maximum(
+        frame.get("delta_dist_to_active_item", pd.Series(np.zeros(len(frame)))).to_numpy(dtype=float),
+        0.0,
+    )
+    delta_drop = np.maximum(
+        frame.get("delta_dist_to_dropoff", pd.Series(np.zeros(len(frame)))).to_numpy(dtype=float),
+        0.0,
+    )
+    move_failed = frame.get("move_failed", pd.Series(np.zeros(len(frame)))).to_numpy(dtype=float)
+    noop_move = frame.get("noop_move", pd.Series(np.zeros(len(frame)))).to_numpy(dtype=float)
+    local_conflict = frame.get(
+        "local_conflict_count", pd.Series(np.zeros(len(frame)))
+    ).to_numpy(dtype=float)
+    return (
+        2.0 * (pickup + dropoff)
+        + 1.0 * conflict_reduction
+        + 0.8 * queue_eta_improve
+        + 0.5 * delta_drop
+        + 0.4 * delta_item
+        - 1.0 * move_failed
+        - 0.4 * noop_move
+        - 0.3 * local_conflict
+    )
+
+
+def build_pairwise_samples(
+    frame: pd.DataFrame,
+    x_norm: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray]:
+    if frame.empty or x_norm.size == 0:
+        return np.zeros((0, x_norm.shape[1] if x_norm.ndim == 2 else 0), dtype=float), np.zeros((0,), dtype=float)
+    pref = ordering_preference_target(frame)
+    work = frame[["run_id", "tick"]].copy()
+    work["row_idx"] = np.arange(len(frame), dtype=int)
+    pair_x: List[np.ndarray] = []
+    pair_y: List[float] = []
+    for (_, _), group in work.groupby(["run_id", "tick"], sort=False):
+        idxs = group["row_idx"].to_numpy(dtype=int)
+        if idxs.size < 2:
+            continue
+        pref_local = pref[idxs]
+        for i in range(idxs.size - 1):
+            for j in range(i + 1, idxs.size):
+                left = idxs[i]
+                right = idxs[j]
+                p_left = pref_local[i]
+                p_right = pref_local[j]
+                if p_left == p_right:
+                    continue
+                pair_x.append(x_norm[left] - x_norm[right])
+                pair_y.append(1.0 if p_left > p_right else 0.0)
+    if not pair_x:
+        return np.zeros((0, x_norm.shape[1]), dtype=float), np.zeros((0,), dtype=float)
+    return np.vstack(pair_x).astype(float), np.array(pair_y, dtype=float)
+
+
+def fit_pairwise_linear_head(
+    x_train: np.ndarray,
+    y_train: np.ndarray,
+    x_val: np.ndarray,
+    y_val: np.ndarray,
+    max_epochs: int = 300,
+    lr: float = 0.05,
+) -> Tuple[Dict[str, object], Dict[str, object]]:
+    if x_train.size == 0 or y_train.size == 0:
+        empty_head = {
+            "type": "pairwise_linear",
+            "feature_columns": ORDERING_SEQUENCE_FEATURE_COLUMNS,
+            "normalization": {"mean": [], "std": []},
+            "bias": 0.0,
+            "weights": [0.0 for _ in ORDERING_SEQUENCE_FEATURE_COLUMNS],
+            "temperature": 1.0,
+            "metrics": {
+                "pair_auc": 0.5,
+                "pair_logloss": 0.0,
+                "rows_train_pairs": 0,
+                "rows_validation_pairs": 0,
+                "backend": "none",
+            },
+        }
+        return empty_head, empty_head["metrics"]  # type: ignore[return-value]
+
+    backend = "numpy_fallback"
+    bias = 0.0
+    weights = np.zeros((x_train.shape[1],), dtype=float)
+    try:
+        import torch
+        import torch.nn.functional as F
+
+        torch.manual_seed(0)
+        x_train_t = torch.from_numpy(x_train.astype(np.float32))
+        y_train_t = torch.from_numpy(y_train.astype(np.float32))
+        w = torch.zeros((x_train.shape[1],), dtype=torch.float32, requires_grad=True)
+        b = torch.zeros((1,), dtype=torch.float32, requires_grad=True)
+        opt = torch.optim.Adam([w, b], lr=lr)
+        for _ in range(max_epochs):
+            logits = x_train_t.matmul(w) + b
+            loss = F.binary_cross_entropy_with_logits(logits, y_train_t)
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+        weights = w.detach().cpu().numpy().astype(float)
+        bias = float(b.detach().cpu().numpy()[0])
+        backend = "torch_cpu"
+    except Exception:
+        # Deterministic fallback if torch is unavailable.
+        w = np.zeros((x_train.shape[1],), dtype=float)
+        b = 0.0
+        for _ in range(max_epochs):
+            logits = x_train @ w + b
+            probs = sigmoid(logits)
+            err = probs - y_train
+            grad_w = (x_train.T @ err) / max(1, x_train.shape[0])
+            grad_b = float(err.mean())
+            w -= lr * grad_w
+            b -= lr * grad_b
+        weights = w
+        bias = b
+
+    logits_val = x_val @ weights + bias if x_val.size else np.zeros((0,), dtype=float)
+    temperature = fit_temperature(logits_val, y_val)
+    probs_val = sigmoid(logits_val / temperature) if logits_val.size else np.zeros((0,), dtype=float)
+    head_metrics = {
+        "pair_auc": auc_roc(y_val, probs_val),
+        "pair_logloss": prob_logloss(y_val, probs_val),
+        "rows_train_pairs": int(y_train.size),
+        "rows_validation_pairs": int(y_val.size),
+        "backend": backend,
+    }
+    head = {
+        "type": "pairwise_linear",
+        "feature_columns": ORDERING_SEQUENCE_FEATURE_COLUMNS,
+        "normalization": {},
+        "bias": float(bias),
+        "weights": [float(v) for v in weights],
+        "temperature": float(temperature),
+        "metrics": head_metrics,
+    }
+    return head, head_metrics
+
+
 def apply_run_dedup(
     frame: pd.DataFrame,
     strategy: str,
@@ -283,6 +449,20 @@ def main() -> None:
 
     frame = ensure_columns(frame, FEATURE_COLUMNS, default=0.0)
     frame = ensure_columns(frame, ORDERING_FEATURE_COLUMNS, default=0.0)
+    frame = ensure_columns(
+        frame,
+        [
+            "dist_to_goal_proxy",
+            "choke_occupancy_proxy",
+            "conflict_reduction",
+            "queue_eta_improve",
+            "delta_dist_to_active_item",
+            "delta_dist_to_dropoff",
+            "move_failed",
+            "noop_move",
+        ],
+        default=0.0,
+    )
     runtime_feature_columns = (
         list(RUNTIME_FEATURE_COLUMNS)
         if args.runtime_feature_set == "strict"
@@ -373,6 +553,42 @@ def main() -> None:
         ordering_val_pred,
     )
 
+    x_train_seq_raw = extract_ordering_sequence_matrix(train)
+    x_val_seq_raw = (
+        extract_ordering_sequence_matrix(val)
+        if not val.empty
+        else np.zeros((0, len(ORDERING_SEQUENCE_FEATURE_COLUMNS)), dtype=float)
+    )
+    if x_train_seq_raw.size:
+        seq_mean, seq_std = fit_normalization(x_train_seq_raw)
+        x_train_seq = apply_normalization(x_train_seq_raw, seq_mean, seq_std)
+        x_val_seq = apply_normalization(x_val_seq_raw, seq_mean, seq_std) if x_val_seq_raw.size else x_val_seq_raw
+    else:
+        seq_mean = np.zeros((len(ORDERING_SEQUENCE_FEATURE_COLUMNS),), dtype=float)
+        seq_std = np.ones((len(ORDERING_SEQUENCE_FEATURE_COLUMNS),), dtype=float)
+        x_train_seq = np.zeros((0, len(ORDERING_SEQUENCE_FEATURE_COLUMNS)), dtype=float)
+        x_val_seq = np.zeros((0, len(ORDERING_SEQUENCE_FEATURE_COLUMNS)), dtype=float)
+
+    pair_x_train, pair_y_train = build_pairwise_samples(train, x_train_seq)
+    pair_x_val, pair_y_val = (
+        build_pairwise_samples(val, x_val_seq)
+        if not val.empty
+        else (
+            np.zeros((0, len(ORDERING_SEQUENCE_FEATURE_COLUMNS)), dtype=float),
+            np.zeros((0,), dtype=float),
+        )
+    )
+    ordering_sequence_head, ordering_sequence_metrics = fit_pairwise_linear_head(
+        pair_x_train,
+        pair_y_train,
+        pair_x_val,
+        pair_y_val,
+    )
+    ordering_sequence_head["normalization"] = {
+        "mean": [float(v) for v in seq_mean],
+        "std": [float(v) for v in seq_std],
+    }
+
     payload = {
         "schema_version": SCHEMA_VERSION,
         "mode": args.mode,
@@ -387,6 +603,7 @@ def main() -> None:
             "dropoff": dropoff_head,
             "ordering": ordering_head,
         },
+        "ordering_sequence_head": ordering_sequence_head,
         "calibration": {
             "pickup_temp": float(pickup_head["temperature"]),
             "dropoff_temp": float(dropoff_head["temperature"]),
@@ -403,6 +620,7 @@ def main() -> None:
             "pickup": pickup_metrics,
             "dropoff": dropoff_metrics,
             "ordering": ordering_metrics,
+            "ordering_sequence": ordering_sequence_metrics,
         },
     }
     out_path = Path(args.out)

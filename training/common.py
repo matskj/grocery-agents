@@ -113,6 +113,17 @@ ORDERING_FEATURE_COLUMNS = [
     "choke_occupancy_proxy",
 ]
 
+ORDERING_SEQUENCE_FEATURE_COLUMNS = [
+    "carrying_active",
+    "queue_role_lead",
+    "queue_role_courier",
+    "blocked_ticks",
+    "local_conflict_count",
+    "dist_to_goal",
+    "dropoff_watchdog_pressure",
+    "choke_occupancy",
+]
+
 ACTION_SIGNATURE_COLUMNS = [
     "tick",
     "bot_id",

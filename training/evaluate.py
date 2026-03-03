@@ -94,6 +94,108 @@ def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, float]:
     return {"mae": mae, "rmse": rmse, "r2": r2}
 
 
+def extract_ordering_sequence_matrix(
+    frame: pd.DataFrame, feature_columns: list[str]
+) -> np.ndarray:
+    cols = []
+    for name in feature_columns:
+        if name == "dist_to_goal":
+            series = frame.get("dist_to_goal_proxy", pd.Series(np.zeros(len(frame))))
+        elif name == "choke_occupancy":
+            series = frame.get("choke_occupancy_proxy", pd.Series(np.zeros(len(frame))))
+        else:
+            series = frame.get(name, pd.Series(np.zeros(len(frame))))
+        cols.append(series.astype(float).to_numpy(dtype=float))
+    if not cols:
+        return np.zeros((len(frame), 0), dtype=float)
+    return np.stack(cols, axis=1)
+
+
+def ordering_preference_target(frame: pd.DataFrame) -> np.ndarray:
+    pickup = frame.get("pickup_success", pd.Series(np.zeros(len(frame)))).to_numpy(dtype=float)
+    dropoff = frame.get("dropoff_success", pd.Series(np.zeros(len(frame)))).to_numpy(dtype=float)
+    conflict_reduction = frame.get(
+        "conflict_reduction", pd.Series(np.zeros(len(frame)))
+    ).to_numpy(dtype=float)
+    queue_eta_improve = frame.get(
+        "queue_eta_improve", pd.Series(np.zeros(len(frame)))
+    ).to_numpy(dtype=float)
+    delta_item = np.maximum(
+        frame.get("delta_dist_to_active_item", pd.Series(np.zeros(len(frame)))).to_numpy(dtype=float),
+        0.0,
+    )
+    delta_drop = np.maximum(
+        frame.get("delta_dist_to_dropoff", pd.Series(np.zeros(len(frame)))).to_numpy(dtype=float),
+        0.0,
+    )
+    move_failed = frame.get("move_failed", pd.Series(np.zeros(len(frame)))).to_numpy(dtype=float)
+    noop_move = frame.get("noop_move", pd.Series(np.zeros(len(frame)))).to_numpy(dtype=float)
+    local_conflict = frame.get(
+        "local_conflict_count", pd.Series(np.zeros(len(frame)))
+    ).to_numpy(dtype=float)
+    return (
+        2.0 * (pickup + dropoff)
+        + 1.0 * conflict_reduction
+        + 0.8 * queue_eta_improve
+        + 0.5 * delta_drop
+        + 0.4 * delta_item
+        - 1.0 * move_failed
+        - 0.4 * noop_move
+        - 0.3 * local_conflict
+    )
+
+
+def build_pairwise_eval(
+    frame: pd.DataFrame, x_norm: np.ndarray
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    if frame.empty or x_norm.size == 0:
+        return (
+            np.zeros((0, x_norm.shape[1] if x_norm.ndim == 2 else 0), dtype=float),
+            np.zeros((0,), dtype=float),
+            np.zeros((0,), dtype=bool),
+        )
+    pref = ordering_preference_target(frame)
+    blocked = (
+        frame.get("blocked_ticks", pd.Series(np.zeros(len(frame)))).to_numpy(dtype=float) > 0.0
+    ) | (
+        frame.get("local_conflict_count", pd.Series(np.zeros(len(frame)))).to_numpy(dtype=float)
+        > 0.0
+    )
+    work = frame[["run_id", "tick"]].copy()
+    work["row_idx"] = np.arange(len(frame), dtype=int)
+    pair_x: list[np.ndarray] = []
+    pair_y: list[float] = []
+    pair_blocked: list[bool] = []
+    for (_, _), group in work.groupby(["run_id", "tick"], sort=False):
+        idxs = group["row_idx"].to_numpy(dtype=int)
+        if idxs.size < 2:
+            continue
+        pref_local = pref[idxs]
+        blocked_local = blocked[idxs]
+        for i in range(idxs.size - 1):
+            for j in range(i + 1, idxs.size):
+                left = idxs[i]
+                right = idxs[j]
+                p_left = pref_local[i]
+                p_right = pref_local[j]
+                if p_left == p_right:
+                    continue
+                pair_x.append(x_norm[left] - x_norm[right])
+                pair_y.append(1.0 if p_left > p_right else 0.0)
+                pair_blocked.append(bool(blocked_local[i] or blocked_local[j]))
+    if not pair_x:
+        return (
+            np.zeros((0, x_norm.shape[1]), dtype=float),
+            np.zeros((0,), dtype=float),
+            np.zeros((0,), dtype=bool),
+        )
+    return (
+        np.vstack(pair_x).astype(float),
+        np.array(pair_y, dtype=float),
+        np.array(pair_blocked, dtype=bool),
+    )
+
+
 def build_team_tick_frame(frame: pd.DataFrame) -> pd.DataFrame:
     keep = frame.sort_values(["run_id", "tick", "bot_id"], kind="mergesort")
     return keep.drop_duplicates(["run_id", "tick"], keep="first").copy()
@@ -319,6 +421,64 @@ def main() -> None:
         dropoff_true = frame["dropoff_success"].to_numpy(dtype=float)[dropoff_mask]
         pickup_eval = pickup_probs[pickup_mask] if pickup_probs.size else np.zeros((0,))
         dropoff_eval = dropoff_probs[dropoff_mask] if dropoff_probs.size else np.zeros((0,))
+        ordering_sequence_metrics: Dict[str, object] = {}
+        ordering_sequence_head = model.get("ordering_sequence_head", {})
+        if isinstance(ordering_sequence_head, dict):
+            seq_cols = [str(v) for v in ordering_sequence_head.get("feature_columns", [])]
+            seq_weights = np.array(ordering_sequence_head.get("weights", []), dtype=float)
+            if seq_cols and seq_weights.size == len(seq_cols):
+                x_seq = extract_ordering_sequence_matrix(frame, seq_cols)
+                seq_norm = ordering_sequence_head.get("normalization", {})
+                seq_mean = np.array(seq_norm.get("mean", [0.0] * len(seq_cols)), dtype=float)
+                seq_std = np.array(seq_norm.get("std", [1.0] * len(seq_cols)), dtype=float)
+                if seq_mean.size != len(seq_cols):
+                    seq_mean = np.zeros((len(seq_cols),), dtype=float)
+                if seq_std.size != len(seq_cols):
+                    seq_std = np.ones((len(seq_cols),), dtype=float)
+                seq_std = np.where(seq_std <= 1e-9, 1.0, seq_std)
+                x_seq_norm = (x_seq - seq_mean) / seq_std
+                pair_x, pair_y, pair_blocked = build_pairwise_eval(frame, x_seq_norm)
+                seq_bias = float(ordering_sequence_head.get("bias", 0.0))
+                seq_temp = float(ordering_sequence_head.get("temperature", 1.0))
+                if pair_x.size:
+                    pair_logits = seq_bias + pair_x @ seq_weights
+                    pair_probs = sigmoid(pair_logits / max(0.25, seq_temp))
+                    seq_pair_auc = auc_roc(pair_y, pair_probs)
+                    seq_pair_logloss = prob_logloss(pair_y, pair_probs)
+                    pair_pred = (pair_probs >= 0.5).astype(float)
+                    pair_acc = float((pair_pred == pair_y).mean())
+                    blocked_acc = (
+                        float((pair_pred[pair_blocked] == pair_y[pair_blocked]).mean())
+                        if pair_blocked.any()
+                        else 0.0
+                    )
+                    non_blocked_mask = ~pair_blocked
+                    non_blocked_acc = (
+                        float((pair_pred[non_blocked_mask] == pair_y[non_blocked_mask]).mean())
+                        if non_blocked_mask.any()
+                        else 0.0
+                    )
+                else:
+                    seq_pair_auc = 0.5
+                    seq_pair_logloss = 0.0
+                    pair_acc = 0.0
+                    blocked_acc = 0.0
+                    non_blocked_acc = 0.0
+                seq_utility = seq_bias + x_seq_norm @ seq_weights
+                conflict_proxy = (
+                    frame.get("conflict_reduction", pd.Series(np.zeros(len(frame)))).to_numpy(dtype=float)
+                    - 0.5
+                    * frame.get("local_conflict_count", pd.Series(np.zeros(len(frame)))).to_numpy(dtype=float)
+                )
+                ordering_sequence_metrics = {
+                    "pair_auc": float(seq_pair_auc),
+                    "pair_logloss": float(seq_pair_logloss),
+                    "pair_accuracy": float(pair_acc),
+                    "blocked_pair_accuracy": float(blocked_acc),
+                    "reorder_gain_blocked_stuck": float(blocked_acc - non_blocked_acc),
+                    "conflict_avoidance_proxy_corr": pearson_corr(seq_utility, conflict_proxy),
+                    "rows_pairs": int(pair_y.size),
+                }
         result["metrics_v2"] = {
             "pickup": {
                 "rows": int(pickup_true.size),
@@ -338,6 +498,7 @@ def main() -> None:
                 else 0.0,
                 "idle_far_given_carrying_only_inactive_rate": float(idle_far_inactive),
             },
+            "ordering_sequence": ordering_sequence_metrics,
         }
     print(json.dumps(result, indent=2))
 

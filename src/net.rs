@@ -19,18 +19,17 @@ use tokio_tungstenite::{
 use tracing::{info, warn};
 
 use crate::{
-    config::Config,
+    config::{Config, PlannerBudgetMode},
     dispatcher::Dispatcher,
     model::{
         to_wire_action_envelope, Action, ActionEnvelope, BotState, GameOver, GameState,
         OrderStatus, RuntimeContext, WireServerMessage,
     },
     policy::Policy,
-    scoring::detect_mode_label,
+    scoring::{artifact_load_status, detect_mode_label},
 };
 
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
-const ROUND_PLANNING_BUDGET: Duration = Duration::from_millis(1_400);
 const LOG_SCHEMA_VERSION: &str = "1.2.0";
 
 #[derive(Debug, serde::Deserialize)]
@@ -57,6 +56,12 @@ struct PlanRoundResult {
     action_validated_by_bot: HashMap<String, bool>,
     plan_ms: u64,
     assign_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct BudgetPressure {
+    blocked_bots_prev: u64,
+    stuck_bots_prev: u64,
 }
 
 async fn connect_with_base_url(
@@ -91,6 +96,7 @@ pub async fn run_game_loop(
         }
     };
     let dispatcher = Dispatcher::new();
+    let artifact_status = artifact_load_status();
 
     run_logger.log(
         "session_start",
@@ -99,18 +105,28 @@ pub async fn run_game_loop(
             "run_id": run_logger.run_id(),
             "ws_url": base_url,
             "token_preview": token_preview(&ctx.token),
-            "planning_budget_ms": ROUND_PLANNING_BUDGET.as_millis(),
+            "planner_budget_mode": format!("{:?}", config.planner_budget_mode).to_lowercase(),
+            "planner_soft_budget_ms": config.planner_soft_budget_ms,
+            "planner_soft_budget_min_ms": config.planner_soft_budget_min_ms,
+            "planner_soft_budget_max_ms": config.planner_soft_budget_max_ms,
+            "planner_hard_budget_ms": config.planner_hard_budget_ms,
+            "planner_deadline_slack_ms": config.planner_deadline_slack_ms,
             "mode": ctx.session.difficulty.as_deref().unwrap_or("unknown"),
             "map_id": ctx.session.map_id,
             "difficulty": ctx.session.difficulty,
             "team_id": ctx.session.team_id,
             "map_seed": ctx.session.map_seed,
             "build_version": build_version(),
+            "artifact_path": artifact_status.artifact_path,
+            "artifact_loaded": artifact_status.artifact_loaded,
+            "artifact_schema_version": artifact_status.artifact_schema_version,
+            "artifact_mode_count": artifact_status.artifact_mode_count,
         }),
     );
 
     info!("connected websocket, entering receive loop");
     let mut mode_logged = false;
+    let mut budget_pressure = BudgetPressure::default();
 
     while let Some(frame) = socket.next().await {
         match frame {
@@ -126,26 +142,28 @@ pub async fn run_game_loop(
                 match msg {
                     ServerMessage::Wire(WireServerMessage::GameState(wire_state)) => {
                         let game_state = GameState::from_wire(wire_state);
-                        handle_game_state(
+                        budget_pressure = handle_game_state(
                             &mut socket,
                             &mut policy,
                             &dispatcher,
                             &mut run_logger,
                             &mut mode_logged,
                             config.as_ref(),
+                            budget_pressure,
                             game_state,
                         )
                         .await?;
                     }
                     ServerMessage::LegacyGameStateEnvelope { game_state }
                     | ServerMessage::LegacyGameState(game_state) => {
-                        handle_game_state(
+                        budget_pressure = handle_game_state(
                             &mut socket,
                             &mut policy,
                             &dispatcher,
                             &mut run_logger,
                             &mut mode_logged,
                             config.as_ref(),
+                            budget_pressure,
                             game_state,
                         )
                         .await?;
@@ -228,16 +246,19 @@ async fn handle_game_state(
     run_logger: &mut RunLogger,
     mode_logged: &mut bool,
     config: &Config,
+    budget_pressure: BudgetPressure,
     game_state: GameState,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<BudgetPressure, Box<dyn std::error::Error>> {
     if !*mode_logged {
         run_logger.log("game_mode", game_mode_payload(&game_state));
         *mode_logged = true;
     }
 
+    let soft_budget_ms = compute_soft_budget_ms(config, budget_pressure, game_state.bots.len());
+    let hard_budget = Duration::from_millis(config.planner_hard_budget_ms);
     let planned = timeout(
-        ROUND_PLANNING_BUDGET,
-        plan_round_actions(policy, dispatcher, &game_state, config),
+        hard_budget,
+        plan_round_actions(policy, dispatcher, &game_state, soft_budget_ms),
     )
     .await
     .unwrap_or_else(|_| {
@@ -248,12 +269,13 @@ async fn handle_game_state(
         if bot_debug_enabled() {
             warn!(
                 tick = game_state.tick,
-                budget_ms = ROUND_PLANNING_BUDGET.as_millis(),
+                budget_ms = hard_budget.as_millis(),
+                soft_budget_ms,
                 bot_count = game_state.bots.len(),
                 "time-budget event: fallback wait envelope emitted"
             );
         }
-        fallback_wait_actions(&game_state)
+        fallback_wait_actions(&game_state, soft_budget_ms)
     });
 
     let envelope = ActionEnvelope {
@@ -316,7 +338,47 @@ async fn handle_game_state(
     run_logger.dump_replay(&game_state, &envelope.actions, &planned.team_telemetry);
     socket.send(Message::Text(payload.into())).await?;
     info!(tick, "sent round action envelope");
-    Ok(())
+    Ok(budget_pressure_from_team_telemetry(&planned.team_telemetry))
+}
+
+fn compute_soft_budget_ms(config: &Config, pressure: BudgetPressure, bot_count: usize) -> u64 {
+    let hard = config.planner_hard_budget_ms.max(200);
+    let slack = config.planner_deadline_slack_ms.min(hard.saturating_sub(1));
+    let max_soft_allowed = hard.saturating_sub(slack).max(100);
+    let min_soft = config.planner_soft_budget_min_ms.min(max_soft_allowed);
+    let max_soft = config
+        .planner_soft_budget_max_ms
+        .min(max_soft_allowed)
+        .max(min_soft);
+    let mut soft = match config.planner_budget_mode {
+        PlannerBudgetMode::Fixed => config.planner_soft_budget_ms.min(max_soft_allowed),
+        PlannerBudgetMode::Adaptive => {
+            let raw = min_soft
+                .saturating_add(18u64.saturating_mul(pressure.blocked_bots_prev))
+                .saturating_add(14u64.saturating_mul(pressure.stuck_bots_prev))
+                .saturating_add(8u64.saturating_mul(bot_count as u64));
+            raw.clamp(min_soft, max_soft)
+        }
+    };
+    if soft + slack > hard {
+        soft = hard.saturating_sub(slack).max(100);
+    }
+    soft.clamp(100, max_soft_allowed)
+}
+
+fn budget_pressure_from_team_telemetry(team_telemetry: &serde_json::Value) -> BudgetPressure {
+    let blocked = team_telemetry
+        .get("blocked_bot_count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let stuck = team_telemetry
+        .get("stuck_bot_count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    BudgetPressure {
+        blocked_bots_prev: blocked.min(64),
+        stuck_bots_prev: stuck.min(64),
+    }
 }
 
 struct RunLogger {
@@ -918,10 +980,10 @@ async fn plan_round_actions(
     policy: &mut Policy,
     dispatcher: &Dispatcher,
     state: &GameState,
-    config: &Config,
+    soft_budget_ms: u64,
 ) -> PlanRoundResult {
     let plan_started = Instant::now();
-    let proposed = policy.decide_round(state, Duration::from_millis(config.planner_soft_budget_ms));
+    let proposed = policy.decide_round(state, Duration::from_millis(soft_budget_ms));
     let team_telemetry = policy.last_team_telemetry();
     let assign_ms = team_telemetry
         .get("assign_ms")
@@ -954,7 +1016,7 @@ async fn plan_round_actions(
     }
 }
 
-fn fallback_wait_actions(state: &GameState) -> PlanRoundResult {
+fn fallback_wait_actions(state: &GameState, soft_budget_ms: u64) -> PlanRoundResult {
     if bot_debug_enabled() {
         warn!(
             tick = state.tick,
@@ -1035,6 +1097,9 @@ fn fallback_wait_actions(state: &GameState) -> PlanRoundResult {
             "cbs_timeout": false,
             "cbs_expanded_nodes": 0,
             "dropoff_target_status_by_bot": none_string_map,
+            "blocked_bot_count": 0,
+            "stuck_bot_count": 0,
+            "planner_soft_budget_ms": soft_budget_ms,
             "assign_ms": 0,
         }),
         action_validated_by_bot: state
@@ -1182,9 +1247,12 @@ fn bot_debug_enabled() -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
+    use crate::config::{AssignmentMode, Config, PlannerBudgetMode};
     use crate::model::{Action, BotState, GameState, Grid, Order, OrderStatus};
 
-    use super::validate_action;
+    use super::{compute_soft_budget_ms, validate_action, BudgetPressure};
 
     fn base_state(order_status: OrderStatus) -> (GameState, BotState) {
         let bot = BotState {
@@ -1240,5 +1308,88 @@ mod tests {
         );
         assert!(!invalid);
         assert!(matches!(validated, Action::DropOff { .. }));
+    }
+
+    fn test_config(mode: PlannerBudgetMode) -> Config {
+        Config {
+            horizon: 16,
+            candidate_k: 8,
+            assignment_enabled: true,
+            assignment_mode: AssignmentMode::Hybrid,
+            dropoff_scheduling_enabled: true,
+            dropoff_window: 12,
+            dropoff_capacity: 1,
+            lambda_density: 1.0,
+            lambda_choke: 1.5,
+            planner_budget_mode: mode,
+            planner_soft_budget_ms: 1_200,
+            planner_soft_budget_min_ms: 1_350,
+            planner_soft_budget_max_ms: 1_900,
+            planner_hard_budget_ms: 1_950,
+            planner_deadline_slack_ms: 80,
+            log_level: "info".to_owned(),
+            structured_bot_log: false,
+            ascii_render: false,
+            replay_dump_path: Option::<PathBuf>::None,
+            coord_claim_ttl_ticks: 10,
+            coord_reassign_no_progress_ticks: 8,
+            coord_goal_collapse_threshold: 4,
+            coord_max_bots_per_stand: 1,
+            coord_post_dropoff_retask_ticks: 6,
+            coord_area_balance_weight: 1.0,
+        }
+    }
+
+    #[test]
+    fn adaptive_budget_increases_with_congestion() {
+        let cfg = test_config(PlannerBudgetMode::Adaptive);
+        let low = compute_soft_budget_ms(
+            &cfg,
+            BudgetPressure {
+                blocked_bots_prev: 0,
+                stuck_bots_prev: 0,
+            },
+            10,
+        );
+        let high = compute_soft_budget_ms(
+            &cfg,
+            BudgetPressure {
+                blocked_bots_prev: 6,
+                stuck_bots_prev: 4,
+            },
+            10,
+        );
+        assert!(high > low);
+    }
+
+    #[test]
+    fn soft_plus_slack_never_exceeds_hard_budget() {
+        let mut cfg = test_config(PlannerBudgetMode::Adaptive);
+        cfg.planner_hard_budget_ms = 1_500;
+        cfg.planner_deadline_slack_ms = 120;
+        cfg.planner_soft_budget_max_ms = 1_900;
+        let soft = compute_soft_budget_ms(
+            &cfg,
+            BudgetPressure {
+                blocked_bots_prev: 20,
+                stuck_bots_prev: 20,
+            },
+            10,
+        );
+        assert!(soft + cfg.planner_deadline_slack_ms <= cfg.planner_hard_budget_ms);
+    }
+
+    #[test]
+    fn fixed_mode_preserves_legacy_behavior() {
+        let cfg = test_config(PlannerBudgetMode::Fixed);
+        let soft = compute_soft_budget_ms(
+            &cfg,
+            BudgetPressure {
+                blocked_bots_prev: 20,
+                stuck_bots_prev: 20,
+            },
+            10,
+        );
+        assert_eq!(soft, cfg.planner_soft_budget_ms);
     }
 }

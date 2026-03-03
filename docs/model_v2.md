@@ -13,6 +13,7 @@ Each mode can include:
 - `pickup` head: ridge-logit + sigmoid + temperature
 - `dropoff` head: ridge-logit + sigmoid + temperature
 - `ordering` head: ridge linear score (value proxy)
+- `ordering_sequence_head` (optional): pairwise-linear ordering utility used by PMAT-lite decode
 
 The runtime combined score is:
 
@@ -78,6 +79,18 @@ Labels are inferred with one-tick alignment via carrying deltas.
   "calibration": {
     "pickup_temp": 1.0,
     "dropoff_temp": 1.0
+  },
+  "ordering_sequence_head": {
+    "type": "pairwise_linear",
+    "feature_columns": ["..."],
+    "normalization": {"mean": [0.0], "std": [1.0]},
+    "bias": 0.0,
+    "weights": [0.0],
+    "temperature": 1.0,
+    "metrics": {
+      "pair_auc": 0.5,
+      "pair_logloss": 0.69
+    }
   }
 }
 ```
@@ -87,6 +100,26 @@ If v2 fields are missing, runtime falls back to v1 behavior:
 - legacy linear pick score (`weights`)
 - unchanged ordering scorer (`ordering_weights`)
 - v2 heads normalize over `runtime_feature_columns` when present, otherwise `feature_columns`
+- missing `ordering_sequence_head` cleanly falls back to heuristic + `ordering_weights`
+
+## Runtime Budgeting (2s-aware)
+Adaptive planning can use more of the server response window while preserving timeout safety.
+
+Config/env knobs:
+
+- `--planner-budget-mode` / `GROCERY_PLANNER_BUDGET_MODE` (`fixed|adaptive`)
+- `--planner-soft-budget-min-ms` / `GROCERY_PLANNER_SOFT_BUDGET_MIN_MS`
+- `--planner-soft-budget-max-ms` / `GROCERY_PLANNER_SOFT_BUDGET_MAX_MS`
+- `--planner-hard-budget-ms` / `GROCERY_PLANNER_HARD_BUDGET_MS`
+- `--planner-deadline-slack-ms` / `GROCERY_PLANNER_DEADLINE_SLACK_MS`
+
+Adaptive soft budget formula:
+
+`soft = clamp(min + 18*blocked_prev + 14*stuck_prev + 8*bot_count, min, max)`
+
+Then enforce:
+
+`soft + slack <= hard`
 
 ## Training + Eval Commands
 ```powershell
@@ -95,6 +128,7 @@ python -m training.featurize --data data/runs.parquet --out data/runs_features.p
 python -m training.train --mode expert --data data/runs_features.parquet --out models/expert.json --dedup-strategy downweight --signature-kind action --runtime-feature-set strict
 python -m training.evaluate --data data/runs_features.parquet --model models/expert.json --mode expert --reference-score 101 --candidate-score 85
 python -m training.export --models-dir models --out models/policy_artifacts.json
+python tools/sweep_eval.py --episodes 20 --mode-filter expert --out models/sweep_results.json
 ```
 
 ## Dedup Strategy
@@ -117,3 +151,12 @@ Use the Rust eval binary to print conversion KPIs and optional hard-fail gates:
 .\cargo-x64.cmd run --bin eval -- --from-logs --episodes 20 --mode-filter expert
 .\cargo-x64.cmd run --bin eval -- --from-logs --episodes 20 --mode-filter expert --enforce-gates
 ```
+
+## Reproducibility Contract
+For every promoted artifact, log and keep:
+
+- git commit hash (`build_version`)
+- artifact path + schema version + mode count
+- seed / eval profile / planner budget settings
+- gate profile and gate results
+- sweep objective and selected parameter tuple

@@ -359,15 +359,24 @@ def main() -> None:
         + 0.3 * frame.get("coverage_gain", 0).astype(float)
     )
     frame["wait_reason"] = frame.get("wait_reason", "intent_wait").astype(str)
-    for reason in [
+    wait_reason_values = [
         "blocked_by_vertex_reservation",
         "blocked_by_edge_reservation",
         "forbidden_queue_zone",
         "prohibited_repeat_move",
         "no_path_with_constraints",
         "timeout_fallback",
-    ]:
-        frame[f"wait_reason_{reason}"] = (frame["wait_reason"] == reason).astype(int)
+    ]
+    wait_reason_cols = {
+        f"wait_reason_{reason}": (frame["wait_reason"] == reason).astype(np.int8)
+        for reason in wait_reason_values
+    }
+    frame = pd.concat(
+        [frame, pd.DataFrame(wait_reason_cols, index=frame.index)],
+        axis=1,
+    )
+    # Defragment before heavy vectorized ops to avoid pandas fragmentation warnings.
+    frame = frame.copy()
     frame["reward_proxy"] = reward_proxy(frame)
     frame = compute_reliability_features(frame)
     frame = ensure_columns(frame, CONVERSION_LABEL_COLUMNS, default=0.0)

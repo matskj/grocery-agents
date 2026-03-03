@@ -9,16 +9,28 @@ import numpy as np
 import pandas as pd
 
 from .common import (
+    ACTION_SIGNATURE_COLUMNS,
     CONVERSION_LABEL_COLUMNS,
     FEATURE_COLUMNS,
     ORDERING_FEATURE_COLUMNS,
     SCHEMA_VERSION,
+    STATE_ACTION_SIGNATURE_EXTRA_COLUMNS,
+    build_run_signature_map,
     ensure_columns,
     read_table,
+    signature_cluster_sizes,
 )
 
 
 def split_train_validation(frame: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    if "run_signature" in frame.columns:
+        signatures = sorted(frame["run_signature"].dropna().astype(str).unique().tolist())
+        if len(signatures) > 1:
+            cut = max(1, int(len(signatures) * 0.8))
+            train_sigs = set(signatures[:cut])
+            train = frame[frame["run_signature"].isin(train_sigs)].copy()
+            val = frame[~frame["run_signature"].isin(train_sigs)].copy()
+            return train, val
     run_ids = sorted(frame["run_id"].dropna().unique().tolist())
     if len(run_ids) <= 1:
         return frame, frame.iloc[0:0]
@@ -29,13 +41,23 @@ def split_train_validation(frame: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFr
     return train, val
 
 
-def ridge_fit(features: np.ndarray, targets: np.ndarray, alpha: float) -> np.ndarray:
+def ridge_fit(
+    features: np.ndarray,
+    targets: np.ndarray,
+    alpha: float,
+    sample_weight: np.ndarray | None = None,
+) -> np.ndarray:
     ones = np.ones((features.shape[0], 1), dtype=float)
     x = np.hstack([ones, features])
+    y = targets
+    if sample_weight is not None and sample_weight.size == features.shape[0]:
+        w = np.sqrt(np.clip(sample_weight.astype(float), 1e-6, None))
+        x = x * w[:, None]
+        y = y * w
     xtx = x.T @ x
     reg = np.eye(xtx.shape[0], dtype=float) * alpha
     reg[0, 0] = 0.0
-    w = np.linalg.solve(xtx + reg, x.T @ targets)
+    w = np.linalg.solve(xtx + reg, x.T @ y)
     return w
 
 
@@ -115,13 +137,19 @@ def fit_binary_prob_head(
     x_val: np.ndarray,
     y_val: np.ndarray,
     alpha: float,
+    sample_weight_train: np.ndarray | None = None,
     clip: float = 8.0,
 ) -> Tuple[Dict, Dict[str, float]]:
     if x_train.size == 0 or y_train.size == 0:
         weights = np.zeros((x_train.shape[1] + 1 if x_train.ndim == 2 else 1,), dtype=float)
         logits_val = np.zeros_like(y_val, dtype=float)
     else:
-        weights = ridge_fit(x_train, y_train, alpha=alpha)
+        weights = ridge_fit(
+            x_train,
+            y_train,
+            alpha=alpha,
+            sample_weight=sample_weight_train,
+        )
         logits_val = predict(weights, x_val) if x_val.size else np.zeros((0,), dtype=float)
     temp = fit_temperature(logits_val, y_val)
     probs_val = sigmoid(np.clip(logits_val, -clip, clip) / temp) if logits_val.size else np.zeros((0,))
@@ -141,6 +169,79 @@ def fit_binary_prob_head(
     return head, head_metrics
 
 
+def apply_run_dedup(
+    frame: pd.DataFrame,
+    strategy: str,
+    signature_kind: str,
+) -> Tuple[pd.DataFrame, Dict[str, object]]:
+    if frame.empty or "run_id" not in frame.columns:
+        out = frame.copy()
+        out["run_signature"] = ""
+        out["sample_weight"] = 1.0
+        return out, {
+            "strategy": strategy,
+            "signature_kind": signature_kind,
+            "runs_total": 0,
+            "runs_kept": 0,
+            "signature_clusters": 0,
+            "duplicated_clusters": 0,
+            "duplicate_runs": 0,
+            "max_cluster_size": 0,
+            "signature_columns": ACTION_SIGNATURE_COLUMNS,
+        }
+
+    signature_by_run = build_run_signature_map(frame, signature_kind=signature_kind)
+    cluster_sizes = signature_cluster_sizes(signature_by_run)
+    cluster_counts = np.array(list(cluster_sizes.values()), dtype=int)
+    duplicated_clusters = int((cluster_counts > 1).sum()) if cluster_counts.size else 0
+    duplicate_runs = int(cluster_counts[cluster_counts > 1].sum() - duplicated_clusters) if cluster_counts.size else 0
+
+    run_ids = sorted(signature_by_run.keys())
+    kept_run_ids = run_ids
+    if strategy == "drop":
+        seen = set()
+        kept: list[str] = []
+        for run_id in run_ids:
+            signature = signature_by_run[run_id]
+            if signature in seen:
+                continue
+            seen.add(signature)
+            kept.append(run_id)
+        kept_run_ids = kept
+
+    out = frame[frame["run_id"].astype(str).isin(set(kept_run_ids))].copy()
+    out["run_signature"] = out["run_id"].astype(str).map(signature_by_run).fillna("")
+
+    if strategy == "downweight":
+        run_weight = {
+            run_id: 1.0 / float(max(1, cluster_sizes.get(signature_by_run[run_id], 1)))
+            for run_id in kept_run_ids
+        }
+    else:
+        run_weight = {run_id: 1.0 for run_id in kept_run_ids}
+    out["sample_weight"] = (
+        out["run_id"].astype(str).map(run_weight).fillna(1.0).astype(float).clip(lower=1e-6)
+    )
+
+    signature_columns = list(ACTION_SIGNATURE_COLUMNS)
+    if signature_kind == "state_action":
+        signature_columns.extend(STATE_ACTION_SIGNATURE_EXTRA_COLUMNS)
+    dedup = {
+        "strategy": strategy,
+        "signature_kind": signature_kind,
+        "runs_total": int(len(run_ids)),
+        "runs_kept": int(len(kept_run_ids)),
+        "signature_clusters": int(len(cluster_sizes)),
+        "duplicated_clusters": duplicated_clusters,
+        "duplicate_runs": duplicate_runs,
+        "max_cluster_size": int(cluster_counts.max()) if cluster_counts.size else 0,
+        "top_cluster_sizes": [int(v) for v in sorted(cluster_sizes.values(), reverse=True)[:5]],
+        "effective_run_weight_sum": float(sum(run_weight.values())),
+        "signature_columns": signature_columns,
+    }
+    return out, dedup
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train a per-mode linear scorer.")
     parser.add_argument("--mode", required=True, choices=["easy", "medium", "hard", "expert", "custom"])
@@ -148,6 +249,18 @@ def main() -> None:
     parser.add_argument("--out", required=True)
     parser.add_argument("--alpha", type=float, default=1.0)
     parser.add_argument("--min-rows", type=int, default=50)
+    parser.add_argument(
+        "--dedup-strategy",
+        choices=["none", "downweight", "drop"],
+        default="downweight",
+        help="Handle near-identical runs via action/state-action signatures.",
+    )
+    parser.add_argument(
+        "--signature-kind",
+        choices=["action", "state_action"],
+        default="action",
+        help="Signature basis for run deduplication.",
+    )
     args = parser.parse_args()
 
     frame = read_table(Path(args.data))
@@ -164,11 +277,17 @@ def main() -> None:
     frame = ensure_columns(frame, FEATURE_COLUMNS, default=0.0)
     frame = ensure_columns(frame, ORDERING_FEATURE_COLUMNS, default=0.0)
     frame = frame.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    frame, dedup = apply_run_dedup(frame, args.dedup_strategy, args.signature_kind)
+    if frame.empty or len(frame) < args.min_rows:
+        raise SystemExit(
+            f"not enough rows after dedup for mode={args.mode}: {len(frame)} (min={args.min_rows})"
+        )
 
     train, val = split_train_validation(frame)
+    train_weights = train.get("sample_weight", pd.Series(np.ones(len(train)))).to_numpy(dtype=float)
     x_train = train[FEATURE_COLUMNS].to_numpy(dtype=float)
     y_train = train["n_step_return"].to_numpy(dtype=float)
-    weights = ridge_fit(x_train, y_train, alpha=args.alpha)
+    weights = ridge_fit(x_train, y_train, alpha=args.alpha, sample_weight=train_weights)
 
     x_val = val[FEATURE_COLUMNS].to_numpy(dtype=float) if not val.empty else np.zeros((0, len(FEATURE_COLUMNS)))
     y_val = val["n_step_return"].to_numpy(dtype=float) if not val.empty else np.zeros((0,))
@@ -180,7 +299,12 @@ def main() -> None:
 
     x_order = train[ORDERING_FEATURE_COLUMNS].to_numpy(dtype=float)
     y_order = train["ordering_target"].to_numpy(dtype=float)
-    ordering_weights_raw = ridge_fit(x_order, y_order, alpha=args.alpha)
+    ordering_weights_raw = ridge_fit(
+        x_order,
+        y_order,
+        alpha=args.alpha,
+        sample_weight=train_weights,
+    )
     named_ordering_weights = {"bias": float(ordering_weights_raw[0])}
     for idx, name in enumerate(ORDERING_FEATURE_COLUMNS, start=1):
         named_ordering_weights[name] = float(ordering_weights_raw[idx])
@@ -206,6 +330,7 @@ def main() -> None:
         x_val_v2[pickup_val_mask] if x_val_v2.size else np.zeros((0, len(FEATURE_COLUMNS))),
         val["pickup_success"].to_numpy(dtype=float)[pickup_val_mask] if not val.empty else np.zeros((0,)),
         alpha=args.alpha,
+        sample_weight_train=train_weights[pickup_train_mask],
     )
     dropoff_head, dropoff_metrics = fit_binary_prob_head(
         x_train_v2[dropoff_train_mask],
@@ -213,11 +338,13 @@ def main() -> None:
         x_val_v2[dropoff_val_mask] if x_val_v2.size else np.zeros((0, len(FEATURE_COLUMNS))),
         val["dropoff_success"].to_numpy(dtype=float)[dropoff_val_mask] if not val.empty else np.zeros((0,)),
         alpha=args.alpha,
+        sample_weight_train=train_weights[dropoff_train_mask],
     )
     ordering_head_raw = ridge_fit(
         x_train_v2,
         train["ordering_target"].to_numpy(dtype=float),
         alpha=args.alpha,
+        sample_weight=train_weights,
     )
     ordering_val_pred = (
         predict(ordering_head_raw, x_val_v2) if x_val_v2.size else np.zeros((0,), dtype=float)
@@ -257,6 +384,7 @@ def main() -> None:
             "rows_validation": int(len(val)),
             **metrics(y_val, y_hat),
         },
+        "dedup": dedup,
         "metrics_v2": {
             "pickup": pickup_metrics,
             "dropoff": dropoff_metrics,

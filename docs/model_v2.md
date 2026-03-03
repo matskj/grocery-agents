@@ -90,10 +90,23 @@ If v2 fields are missing, runtime falls back to v1 behavior:
 ```powershell
 python -m training.extract --logs-dir logs --out data/runs.parquet
 python -m training.featurize --data data/runs.parquet --out data/runs_features.parquet --n-step 5
-python -m training.train --mode expert --data data/runs_features.parquet --out models/expert.json
-python -m training.evaluate --data data/runs_features.parquet --model models/expert.json --mode expert
+python -m training.train --mode expert --data data/runs_features.parquet --out models/expert.json --dedup-strategy downweight --signature-kind action
+python -m training.evaluate --data data/runs_features.parquet --model models/expert.json --mode expert --reference-score 101 --candidate-score 85
 python -m training.export --models-dir models --out models/policy_artifacts.json
 ```
+
+## Dedup Strategy
+`training.train` can control duplicate trajectories before fitting:
+
+- `--dedup-strategy none`: keep all runs with weight `1.0`
+- `--dedup-strategy downweight` (default): keep all runs, but each run gets weight `1 / cluster_size`
+- `--dedup-strategy drop`: keep one deterministic representative run per signature cluster
+
+Run signatures are deterministic and use:
+- `--signature-kind action`: action/goal trace only
+- `--signature-kind state_action`: action trace plus bot position/carrying state
+
+The trained model JSON now includes a `dedup` section with cluster stats and effective run weight.
 
 ## Eval Gates
 Use the Rust eval binary to print conversion KPIs and optional hard-fail gates:

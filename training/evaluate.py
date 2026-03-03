@@ -3,12 +3,19 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Optional
 
 import numpy as np
 import pandas as pd
 
-from .common import CONVERSION_LABEL_COLUMNS, FEATURE_COLUMNS, ensure_columns, read_table
+from .common import (
+    CONVERSION_LABEL_COLUMNS,
+    FEATURE_COLUMNS,
+    build_run_signature_map,
+    ensure_columns,
+    read_table,
+    signature_cluster_sizes,
+)
 
 
 def load_model(path: Path) -> Dict:
@@ -87,11 +94,107 @@ def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, float]:
     return {"mae": mae, "rmse": rmse, "r2": r2}
 
 
+def build_team_tick_frame(frame: pd.DataFrame) -> pd.DataFrame:
+    keep = frame.sort_values(["run_id", "tick", "bot_id"], kind="mergesort")
+    return keep.drop_duplicates(["run_id", "tick"], keep="first").copy()
+
+
+def summarize_runs(team_ticks: pd.DataFrame) -> pd.DataFrame:
+    if team_ticks.empty:
+        return pd.DataFrame(
+            columns=[
+                "run_id",
+                "final_score",
+                "items_delivered",
+                "orders_completed",
+                "ticks",
+                "delivered_per_100_ticks",
+            ]
+        )
+    grouped = team_ticks.groupby("run_id", sort=False)
+    out = grouped.agg(
+        final_score=("score", "max"),
+        items_delivered=("items_delivered_delta", "sum"),
+        orders_completed=("order_completed_delta", "sum"),
+        ticks=("tick", "max"),
+    ).reset_index()
+    out["ticks"] = out["ticks"].astype(int) + 1
+    out["delivered_per_100_ticks"] = (
+        out["items_delivered"].astype(float) * 100.0 / out["ticks"].clip(lower=1).astype(float)
+    )
+    return out
+
+
+def _expanded_event_ticks(group: pd.DataFrame, delta_col: str) -> list[int]:
+    ticks: list[int] = []
+    for tick, delta in zip(group["tick"].astype(int), group[delta_col].astype(int)):
+        for _ in range(max(0, delta)):
+            ticks.append(int(tick))
+    return ticks
+
+
+def run_completion_profile(team_ticks: pd.DataFrame, run_id: str) -> Dict[str, object]:
+    group = team_ticks[team_ticks["run_id"].astype(str) == str(run_id)].copy()
+    if group.empty:
+        return {}
+    group = group.sort_values("tick", kind="mergesort")
+    order_ticks = _expanded_event_ticks(group, "order_completed_delta")
+    item_ticks = _expanded_event_ticks(group, "items_delivered_delta")
+
+    order_gaps = np.diff(np.array(order_ticks, dtype=int)) if len(order_ticks) >= 2 else np.array([], dtype=int)
+    item_gaps = np.diff(np.array(item_ticks, dtype=int)) if len(item_ticks) >= 2 else np.array([], dtype=int)
+    return {
+        "run_id": str(run_id),
+        "final_score": int(group["score"].max()),
+        "items_delivered": int(group["items_delivered_delta"].sum()),
+        "orders_completed": int(group["order_completed_delta"].sum()),
+        "order_completion_ticks": [int(t) for t in order_ticks[:12]],
+        "item_delivery_ticks": [int(t) for t in item_ticks[:16]],
+        "order_completion_gap_mean": float(order_gaps.mean()) if order_gaps.size else 0.0,
+        "order_completion_gap_max": int(order_gaps.max()) if order_gaps.size else 0,
+        "item_delivery_gap_mean": float(item_gaps.mean()) if item_gaps.size else 0.0,
+        "item_delivery_gap_max": int(item_gaps.max()) if item_gaps.size else 0,
+    }
+
+
+def choose_run_id(
+    run_summary: pd.DataFrame,
+    preferred_run_id: Optional[str],
+    preferred_score: Optional[int],
+) -> Optional[str]:
+    if preferred_run_id:
+        run_id = str(preferred_run_id)
+        if run_id in set(run_summary["run_id"].astype(str)):
+            return run_id
+        return None
+    if preferred_score is None:
+        return None
+    score_matches = run_summary[run_summary["final_score"].astype(int) == int(preferred_score)].copy()
+    if score_matches.empty:
+        return None
+    score_matches = score_matches.sort_values(
+        ["orders_completed", "items_delivered", "run_id"],
+        ascending=[False, False, True],
+        kind="mergesort",
+    )
+    return str(score_matches.iloc[0]["run_id"])
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Evaluate a trained mode model.")
     parser.add_argument("--data", default="data/runs_features.parquet")
     parser.add_argument("--model", required=True)
     parser.add_argument("--mode", default=None)
+    parser.add_argument("--reference-run-id", default=None)
+    parser.add_argument("--candidate-run-id", default=None)
+    parser.add_argument("--reference-score", type=int, default=None)
+    parser.add_argument("--candidate-score", type=int, default=None)
+    parser.add_argument(
+        "--signature-kind",
+        choices=["action", "state_action"],
+        default="action",
+        help="Run-signature basis for duplicate-cluster diagnostics.",
+    )
     args = parser.parse_args()
 
     frame = read_table(Path(args.data))
@@ -116,6 +219,55 @@ def main() -> None:
         "rows": int(len(frame)),
         **compute_metrics(y_true, y_pred),
     }
+    team_ticks = build_team_tick_frame(frame)
+    run_summary = summarize_runs(team_ticks)
+    signature_by_run = build_run_signature_map(frame, signature_kind=args.signature_kind)
+    cluster_sizes = signature_cluster_sizes(signature_by_run)
+    cluster_counts = np.array(list(cluster_sizes.values()), dtype=int)
+    duplicated_clusters = int((cluster_counts > 1).sum()) if cluster_counts.size else 0
+    duplicate_runs = int(cluster_counts[cluster_counts > 1].sum() - duplicated_clusters) if cluster_counts.size else 0
+    best_run = (
+        run_summary.sort_values(
+            ["final_score", "orders_completed", "items_delivered", "run_id"],
+            ascending=[False, False, False, True],
+            kind="mergesort",
+        ).iloc[0]
+        if not run_summary.empty
+        else None
+    )
+    result["run_analysis"] = {
+        "runs": int(len(run_summary)),
+        "best_run_id": str(best_run["run_id"]) if best_run is not None else None,
+        "best_score": int(best_run["final_score"]) if best_run is not None else None,
+        "duplicate_signature_clusters": duplicated_clusters,
+        "duplicate_runs": duplicate_runs,
+        "top_cluster_sizes": [int(v) for v in sorted(cluster_sizes.values(), reverse=True)[:5]],
+    }
+
+    reference_run_id = choose_run_id(run_summary, args.reference_run_id, args.reference_score)
+    candidate_run_id = choose_run_id(run_summary, args.candidate_run_id, args.candidate_score)
+    if not reference_run_id and not candidate_run_id and not run_summary.empty:
+        auto_ref = choose_run_id(run_summary, None, 101)
+        auto_cand = choose_run_id(run_summary, None, 85)
+        if auto_ref and auto_cand:
+            reference_run_id = auto_ref
+            candidate_run_id = auto_cand
+    if reference_run_id and candidate_run_id:
+        ref_profile = run_completion_profile(team_ticks, reference_run_id)
+        cand_profile = run_completion_profile(team_ticks, candidate_run_id)
+        if ref_profile and cand_profile:
+            result["trajectory_diff"] = {
+                "reference": ref_profile,
+                "candidate": cand_profile,
+                "delta_items_delivered": int(ref_profile["items_delivered"]) - int(cand_profile["items_delivered"]),
+                "delta_orders_completed": int(ref_profile["orders_completed"]) - int(cand_profile["orders_completed"]),
+                "delta_score": int(ref_profile["final_score"]) - int(cand_profile["final_score"]),
+                "same_signature": bool(
+                    signature_by_run.get(reference_run_id, "") == signature_by_run.get(candidate_run_id, "")
+                    and signature_by_run.get(reference_run_id, "") != ""
+                ),
+            }
+
     feature_columns = model.get("feature_columns", [])
     heads = model.get("heads", {})
     normalization = model.get("normalization", {})

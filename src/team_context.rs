@@ -716,7 +716,7 @@ fn build_team_knowledge(
     items.sort_by(|a, b| a.id.cmp(&b.id));
 
     let mut kind_to_stands_set = HashMap::<String, HashSet<u16>>::new();
-    let mut stand_to_kind = HashMap::<u16, String>::new();
+    let mut stand_to_kinds_set = HashMap::<u16, HashSet<String>>::new();
     for item in items {
         let mut stands = map.stand_cells_for_item(&item.id).to_vec();
         stands.sort_unstable();
@@ -725,12 +725,10 @@ fn build_team_knowledge(
                 .entry(item.kind.clone())
                 .or_default()
                 .insert(stand);
-            match stand_to_kind.get(&stand) {
-                Some(existing) if existing <= &item.kind => {}
-                _ => {
-                    stand_to_kind.insert(stand, item.kind.clone());
-                }
-            }
+            stand_to_kinds_set
+                .entry(stand)
+                .or_default()
+                .insert(item.kind.clone());
         }
     }
     let mut kind_to_stands = HashMap::<String, Vec<u16>>::new();
@@ -764,6 +762,65 @@ fn build_team_knowledge(
     for (kind, missing) in &order_snapshot.active_remaining_by_item {
         let covered = effective_supply_by_kind.get(kind).copied().unwrap_or(0);
         active_gap_by_kind.insert(kind.clone(), (*missing as u16).saturating_sub(covered));
+    }
+
+    let mut stand_to_kind = HashMap::<u16, String>::new();
+    for (stand, kind_set) in stand_to_kinds_set {
+        let mut kinds = kind_set.into_iter().collect::<Vec<_>>();
+        kinds.sort();
+        kinds.sort_by(|a, b| {
+            let a_gap = active_gap_by_kind.get(a).copied().unwrap_or(0);
+            let b_gap = active_gap_by_kind.get(b).copied().unwrap_or(0);
+            let a_active_remaining = order_snapshot
+                .active_remaining_by_item
+                .get(a)
+                .copied()
+                .unwrap_or(0);
+            let b_active_remaining = order_snapshot
+                .active_remaining_by_item
+                .get(b)
+                .copied()
+                .unwrap_or(0);
+            let a_preview_remaining = order_snapshot
+                .preview_remaining_by_item
+                .get(a)
+                .copied()
+                .unwrap_or(0);
+            let b_preview_remaining = order_snapshot
+                .preview_remaining_by_item
+                .get(b)
+                .copied()
+                .unwrap_or(0);
+
+            let a_tier = if a_gap > 0 {
+                0
+            } else if a_active_remaining > 0 {
+                1
+            } else if a_preview_remaining > 0 {
+                2
+            } else {
+                3
+            };
+            let b_tier = if b_gap > 0 {
+                0
+            } else if b_active_remaining > 0 {
+                1
+            } else if b_preview_remaining > 0 {
+                2
+            } else {
+                3
+            };
+
+            a_tier
+                .cmp(&b_tier)
+                .then_with(|| b_gap.cmp(&a_gap))
+                .then_with(|| b_active_remaining.cmp(&a_active_remaining))
+                .then_with(|| b_preview_remaining.cmp(&a_preview_remaining))
+                .then_with(|| a.cmp(b))
+        });
+        if let Some(kind) = kinds.first() {
+            stand_to_kind.insert(stand, kind.clone());
+        }
     }
 
     TeamKnowledge {
@@ -1562,6 +1619,77 @@ mod tests {
         assert_ne!(
             ctx.knowledge.area_id_by_cell[left as usize],
             ctx.knowledge.area_id_by_cell[right as usize]
+        );
+    }
+
+    #[test]
+    fn stand_kind_prefers_active_gap_on_shared_stand() {
+        let state = GameState {
+            grid: Grid {
+                width: 8,
+                height: 6,
+                drop_off_tiles: vec![[1, 4]],
+                ..Grid::default()
+            },
+            bots: vec![BotState {
+                id: "0".to_owned(),
+                x: 6,
+                y: 4,
+                carrying: vec![],
+                capacity: 3,
+            }],
+            items: vec![
+                Item {
+                    id: "item_oats".to_owned(),
+                    kind: "oats".to_owned(),
+                    x: 2,
+                    y: 2,
+                },
+                Item {
+                    id: "item_apples".to_owned(),
+                    kind: "apples".to_owned(),
+                    x: 4,
+                    y: 2,
+                },
+            ],
+            orders: vec![
+                Order {
+                    id: "o_active".to_owned(),
+                    item_id: "oats".to_owned(),
+                    status: OrderStatus::InProgress,
+                },
+                Order {
+                    id: "o_preview".to_owned(),
+                    item_id: "apples".to_owned(),
+                    status: OrderStatus::Pending,
+                },
+            ],
+            ..GameState::default()
+        };
+        let world = World::new(state.clone());
+        let map = world.map();
+        let dist = DistanceMap::build(map);
+        let ctx = TeamContext::build(
+            &state,
+            map,
+            &dist,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            TeamContextConfig::default(),
+        );
+        let shared = map.idx(3, 2).expect("shared stand");
+        assert_eq!(
+            ctx.knowledge.stand_to_kind.get(&shared).map(String::as_str),
+            Some("oats")
         );
     }
 }

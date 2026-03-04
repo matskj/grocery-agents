@@ -268,6 +268,11 @@ impl AssignmentEngine {
                     if matches!(task.kind, TaskKind::CarryToDropoff) && !carrying_active {
                         return false;
                     }
+                    if carrying_active
+                        && matches!(task.kind, TaskKind::PickupStand | TaskKind::ImmediatePickup)
+                    {
+                        return false;
+                    }
                     if matches!(task.kind, TaskKind::PickupStand | TaskKind::ImmediatePickup)
                         && !bot_has_capacity
                     {
@@ -713,7 +718,12 @@ fn build_tasks(
         .copied()
         .map(usize::from)
         .sum::<usize>();
-    let preview_quota = preview_prefetch_quota(active_gap_total);
+    let active_missing_total = active_missing
+        .values()
+        .copied()
+        .map(usize::from)
+        .sum::<usize>();
+    let preview_quota = preview_prefetch_quota(active_gap_total, active_missing_total);
     let preview_enabled = preview_quota > 0 && !preview_missing.is_empty();
 
     let mut active_orders = state
@@ -1120,7 +1130,11 @@ fn avg_teammate_distance(bot: &BotState, bots: &[BotState]) -> f64 {
     }
 }
 
-fn preview_prefetch_quota(active_gap_total: usize) -> u16 {
+fn preview_prefetch_quota(active_gap_total: usize, active_missing_total: usize) -> u16 {
+    // Never let preview prefetch compete while the active order still needs deliveries.
+    if active_missing_total > 0 {
+        return 0;
+    }
     if active_gap_total == 0 {
         return 8;
     }

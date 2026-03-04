@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     hash::{Hash, Hasher},
     sync::{Arc, Mutex, OnceLock},
 };
@@ -23,6 +23,12 @@ pub struct MapCache {
     pub item_shelf_cells: Vec<u16>,
     pub item_stand_cells: Vec<SmallVec<[u16; 4]>>,
     pub item_by_id: HashMap<String, usize>,
+    pub dropoff_bfs: Vec<u16>,
+    pub choke_points: Vec<bool>,
+    pub intersection_points: Vec<bool>,
+    pub aisle_id_by_cell: Vec<u16>,
+    pub aisle_dropoff_dist: Vec<u16>,
+    pub aisle_vertical: Vec<bool>,
 }
 
 impl World {
@@ -63,6 +69,13 @@ impl MapCache {
             .get(item_id)
             .map(|ix| self.item_stand_cells[*ix].as_slice())
             .unwrap_or(&[])
+    }
+
+    pub fn is_choke_point(&self, idx: u16) -> bool {
+        self.choke_points
+            .get(idx as usize)
+            .copied()
+            .unwrap_or(false)
     }
 }
 
@@ -171,6 +184,84 @@ fn build_map_cache(state: &GameState) -> MapCache {
         }
     }
 
+    let mut dropoff_bfs = vec![u16::MAX; n];
+    if !dropoff_cells.is_empty() {
+        let mut queue = VecDeque::<u16>::new();
+        for &drop in &dropoff_cells {
+            dropoff_bfs[drop as usize] = 0;
+            queue.push_back(drop);
+        }
+        while let Some(cell) = queue.pop_front() {
+            let base = dropoff_bfs[cell as usize];
+            for &nb in &neighbors[cell as usize] {
+                if dropoff_bfs[nb as usize] != u16::MAX {
+                    continue;
+                }
+                dropoff_bfs[nb as usize] = base.saturating_add(1);
+                queue.push_back(nb);
+            }
+        }
+    }
+
+    let mut choke_points = vec![false; n];
+    let mut intersection_points = vec![false; n];
+    for idx in 0..n {
+        if wall_mask[idx] {
+            continue;
+        }
+        let deg = neighbors[idx].len();
+        choke_points[idx] = deg <= 2;
+        intersection_points[idx] = deg >= 3;
+    }
+
+    let mut aisle_id_by_cell = vec![u16::MAX; n];
+    let mut aisle_dropoff_dist = Vec::<u16>::new();
+    let mut aisle_vertical = Vec::<bool>::new();
+    let mut next_aisle_id = 0u16;
+    for idx in 0..n {
+        if wall_mask[idx]
+            || intersection_points[idx]
+            || neighbors[idx].len() > 2
+            || aisle_id_by_cell[idx] != u16::MAX
+        {
+            continue;
+        }
+        let mut stack = vec![idx as u16];
+        let mut cells = Vec::<u16>::new();
+        aisle_id_by_cell[idx] = next_aisle_id;
+        while let Some(cell) = stack.pop() {
+            cells.push(cell);
+            for &nb in &neighbors[cell as usize] {
+                let nb_usize = nb as usize;
+                if wall_mask[nb_usize]
+                    || intersection_points[nb_usize]
+                    || neighbors[nb_usize].len() > 2
+                    || aisle_id_by_cell[nb_usize] != u16::MAX
+                {
+                    continue;
+                }
+                aisle_id_by_cell[nb_usize] = next_aisle_id;
+                stack.push(nb);
+            }
+        }
+        let mut min_drop = u16::MAX;
+        let mut min_x = i32::MAX;
+        let mut max_x = i32::MIN;
+        let mut min_y = i32::MAX;
+        let mut max_y = i32::MIN;
+        for &cell in &cells {
+            min_drop = min_drop.min(dropoff_bfs[cell as usize]);
+            let (x, y) = ((cell as i32) % width, (cell as i32) / width);
+            min_x = min_x.min(x);
+            max_x = max_x.max(x);
+            min_y = min_y.min(y);
+            max_y = max_y.max(y);
+        }
+        aisle_dropoff_dist.push(min_drop);
+        aisle_vertical.push((max_y - min_y) >= (max_x - min_x));
+        next_aisle_id = next_aisle_id.saturating_add(1);
+    }
+
     let mut item_shelf_cells = Vec::with_capacity(state.items.len());
     let mut item_stand_cells = Vec::with_capacity(state.items.len());
     let mut item_by_id = HashMap::with_capacity(state.items.len());
@@ -211,6 +302,12 @@ fn build_map_cache(state: &GameState) -> MapCache {
         item_shelf_cells,
         item_stand_cells,
         item_by_id,
+        dropoff_bfs,
+        choke_points,
+        intersection_points,
+        aisle_id_by_cell,
+        aisle_dropoff_dist,
+        aisle_vertical,
     }
 }
 

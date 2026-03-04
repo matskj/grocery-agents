@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     fs::{create_dir_all, File, OpenOptions},
-    io::Write,
+    io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
     process::Command,
     sync::{mpsc, Arc, OnceLock},
@@ -22,6 +22,7 @@ use crate::{
     config::{Config, PlannerBudgetMode},
     dispatcher::Dispatcher,
     dist::DistanceMap,
+    metrics::MetricsTracker,
     model::{
         to_wire_action_envelope, Action, ActionEnvelope, BotState, GameOver, GameState,
         OrderStatus, RuntimeContext, WireServerMessage,
@@ -33,6 +34,20 @@ use crate::{
 
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 const LOG_SCHEMA_VERSION: &str = "1.3.0";
+
+#[derive(Debug, Clone, Default)]
+pub struct ReplaySummary {
+    pub ticks: u64,
+    pub total_score: i64,
+    pub orders_completed: u64,
+    pub items_delivered: u64,
+    pub avg_planning_time_ms: f64,
+    pub p95_planning_time_ms: u64,
+    pub wait_actions: u64,
+    pub invalid_actions_corrected: u64,
+    pub estimated_rounds_in_120s: u64,
+    pub avg_order_rounds_to_complete: f64,
+}
 
 #[derive(Debug, serde::Deserialize)]
 #[serde(untagged)]
@@ -101,6 +116,7 @@ struct PlannerManager {
     request_tx: mpsc::Sender<PlannerWorkerMsg>,
     response_rx: mpsc::Receiver<PlanResponse>,
     pending_by_seq: HashMap<u64, PlanResponse>,
+    last_result: Option<PlanRoundResult>,
     worker: Option<JoinHandle<()>>,
 }
 
@@ -144,6 +160,7 @@ impl PlannerManager {
             request_tx,
             response_rx,
             pending_by_seq: HashMap::new(),
+            last_result: None,
             worker,
         }
     }
@@ -175,7 +192,51 @@ impl PlannerManager {
 
     fn take(&mut self, seq: u64) -> Option<PlanResponse> {
         self.poll();
-        self.pending_by_seq.remove(&seq)
+        let resp = self.pending_by_seq.remove(&seq)?;
+        self.last_result = Some(resp.result.clone());
+        Some(resp)
+    }
+
+    fn cached_for_state(&self, state: &GameState) -> Option<PlanRoundResult> {
+        let last = self.last_result.as_ref()?;
+        if last.actions.is_empty() || state.bots.is_empty() {
+            return None;
+        }
+        let mut action_by_bot = HashMap::<&str, Action>::new();
+        for action in &last.actions {
+            action_by_bot.insert(action.bot_id(), action.clone());
+        }
+        let mut out = Vec::with_capacity(state.bots.len());
+        for bot in &state.bots {
+            let candidate = action_by_bot
+                .get(bot.id.as_str())
+                .cloned()
+                .unwrap_or_else(|| Action::wait(bot.id.clone()));
+            let (validated, invalid) = validate_action(candidate, state, bot);
+            if invalid {
+                return None;
+            }
+            out.push(validated);
+        }
+        let mut telemetry = last.team_telemetry.clone();
+        if let Some(obj) = telemetry.as_object_mut() {
+            obj.insert(
+                "fallback_level".to_owned(),
+                serde_json::Value::String("cached".to_owned()),
+            );
+        }
+        Some(PlanRoundResult {
+            actions: out,
+            invalid_action_count: 0,
+            team_telemetry: telemetry,
+            action_validated_by_bot: state
+                .bots
+                .iter()
+                .map(|bot| (bot.id.clone(), true))
+                .collect(),
+            plan_ms: 0,
+            assign_ms: last.assign_ms,
+        })
     }
 }
 
@@ -303,6 +364,28 @@ pub async fn run_game_loop(
                     ServerMessage::Wire(WireServerMessage::GameOver(wire_game_over)) => {
                         let game_over = GameOver::from_wire(wire_game_over);
                         let reason = game_over.reason.clone();
+                        let metrics_summary = run_logger.metrics_summary_json();
+                        let metrics_summary_for_log = metrics_summary.clone();
+                        let p95_ms = metrics_summary
+                            .get("p95_planning_time_ms")
+                            .and_then(serde_json::Value::as_u64)
+                            .unwrap_or(0);
+                        let avg_order_rounds = metrics_summary
+                            .get("order_metrics")
+                            .and_then(serde_json::Value::as_array)
+                            .map(|rows| {
+                                if rows.is_empty() {
+                                    0.0
+                                } else {
+                                    rows.iter()
+                                        .filter_map(|r| r.get("rounds_to_complete"))
+                                        .filter_map(serde_json::Value::as_u64)
+                                        .map(|v| v as f64)
+                                        .sum::<f64>()
+                                        / rows.len() as f64
+                                }
+                            })
+                            .unwrap_or(0.0);
                         run_logger.log(
                             "game_over",
                             serde_json::json!({
@@ -310,7 +393,25 @@ pub async fn run_game_loop(
                                 "final_score": game_over.final_score,
                                 "reason": reason,
                                 "episode_counters": run_logger.episode_counters_json(),
+                                "game_metrics": metrics_summary_for_log,
                             }),
+                        );
+                        if p95_ms > 100 {
+                            warn!(
+                                p95_planning_time_ms = p95_ms,
+                                "planning p95 exceeded 100ms target"
+                            );
+                        }
+                        println!(
+                            "game_end score={} orders={} items={} avg_order_rounds={:.2} avg_plan_ms={:.2} p95_plan_ms={} waits={} invalid_fixed={}",
+                            metrics_summary.get("total_score").and_then(serde_json::Value::as_i64).unwrap_or(game_over.final_score),
+                            metrics_summary.get("orders_completed").and_then(serde_json::Value::as_u64).unwrap_or(0),
+                            metrics_summary.get("items_delivered").and_then(serde_json::Value::as_u64).unwrap_or(0),
+                            avg_order_rounds,
+                            metrics_summary.get("avg_planning_time_ms").and_then(serde_json::Value::as_f64).unwrap_or(0.0),
+                            p95_ms,
+                            metrics_summary.get("wait_actions").and_then(serde_json::Value::as_u64).unwrap_or(0),
+                            metrics_summary.get("corrected_invalid_actions").and_then(serde_json::Value::as_u64).unwrap_or(0),
                         );
                         info!(
                             final_score = game_over.final_score,
@@ -322,6 +423,28 @@ pub async fn run_game_loop(
                     ServerMessage::LegacyGameOverEnvelope { game_over }
                     | ServerMessage::LegacyGameOver(game_over) => {
                         let reason = game_over.reason.clone();
+                        let metrics_summary = run_logger.metrics_summary_json();
+                        let metrics_summary_for_log = metrics_summary.clone();
+                        let p95_ms = metrics_summary
+                            .get("p95_planning_time_ms")
+                            .and_then(serde_json::Value::as_u64)
+                            .unwrap_or(0);
+                        let avg_order_rounds = metrics_summary
+                            .get("order_metrics")
+                            .and_then(serde_json::Value::as_array)
+                            .map(|rows| {
+                                if rows.is_empty() {
+                                    0.0
+                                } else {
+                                    rows.iter()
+                                        .filter_map(|r| r.get("rounds_to_complete"))
+                                        .filter_map(serde_json::Value::as_u64)
+                                        .map(|v| v as f64)
+                                        .sum::<f64>()
+                                        / rows.len() as f64
+                                }
+                            })
+                            .unwrap_or(0.0);
                         run_logger.log(
                             "game_over",
                             serde_json::json!({
@@ -329,7 +452,25 @@ pub async fn run_game_loop(
                                 "final_score": game_over.final_score,
                                 "reason": reason,
                                 "episode_counters": run_logger.episode_counters_json(),
+                                "game_metrics": metrics_summary_for_log,
                             }),
+                        );
+                        if p95_ms > 100 {
+                            warn!(
+                                p95_planning_time_ms = p95_ms,
+                                "planning p95 exceeded 100ms target"
+                            );
+                        }
+                        println!(
+                            "game_end score={} orders={} items={} avg_order_rounds={:.2} avg_plan_ms={:.2} p95_plan_ms={} waits={} invalid_fixed={}",
+                            metrics_summary.get("total_score").and_then(serde_json::Value::as_i64).unwrap_or(game_over.final_score),
+                            metrics_summary.get("orders_completed").and_then(serde_json::Value::as_u64).unwrap_or(0),
+                            metrics_summary.get("items_delivered").and_then(serde_json::Value::as_u64).unwrap_or(0),
+                            avg_order_rounds,
+                            metrics_summary.get("avg_planning_time_ms").and_then(serde_json::Value::as_f64).unwrap_or(0.0),
+                            p95_ms,
+                            metrics_summary.get("wait_actions").and_then(serde_json::Value::as_u64).unwrap_or(0),
+                            metrics_summary.get("corrected_invalid_actions").and_then(serde_json::Value::as_u64).unwrap_or(0),
                         );
                         info!(
                             final_score = game_over.final_score,
@@ -371,6 +512,113 @@ pub async fn run_game_loop(
     Ok(())
 }
 
+pub fn run_replay_file(
+    replay_path: &Path,
+    mut policy: Policy,
+    config: Arc<Config>,
+) -> Result<ReplaySummary, Box<dyn std::error::Error>> {
+    let file = File::open(replay_path)?;
+    let reader = BufReader::new(file);
+    let dispatcher = Dispatcher::new();
+    let mut metrics = MetricsTracker::default();
+    let mut prev_score = None::<i64>;
+    let mut prev_active_index = None::<i64>;
+    let mut ticks = 0u64;
+
+    for line in reader.lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Ok(record) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        let Some(state) = replay_state_from_record(&record) else {
+            continue;
+        };
+        ticks = ticks.saturating_add(1);
+
+        let started = Instant::now();
+        let mut planned =
+            plan_round_actions(&mut policy, &dispatcher, &state, config.tick_soft_budget_ms);
+        if started.elapsed() > Duration::from_millis(config.tick_hard_budget_ms) {
+            planned = fallback_safe_actions(&state, config.tick_soft_budget_ms);
+            if let Some(obj) = planned.team_telemetry.as_object_mut() {
+                obj.insert(
+                    "fallback_level".to_owned(),
+                    serde_json::Value::String("wait".to_owned()),
+                );
+            }
+        }
+
+        let delta_score = prev_score.map(|v| state.score - v).unwrap_or(0);
+        prev_score = Some(state.score);
+        let order_completed_delta = prev_active_index
+            .map(|v| (state.active_order_index - v).max(0))
+            .unwrap_or(0);
+        prev_active_index = Some(state.active_order_index);
+        let items_delivered_delta = (delta_score - 5 * order_completed_delta).max(0);
+        let tick_outcome = serde_json::json!({
+            "delta_score": delta_score,
+            "items_delivered_delta": items_delivered_delta,
+            "order_completed_delta": order_completed_delta,
+            "invalid_action_count": planned.invalid_action_count,
+        });
+        metrics.on_tick(
+            &state,
+            &planned.actions,
+            &planned.team_telemetry,
+            &tick_outcome,
+            planned.plan_ms,
+        );
+    }
+
+    let summary = metrics.summary();
+    let estimated_rounds = if summary.avg_planning_time_ms > 0.0 {
+        ((120_000.0 / summary.avg_planning_time_ms).floor() as u64).min(300)
+    } else {
+        0
+    };
+    let avg_order_rounds_to_complete = if summary.order_metrics.is_empty() {
+        0.0
+    } else {
+        summary
+            .order_metrics
+            .iter()
+            .map(|m| m.rounds_to_complete as f64)
+            .sum::<f64>()
+            / summary.order_metrics.len() as f64
+    };
+    Ok(ReplaySummary {
+        ticks,
+        total_score: summary.total_score,
+        orders_completed: summary.orders_completed,
+        items_delivered: summary.items_delivered,
+        avg_planning_time_ms: summary.avg_planning_time_ms,
+        p95_planning_time_ms: summary.p95_planning_time_ms,
+        wait_actions: summary.wait_actions,
+        invalid_actions_corrected: summary.corrected_invalid_actions,
+        estimated_rounds_in_120s: estimated_rounds,
+        avg_order_rounds_to_complete,
+    })
+}
+
+fn replay_state_from_record(record: &serde_json::Value) -> Option<GameState> {
+    let event = record.get("event").and_then(serde_json::Value::as_str)?;
+    match event {
+        "tick_replay" => record
+            .get("game_state")
+            .cloned()
+            .and_then(|v| serde_json::from_value(v).ok()),
+        "tick" => record
+            .get("data")
+            .and_then(|d| d.get("game_state"))
+            .cloned()
+            .and_then(|v| serde_json::from_value(v).ok()),
+        _ => None,
+    }
+}
+
 async fn handle_game_state(
     socket: &mut WsStream,
     planner: &mut PlannerManager,
@@ -397,24 +645,13 @@ async fn handle_game_state(
     let soft_budget_ms = budget.soft_ms;
     let hard_budget = Duration::from_millis(budget.hard_ms);
     let plan_started = Instant::now();
-    let mut planned = None::<PlanRoundResult>;
+    let mut planned = planner.cached_for_state(&game_state);
     let mut worker_plan_ms = 0u64;
-    if let Some(req_seq) = planner.submit(&game_state, soft_budget_ms) {
-        let soft_deadline =
-            plan_started + Duration::from_millis(soft_budget_ms.max(1).min(budget.hard_ms.max(1)));
-        while Instant::now() < soft_deadline {
-            if let Some(resp) = planner.take(req_seq) {
-                if resp.tick == game_state.tick {
-                    worker_plan_ms = resp.worker_plan_ms;
-                    planned = Some(resp.result);
-                }
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(1)).await;
-        }
-        if planned.is_none() {
-            let hard_deadline = plan_started + hard_budget;
-            while Instant::now() < hard_deadline {
+    if planned.is_none() {
+        if let Some(req_seq) = planner.submit(&game_state, soft_budget_ms) {
+            let soft_deadline = plan_started
+                + Duration::from_millis(soft_budget_ms.max(1).min(budget.hard_ms.max(1)));
+            while Instant::now() < soft_deadline {
                 if let Some(resp) = planner.take(req_seq) {
                     if resp.tick == game_state.tick {
                         worker_plan_ms = resp.worker_plan_ms;
@@ -441,7 +678,7 @@ async fn handle_game_state(
                 "time-budget event: fallback greedy-safe envelope emitted"
             );
         }
-        fallback_safe_actions(&game_state, soft_budget_ms)
+        fallback_safe_actions(&game_state, config.tick_greedy_fallback_ms)
     });
     if let Some(obj) = planned.team_telemetry.as_object_mut() {
         obj.insert(
@@ -470,6 +707,7 @@ async fn handle_game_state(
         &envelope.actions,
         planned.invalid_action_count,
         &planned.team_telemetry,
+        planned.plan_ms,
     );
     if config.structured_bot_log {
         log_structured_bot_ticks(run_logger, &game_state, &envelope.actions, &planned);
@@ -478,6 +716,16 @@ async fn handle_game_state(
         let frame = render_ascii_frame(&game_state, &envelope.actions, &planned.team_telemetry);
         run_logger.log(
             "ascii_render",
+            serde_json::json!({
+                "tick": game_state.tick,
+                "frame": frame,
+            }),
+        );
+    }
+    if config.debug {
+        let frame = render_debug_overlay(&game_state, &planned.team_telemetry);
+        run_logger.log(
+            "debug_overlay",
             serde_json::json!({
                 "tick": game_state.tick,
                 "frame": frame,
@@ -609,7 +857,6 @@ struct RunLogger {
     replay_dump_file: Option<File>,
     run_id: String,
     last_score: Option<i64>,
-    last_items_remaining: Option<i64>,
     last_active_order_index: Option<i64>,
     prev_positions: HashMap<String, (i32, i32)>,
     blocked_ticks: HashMap<String, u8>,
@@ -622,6 +869,7 @@ struct RunLogger {
     episode_blocked_events: u64,
     episode_near_dropoff_congestion_events: u64,
     episode_started_at: Option<Instant>,
+    metrics: MetricsTracker,
 }
 
 impl RunLogger {
@@ -636,7 +884,6 @@ impl RunLogger {
                 replay_dump_file: None,
                 run_id: format!("run-{}", now_unix_millis()),
                 last_score: None,
-                last_items_remaining: None,
                 last_active_order_index: None,
                 prev_positions: HashMap::new(),
                 blocked_ticks: HashMap::new(),
@@ -649,6 +896,7 @@ impl RunLogger {
                 episode_blocked_events: 0,
                 episode_near_dropoff_congestion_events: 0,
                 episode_started_at: None,
+                metrics: MetricsTracker::default(),
             };
         }
 
@@ -665,7 +913,6 @@ impl RunLogger {
                     replay_dump_file: None,
                     run_id,
                     last_score: None,
-                    last_items_remaining: None,
                     last_active_order_index: None,
                     prev_positions: HashMap::new(),
                     blocked_ticks: HashMap::new(),
@@ -678,6 +925,7 @@ impl RunLogger {
                     episode_blocked_events: 0,
                     episode_near_dropoff_congestion_events: 0,
                     episode_started_at: None,
+                    metrics: MetricsTracker::default(),
                 };
             }
         };
@@ -735,7 +983,6 @@ impl RunLogger {
             replay_dump_file,
             run_id,
             last_score: None,
-            last_items_remaining: None,
             last_active_order_index: None,
             prev_positions: HashMap::new(),
             blocked_ticks: HashMap::new(),
@@ -748,6 +995,7 @@ impl RunLogger {
             episode_blocked_events: 0,
             episode_near_dropoff_congestion_events: 0,
             episode_started_at: None,
+            metrics: MetricsTracker::default(),
         }
     }
 
@@ -815,6 +1063,10 @@ impl RunLogger {
         let Some(file) = self.replay_dump_file.as_mut() else {
             return;
         };
+        let planning_time_ms = team_telemetry
+            .get("plan_ms")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
         let record = serde_json::json!({
             "event": "tick_replay",
             "run_id": self.run_id,
@@ -823,7 +1075,7 @@ impl RunLogger {
             "tick": state.tick,
             "game_state": state,
             "actions": actions,
-            "team_telemetry": team_telemetry,
+            "planning_time_ms": planning_time_ms,
         });
         match serde_json::to_string(&record) {
             Ok(line) => {
@@ -849,12 +1101,37 @@ impl RunLogger {
         })
     }
 
+    fn metrics_summary_json(&self) -> serde_json::Value {
+        let summary = self.metrics.summary();
+        serde_json::json!({
+            "total_score": summary.total_score,
+            "orders_completed": summary.orders_completed,
+            "items_delivered": summary.items_delivered,
+            "avg_path_length_per_item": summary.avg_path_length_per_item,
+            "avg_planning_time_ms": summary.avg_planning_time_ms,
+            "p95_planning_time_ms": summary.p95_planning_time_ms,
+            "corrected_invalid_actions": summary.corrected_invalid_actions,
+            "wait_actions": summary.wait_actions,
+            "collisions_prevented": summary.collisions_prevented,
+            "bots_idle": summary.bots_idle,
+            "order_metrics": summary.order_metrics.iter().map(|m| {
+                serde_json::json!({
+                    "order_index": m.order_index,
+                    "rounds_to_complete": m.rounds_to_complete,
+                    "items_delivered": m.items_delivered,
+                    "items_pre_staged": m.items_pre_staged,
+                })
+            }).collect::<Vec<_>>(),
+        })
+    }
+
     fn observe_tick(
         &mut self,
         state: &GameState,
         actions: &[Action],
         invalid_action_count: u64,
         team_telemetry: &serde_json::Value,
+        planning_time_ms: u64,
     ) -> TickAnalytics {
         let mode = detect_mode_label(state).to_owned();
         self.last_mode = Some(mode.clone());
@@ -902,18 +1179,12 @@ impl RunLogger {
         let delta_score = self.last_score.map(|v| score - v).unwrap_or_default();
         self.last_score = Some(score);
 
-        let items_remaining = state.orders.len() as i64;
-        let items_delivered_delta = self
-            .last_items_remaining
-            .map(|v| (v - items_remaining).max(0))
-            .unwrap_or_default();
-        self.last_items_remaining = Some(items_remaining);
-
         let order_completed_delta = self
             .last_active_order_index
             .map(|v| (state.active_order_index - v).max(0))
             .unwrap_or_default();
         self.last_active_order_index = Some(state.active_order_index);
+        let items_delivered_delta = (delta_score - 5 * order_completed_delta).max(0);
 
         let dropoff_congestion = compute_dropoff_congestion(state);
         let wait_actions = actions
@@ -979,6 +1250,31 @@ impl RunLogger {
             "non_wait_action_count".to_owned(),
             serde_json::Value::Number(serde_json::Number::from(non_wait_actions)),
         );
+        let collisions_prevented_tick = team_telemetry
+            .get("local_conflict_count_by_bot")
+            .and_then(serde_json::Value::as_object)
+            .map(|m| {
+                m.values()
+                    .filter_map(serde_json::Value::as_u64)
+                    .fold(0u64, |acc, v| acc.saturating_add(v))
+            })
+            .unwrap_or(0);
+        team_summary.insert(
+            "planning_time_ms".to_owned(),
+            serde_json::Value::Number(serde_json::Number::from(planning_time_ms)),
+        );
+        team_summary.insert(
+            "corrected_invalid_actions_tick".to_owned(),
+            serde_json::Value::Number(serde_json::Number::from(invalid_action_count)),
+        );
+        team_summary.insert(
+            "collisions_prevented_tick".to_owned(),
+            serde_json::Value::Number(serde_json::Number::from(collisions_prevented_tick)),
+        );
+        team_summary.insert(
+            "bots_idle_tick".to_owned(),
+            serde_json::Value::Number(serde_json::Number::from(wait_actions)),
+        );
         team_summary.insert("episode_counters".to_owned(), self.episode_counters_json());
         if let Some(extra) = team_telemetry.as_object() {
             for (key, value) in extra {
@@ -986,7 +1282,7 @@ impl RunLogger {
             }
         }
 
-        TickAnalytics {
+        let analytics = TickAnalytics {
             team_summary: serde_json::Value::Object(team_summary),
             tick_outcome: serde_json::json!({
                 "delta_score": delta_score,
@@ -994,7 +1290,15 @@ impl RunLogger {
                 "order_completed_delta": order_completed_delta,
                 "invalid_action_count": invalid_action_count,
             }),
-        }
+        };
+        self.metrics.on_tick(
+            state,
+            actions,
+            &analytics.team_summary,
+            &analytics.tick_outcome,
+            planning_time_ms,
+        );
+        analytics
     }
 }
 
@@ -1200,6 +1504,85 @@ fn render_ascii_frame(
     if let Some(reserved) = team_telemetry.get("reserved_cells_by_t") {
         lines.push(format!("reserved_cells_by_t: {reserved}"));
     }
+    lines.join("\n")
+}
+
+fn render_debug_overlay(state: &GameState, team_telemetry: &serde_json::Value) -> String {
+    let world = World::new(state);
+    let map = world.map();
+    let width = map.width.max(0) as usize;
+    let height = map.height.max(0) as usize;
+    if width == 0 || height == 0 {
+        return "empty-grid".to_owned();
+    }
+    let mut cells = vec![vec!['.'; width]; height];
+    for idx in 0..(width * height) {
+        if map.wall_mask[idx] {
+            let x = idx % width;
+            let y = idx / width;
+            cells[y][x] = '#';
+            continue;
+        }
+        if map.choke_points.get(idx).copied().unwrap_or(false) {
+            let x = idx % width;
+            let y = idx / width;
+            cells[y][x] = '!';
+        }
+    }
+    if let Some(goal_map) = team_telemetry
+        .get("goal_cell_by_bot")
+        .and_then(serde_json::Value::as_object)
+    {
+        for cell in goal_map.values().filter_map(serde_json::Value::as_u64) {
+            let c = cell as usize;
+            if c >= width * height {
+                continue;
+            }
+            let x = c % width;
+            let y = c / width;
+            if cells[y][x] == '.' {
+                cells[y][x] = 'T';
+            }
+        }
+    }
+    if let Some(res) = team_telemetry
+        .get("reserved_cells_by_t")
+        .and_then(serde_json::Value::as_object)
+    {
+        for cells_t in res.values().filter_map(serde_json::Value::as_array) {
+            for cell in cells_t.iter().filter_map(serde_json::Value::as_u64) {
+                let c = cell as usize;
+                if c >= width * height {
+                    continue;
+                }
+                let x = c % width;
+                let y = c / width;
+                if matches!(cells[y][x], '.' | 'T') {
+                    cells[y][x] = 'R';
+                }
+            }
+        }
+    }
+    for bot in &state.bots {
+        if bot.x >= 0 && bot.y >= 0 && (bot.x as usize) < width && (bot.y as usize) < height {
+            let ch = bot.id.chars().next().unwrap_or('B');
+            cells[bot.y as usize][bot.x as usize] = ch;
+        }
+    }
+    let mut lines = cells
+        .into_iter()
+        .map(|row| row.into_iter().collect::<String>())
+        .collect::<Vec<_>>();
+    let claimed = team_telemetry
+        .get("claimed_item_type_counts")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let role_counts = team_telemetry
+        .get("strategy_role_counts")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    lines.push(format!("claimed_item_type_counts={claimed}"));
+    lines.push(format!("strategy_role_counts={role_counts}"));
     lines.join("\n")
 }
 

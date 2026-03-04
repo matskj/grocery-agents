@@ -51,6 +51,18 @@ Explicit policy override:
 cargo run --bin grocery-agents -- --policy expert --token <jwt>
 ```
 
+Replay recorded states without websocket:
+
+```bash
+cargo run --bin grocery-agents -- --replay logs/run-<timestamp>.jsonl
+```
+
+Benchmark recordings across all policies:
+
+```bash
+cargo run --bin grocery-agents -- benchmark logs/run-*.jsonl
+```
+
 Windows ARM64 helper (uses VS `vcvars64` + x64 Rust toolchain):
 
 ```powershell
@@ -279,11 +291,17 @@ $env:GAME_LOG_DIR="my-logs"
 .\cargo-x64.cmd run --target x86_64-pc-windows-msvc -- --token eyJ...
 ```
 
+Explicit recording output:
+
+```powershell
+.\cargo-x64.cmd run --bin grocery-agents -- --record logs\recording.jsonl --token eyJ...
+```
+
 ### Planning timeout strategy
 
 Per tick planning now uses a real-time budget ladder:
 
-- default soft target: `45ms`
+- default soft target: `50ms`
 - default hard cap: `150ms`
 - fair-share adaptation from remaining wall-clock (`120s`) and remaining rounds (`300`)
 - deterministic single-worker planner thread with sequence IDs
@@ -294,6 +312,10 @@ If planning exceeds hard deadline:
 - The client logs a warning.
 - It emits a safe fallback envelope (greedy non-wait actions when valid, otherwise `wait`).
 - Normal planning resumes on the next received tick.
+- At `game_over`, the client prints a concise throughput report:
+  - score, orders completed, items delivered
+  - avg rounds/order, avg planning time, p95 planning time
+  - wait actions and corrected invalid actions
 
 ## Training pipeline (per-mode specialists)
 

@@ -136,7 +136,15 @@ impl MotionPlanner {
         let cbs_start = Instant::now();
         let (cbs_budget, cbs_node_cap) = dynamic_cbs_limits(soft_deadline, cbs_start);
         let mut bots = state.bots.iter().collect::<Vec<_>>();
-        sort_bots_for_planning(&mut bots, explicit_order);
+        sort_bots_for_planning(
+            &mut bots,
+            explicit_order,
+            state,
+            map,
+            dist,
+            goals,
+            reservation,
+        );
 
         for (ix, bot) in bots.iter().enumerate() {
             if soft_deadline
@@ -198,6 +206,7 @@ impl MotionPlanner {
                 .copied()
                 .unwrap_or(BotRole::Idle);
             let outcome = self.pick_step_with_fallback(
+                bot.id.as_str(),
                 start,
                 goal,
                 map,
@@ -303,6 +312,7 @@ impl MotionPlanner {
     #[allow(clippy::too_many_arguments)]
     fn pick_step_with_fallback(
         &self,
+        bot_id: &str,
         start: u16,
         goal: u16,
         map: &MapCache,
@@ -316,6 +326,7 @@ impl MotionPlanner {
         role: BotRole,
     ) -> StepOutcome {
         let primary = self.next_path(
+            bot_id,
             start,
             goal,
             map,
@@ -326,6 +337,7 @@ impl MotionPlanner {
             dropoff_capacity,
             blocked_moves,
             forbidden_cells,
+            role,
             self.horizon,
         );
         let step = primary.get(1).copied().unwrap_or(start);
@@ -356,6 +368,7 @@ impl MotionPlanner {
         }
 
         let reduced = self.next_path(
+            bot_id,
             start,
             goal,
             map,
@@ -366,6 +379,7 @@ impl MotionPlanner {
             dropoff_capacity,
             blocked_moves,
             forbidden_cells,
+            role,
             10,
         );
         let step_reduced = reduced.get(1).copied().unwrap_or(start);
@@ -375,6 +389,7 @@ impl MotionPlanner {
 
         if !matches!(role, BotRole::LeadCourier) {
             let relaxed = self.next_path(
+                bot_id,
                 start,
                 goal,
                 map,
@@ -385,6 +400,7 @@ impl MotionPlanner {
                 dropoff_capacity,
                 blocked_moves,
                 &HashSet::new(),
+                role,
                 self.horizon,
             );
             let step_relaxed = relaxed.get(1).copied().unwrap_or(start);
@@ -407,6 +423,7 @@ impl MotionPlanner {
 
     fn next_path(
         &self,
+        bot_id: &str,
         start: u16,
         goal: u16,
         map: &MapCache,
@@ -417,6 +434,7 @@ impl MotionPlanner {
         dropoff_capacity: u8,
         blocked_moves: &[BlockedMove],
         forbidden_cells: &HashSet<u16>,
+        role: BotRole,
         max_horizon: u8,
     ) -> Vec<u16> {
         if start == goal {
@@ -509,6 +527,30 @@ impl MotionPlanner {
                     }
                     penalty = penalty.saturating_add(reservation_penalty.saturating_mul(crowded));
                 }
+                if map
+                    .choke_points
+                    .get(next as usize)
+                    .copied()
+                    .unwrap_or(false)
+                {
+                    penalty = penalty.saturating_add(
+                        if matches!(role, BotRole::LeadCourier | BotRole::QueueCourier) {
+                            1
+                        } else {
+                            4
+                        },
+                    );
+                }
+                if map
+                    .intersection_points
+                    .get(next as usize)
+                    .copied()
+                    .unwrap_or(false)
+                    && !matches!(role, BotRole::LeadCourier | BotRole::QueueCourier)
+                {
+                    penalty = penalty.saturating_add(3);
+                }
+                penalty = penalty.saturating_add(lane_discipline_penalty(bot_id, next, map));
                 let ng = g.saturating_add(1).saturating_add(penalty);
                 let key = (next, nt);
                 if best_g.get(&key).map(|v| ng >= *v).unwrap_or(false) {
@@ -716,6 +758,7 @@ impl MotionPlanner {
         }
 
         let outcome = self.pick_step_with_fallback(
+            bot_id,
             start,
             goal,
             map,
@@ -758,7 +801,18 @@ impl MotionPlanner {
 fn sort_bots_for_planning<'a>(
     bots: &mut Vec<&'a crate::model::BotState>,
     explicit_order: &[String],
+    state: &GameState,
+    map: &MapCache,
+    dist: &DistanceMap,
+    goals: &HashMap<String, u16>,
+    reservation: &MovementReservation,
 ) {
+    let active_kinds = state
+        .orders
+        .iter()
+        .filter(|order| matches!(order.status, crate::model::OrderStatus::InProgress))
+        .map(|order| order.item_id.as_str())
+        .collect::<HashSet<_>>();
     let explicit_rank = explicit_order
         .iter()
         .enumerate()
@@ -771,9 +825,61 @@ fn sort_bots_for_planning<'a>(
             (Some(ra), Some(rb)) => ra.cmp(&rb).then_with(|| a.id.cmp(&b.id)),
             (Some(_), None) => std::cmp::Ordering::Less,
             (None, Some(_)) => std::cmp::Ordering::Greater,
-            (None, None) => a.id.cmp(&b.id),
+            (None, None) => {
+                let a_carry_active = a.carrying.iter().any(|k| active_kinds.contains(k.as_str()));
+                let b_carry_active = b.carrying.iter().any(|k| active_kinds.contains(k.as_str()));
+                let a_prio = reservation.priorities.get(&a.id).copied().unwrap_or(0);
+                let b_prio = reservation.priorities.get(&b.id).copied().unwrap_or(0);
+                let a_start = map.idx(a.x, a.y);
+                let b_start = map.idx(b.x, b.y);
+                let a_goal_eta = a_start
+                    .and_then(|cell| goals.get(&a.id).copied().map(|g| dist.dist(cell, g)))
+                    .unwrap_or(u16::MAX);
+                let b_goal_eta = b_start
+                    .and_then(|cell| goals.get(&b.id).copied().map(|g| dist.dist(cell, g)))
+                    .unwrap_or(u16::MAX);
+                let a_drop_eta = a_start
+                    .map(|cell| dist.dist_to_dropoff(cell))
+                    .unwrap_or(u16::MAX);
+                let b_drop_eta = b_start
+                    .map(|cell| dist.dist_to_dropoff(cell))
+                    .unwrap_or(u16::MAX);
+                b_carry_active
+                    .cmp(&a_carry_active)
+                    .then_with(|| b_prio.cmp(&a_prio))
+                    .then_with(|| a_goal_eta.cmp(&b_goal_eta))
+                    .then_with(|| a_drop_eta.cmp(&b_drop_eta))
+                    .then_with(|| a.id.cmp(&b.id))
+            }
         }
     });
+}
+
+fn lane_discipline_penalty(bot_id: &str, cell: u16, map: &MapCache) -> u16 {
+    let aisle = map
+        .aisle_id_by_cell
+        .get(cell as usize)
+        .copied()
+        .unwrap_or(u16::MAX);
+    if aisle == u16::MAX {
+        return 0;
+    }
+    let aisle_ix = usize::from(aisle);
+    if aisle_ix >= map.aisle_vertical.len() {
+        return 0;
+    }
+    let parity_pref = (bot_id.bytes().fold(0u8, |acc, b| acc ^ b) & 1) as i32;
+    let (x, y) = map.xy(cell);
+    let lane_parity = if map.aisle_vertical[aisle_ix] {
+        x & 1
+    } else {
+        y & 1
+    };
+    if lane_parity == parity_pref {
+        0
+    } else {
+        2
+    }
 }
 
 fn dynamic_cbs_limits(soft_deadline: Option<Instant>, started: Instant) -> (Duration, u16) {
@@ -1322,31 +1428,56 @@ mod tests {
 
     #[test]
     fn explicit_order_changes_priority_when_goals_conflict() {
-        let bots = vec![
-            BotState {
-                id: "a".to_owned(),
-                x: 0,
-                y: 0,
-                carrying: vec![],
-                capacity: 3,
+        let state = GameState {
+            grid: Grid {
+                width: 4,
+                height: 4,
+                drop_off_tiles: vec![[0, 0]],
+                ..Grid::default()
             },
-            BotState {
-                id: "b".to_owned(),
-                x: 0,
-                y: 1,
-                carrying: vec![],
-                capacity: 3,
-            },
-            BotState {
-                id: "c".to_owned(),
-                x: 0,
-                y: 2,
-                carrying: vec![],
-                capacity: 3,
-            },
-        ];
-        let mut refs = bots.iter().collect::<Vec<_>>();
-        sort_bots_for_planning(&mut refs, &["b".to_owned(), "a".to_owned()]);
+            bots: vec![
+                BotState {
+                    id: "a".to_owned(),
+                    x: 0,
+                    y: 0,
+                    carrying: vec![],
+                    capacity: 3,
+                },
+                BotState {
+                    id: "b".to_owned(),
+                    x: 0,
+                    y: 1,
+                    carrying: vec![],
+                    capacity: 3,
+                },
+                BotState {
+                    id: "c".to_owned(),
+                    x: 0,
+                    y: 2,
+                    carrying: vec![],
+                    capacity: 3,
+                },
+            ],
+            ..GameState::default()
+        };
+        let world = World::new(&state);
+        let map = world.map();
+        let dist = DistanceMap::build(map);
+        let mut goals = HashMap::new();
+        goals.insert("a".to_owned(), map.idx(2, 0).expect("goal a"));
+        goals.insert("b".to_owned(), map.idx(2, 1).expect("goal b"));
+        goals.insert("c".to_owned(), map.idx(2, 2).expect("goal c"));
+        let reservation = MovementReservation::default();
+        let mut refs = state.bots.iter().collect::<Vec<_>>();
+        sort_bots_for_planning(
+            &mut refs,
+            &["b".to_owned(), "a".to_owned()],
+            &state,
+            map,
+            &dist,
+            &goals,
+            &reservation,
+        );
         let ordered = refs.iter().map(|bot| bot.id.as_str()).collect::<Vec<_>>();
         assert_eq!(ordered, vec!["b", "a", "c"]);
     }

@@ -67,6 +67,13 @@ struct AreaAssignment {
     expires_tick: u64,
 }
 
+#[derive(Debug, Clone)]
+struct ItemClaim {
+    bot_id: String,
+    item_kind: String,
+    expires_tick: u64,
+}
+
 #[derive(Debug)]
 pub struct Policy {
     config: Arc<Config>,
@@ -85,6 +92,7 @@ pub struct Policy {
     bot_commitments: HashMap<String, BotCommitment>,
     depleted_item_ids: HashSet<String>,
     pickup_failures_by_item: HashMap<String, u8>,
+    item_claims_by_id: HashMap<String, ItemClaim>,
     preferred_area_by_bot: HashMap<String, AreaAssignment>,
     expansion_mode_by_bot: HashMap<String, bool>,
     easy_strategy: EasyStrategy,
@@ -112,6 +120,7 @@ impl Policy {
             bot_commitments: HashMap::new(),
             depleted_item_ids: HashSet::new(),
             pickup_failures_by_item: HashMap::new(),
+            item_claims_by_id: HashMap::new(),
             preferred_area_by_bot: HashMap::new(),
             expansion_mode_by_bot: HashMap::new(),
             easy_strategy: EasyStrategy::default(),
@@ -126,6 +135,7 @@ impl Policy {
         if state.tick == 0 {
             self.depleted_item_ids.clear();
             self.pickup_failures_by_item.clear();
+            self.item_claims_by_id.clear();
             self.preferred_area_by_bot.clear();
             self.expansion_mode_by_bot.clear();
         }
@@ -490,6 +500,8 @@ impl Policy {
                 }
             }
         }
+        let (claimed_item_count, claimed_type_counts) =
+            self.apply_item_claims(state, &team_ctx, &blocked_snapshot, &mut intents);
         assignment_commitment_reassign_count =
             self.invalidate_stale_commitments(state, &team_ctx, assignment_source);
         assignment_goal_concentration_top3 = goal_concentration_top3(&intents);
@@ -1316,6 +1328,55 @@ impl Policy {
                         .collect::<serde_json::Map<_, _>>(),
                 ),
             );
+            let mut role_counts = serde_json::Map::new();
+            let mut picker = 0i64;
+            let mut runner = 0i64;
+            let mut buffer = 0i64;
+            for role in strategy_plan.role_label_by_bot.values() {
+                if role.contains("picker") {
+                    picker += 1;
+                }
+                if role.contains("runner") {
+                    runner += 1;
+                }
+                if role.contains("buffer") {
+                    buffer += 1;
+                }
+            }
+            role_counts.insert(
+                "picker".to_owned(),
+                serde_json::Value::Number(serde_json::Number::from(picker)),
+            );
+            role_counts.insert(
+                "runner".to_owned(),
+                serde_json::Value::Number(serde_json::Number::from(runner)),
+            );
+            role_counts.insert(
+                "buffer".to_owned(),
+                serde_json::Value::Number(serde_json::Number::from(buffer)),
+            );
+            obj.insert(
+                "strategy_role_counts".to_owned(),
+                serde_json::Value::Object(role_counts),
+            );
+            obj.insert(
+                "claimed_item_id_count".to_owned(),
+                serde_json::Value::Number(serde_json::Number::from(claimed_item_count as i64)),
+            );
+            obj.insert(
+                "claimed_item_type_counts".to_owned(),
+                serde_json::Value::Object(
+                    claimed_type_counts
+                        .iter()
+                        .map(|(k, v)| {
+                            (
+                                k.clone(),
+                                serde_json::Value::Number(serde_json::Number::from(*v as i64)),
+                            )
+                        })
+                        .collect(),
+                ),
+            );
             obj.insert(
                 "assignment_source".to_owned(),
                 serde_json::Value::String(assignment_source.to_owned()),
@@ -1784,6 +1845,8 @@ impl Policy {
             .collect::<HashSet<_>>();
         self.bot_commitments
             .retain(|bot_id, _| known_bots.contains(bot_id.as_str()));
+        self.item_claims_by_id
+            .retain(|_, claim| known_bots.contains(claim.bot_id.as_str()));
         let valid_goal_cells = self.stand_claims.keys().copied().collect::<HashSet<_>>();
         self.bot_commitments
             .retain(|_, c| valid_goal_cells.contains(&c.goal_cell));
@@ -1806,6 +1869,83 @@ impl Policy {
             .retain(|cell, _| viable_stands.contains(cell));
         self.bot_commitments
             .retain(|_, commitment| viable_stands.contains(&commitment.goal_cell));
+    }
+
+    fn apply_item_claims(
+        &mut self,
+        state: &GameState,
+        team: &TeamContext,
+        blocked_ticks_by_bot: &HashMap<String, u8>,
+        intents: &mut [BotIntent],
+    ) -> (usize, HashMap<String, u16>) {
+        let now = state.tick;
+        let expire_threshold = self.config.coord_reassign_no_progress_ticks.max(2);
+        self.item_claims_by_id.retain(|_, claim| {
+            if claim.expires_tick < now {
+                return false;
+            }
+            let blocked = blocked_ticks_by_bot
+                .get(&claim.bot_id)
+                .copied()
+                .unwrap_or(0);
+            blocked < expire_threshold
+        });
+
+        let item_kind_by_id = state
+            .items
+            .iter()
+            .map(|item| (item.id.as_str(), item.kind.as_str()))
+            .collect::<HashMap<_, _>>();
+        let mut active_cap_by_kind = HashMap::<String, u16>::new();
+        for (kind, gap) in &team.knowledge.active_gap_by_kind {
+            let cap = (*gap).max(1).saturating_add(1);
+            active_cap_by_kind.insert(kind.clone(), cap);
+        }
+        let mut claimed_type_counts = self.item_claims_by_id.values().fold(
+            HashMap::<String, u16>::new(),
+            |mut acc, claim| {
+                let next = acc
+                    .get(&claim.item_kind)
+                    .copied()
+                    .unwrap_or(0)
+                    .saturating_add(1);
+                acc.insert(claim.item_kind.clone(), next);
+                acc
+            },
+        );
+
+        intents.sort_by(|a, b| a.bot_id.cmp(&b.bot_id));
+        for entry in intents.iter_mut() {
+            let Intent::PickUp { item_id } = &entry.intent else {
+                continue;
+            };
+            let Some(kind) = item_kind_by_id.get(item_id.as_str()).copied() else {
+                entry.intent = Intent::Wait;
+                continue;
+            };
+            if let Some(existing) = self.item_claims_by_id.get(item_id) {
+                if existing.bot_id != entry.bot_id && existing.expires_tick >= now {
+                    entry.intent = Intent::Wait;
+                    continue;
+                }
+            }
+            let used = claimed_type_counts.get(kind).copied().unwrap_or(0);
+            let cap = active_cap_by_kind.get(kind).copied().unwrap_or(2);
+            if used >= cap {
+                entry.intent = Intent::Wait;
+                continue;
+            }
+            self.item_claims_by_id.insert(
+                item_id.clone(),
+                ItemClaim {
+                    bot_id: entry.bot_id.clone(),
+                    item_kind: kind.to_owned(),
+                    expires_tick: now.saturating_add(u64::from(self.config.coord_claim_ttl_ticks)),
+                },
+            );
+            claimed_type_counts.insert(kind.to_owned(), used.saturating_add(1));
+        }
+        (self.item_claims_by_id.len(), claimed_type_counts)
     }
 
     fn invalidate_stale_commitments(

@@ -2,7 +2,7 @@ use crate::dispatcher::Intent;
 
 use super::{
     common::{
-        active_kind_counts, bot_cell, choose_nearest_item_of_kind, first_active_order_for_kind,
+        active_kind_counts, bot_cell, choose_scored_item_of_kind, first_active_order_for_kind,
         is_adjacent_to_item, nearest_dropoff_cell, on_dropoff, preview_kind_counts,
     },
     Strategy, StrategyPlan, TickInput,
@@ -57,6 +57,10 @@ impl Strategy for HardStrategy {
         if let Some(runner_id) = runner_id {
             if let Some(bot) = input.state.bots.iter().find(|b| b.id == runner_id) {
                 if on_dropoff(bot, input.map) {
+                    let has_preview = bot
+                        .carrying
+                        .iter()
+                        .any(|kind| preview_counts.contains_key(kind.as_str()));
                     for kind in &bot.carrying {
                         if let Some(order_id) = first_active_order_for_kind(input.state, kind) {
                             plan.forced_intents.insert(
@@ -68,6 +72,10 @@ impl Strategy for HardStrategy {
                             return plan;
                         }
                     }
+                    if has_preview {
+                        plan.forced_intents.insert(bot.id.clone(), Intent::Wait);
+                        return plan;
+                    }
                 }
                 if let Some(from) = bot_cell(input.map, bot) {
                     let target_kind = if active_gap <= 2 {
@@ -76,12 +84,16 @@ impl Strategy for HardStrategy {
                         preview_counts.keys().next().cloned()
                     };
                     if let Some(kind) = target_kind {
-                        if let Some((item_id, stand)) = choose_nearest_item_of_kind(
+                        if let Some((item_id, stand)) = choose_scored_item_of_kind(
                             input.state,
                             input.map,
                             input.dist,
+                            input.team,
+                            bot.id.as_str(),
                             from,
                             &kind,
+                            bot.carrying.len(),
+                            bot.capacity,
                         ) {
                             if let Some(item) = input.state.items.iter().find(|i| i.id == item_id) {
                                 if bot.carrying.len() < bot.capacity

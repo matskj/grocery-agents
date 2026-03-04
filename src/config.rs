@@ -73,7 +73,8 @@ pub struct ConfigArgs {
     pub candidate_k: usize,
 
     #[arg(
-        long,
+        long = "policy",
+        alias = "policy-mode",
         env = "GROCERY_POLICY",
         value_enum,
         default_value_t = PolicyMode::Auto
@@ -141,7 +142,7 @@ pub struct ConfigArgs {
     #[arg(long, env = "GROCERY_PLANNER_DEADLINE_SLACK_MS", default_value_t = 40)]
     pub planner_deadline_slack_ms: u64,
 
-    #[arg(long, env = "GROCERY_TICK_SOFT_BUDGET_MS", default_value_t = 45)]
+    #[arg(long, env = "GROCERY_TICK_SOFT_BUDGET_MS", default_value_t = 50)]
     pub tick_soft_budget_ms: u64,
 
     #[arg(long, env = "GROCERY_TICK_HARD_BUDGET_MS", default_value_t = 150)]
@@ -165,7 +166,7 @@ pub struct ConfigArgs {
     #[arg(long, env = "GROCERY_REPLAY_DUMP_PATH")]
     pub replay_dump_path: Option<PathBuf>,
 
-    #[arg(long, env = "GROCERY_RECORD_PATH")]
+    #[arg(long = "record", alias = "record-path", env = "GROCERY_RECORD_PATH")]
     pub record_path: Option<PathBuf>,
 
     #[arg(long, env = "GROCERY_COORD_CLAIM_TTL_TICKS", default_value_t = 10)]

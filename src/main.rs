@@ -5,6 +5,7 @@ mod config;
 mod difficulty;
 mod dispatcher;
 mod dist;
+mod metrics;
 mod model;
 mod motion;
 mod net;
@@ -14,11 +15,15 @@ mod scoring;
 mod team_context;
 mod world;
 
-use std::sync::Arc;
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use base64::Engine;
 use clap::Parser;
-use config::ConfigArgs;
+use config::{ConfigArgs, PolicyMode};
 use model::{RuntimeContext, SessionMetadata};
 use serde::Deserialize;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -40,12 +45,20 @@ struct Cli {
     #[arg(long, env = "GROCERY_WS_URL")]
     ws_url: Option<String>,
 
+    #[arg(long)]
+    replay: Option<PathBuf>,
+
     #[command(flatten)]
     config: ConfigArgs,
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let raw_args = std::env::args().collect::<Vec<_>>();
+    if raw_args.get(1).map(String::as_str) == Some("benchmark") {
+        return run_benchmark_command(&raw_args[2..]);
+    }
+
     let cli = Cli::parse();
     let config = Arc::new(cli.config.clone().build());
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
@@ -55,6 +68,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with(env_filter)
         .with(tracing_subscriber::fmt::layer())
         .init();
+
+    if let Some(replay) = cli.replay {
+        let policy = policy::Policy::new(Arc::clone(&config));
+        let summary = net::run_replay_file(&replay, policy, Arc::clone(&config))?;
+        println!(
+            "replay_summary ticks={} score={} orders={} items={} avg_order_rounds={:.2} avg_plan_ms={:.2} p95_plan_ms={} waits={} invalid_fixed={} est_rounds_120s={}",
+            summary.ticks,
+            summary.total_score,
+            summary.orders_completed,
+            summary.items_delivered,
+            summary.avg_order_rounds_to_complete,
+            summary.avg_planning_time_ms,
+            summary.p95_planning_time_ms,
+            summary.wait_actions,
+            summary.invalid_actions_corrected,
+            summary.estimated_rounds_in_120s
+        );
+        if summary.p95_planning_time_ms > 100 {
+            eprintln!(
+                "warning: replay p95 planning time {}ms exceeds 100ms target",
+                summary.p95_planning_time_ms
+            );
+        }
+        return Ok(());
+    }
 
     let (token, ws_url) = resolve_connection(cli.connect, cli.token, cli.ws_url)?;
     let session = parse_session_metadata(&token).unwrap_or_default();
@@ -66,6 +104,111 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let policy = policy::Policy::new(Arc::clone(&config));
 
     net::run_game_loop(ctx, policy, config).await
+}
+
+fn run_benchmark_command(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    if args.is_empty() {
+        return Err("benchmark expects one or more replay paths/patterns".into());
+    }
+    let mut files = Vec::<PathBuf>::new();
+    for arg in args {
+        files.extend(expand_replay_pattern(arg));
+    }
+    files.sort();
+    files.dedup();
+    if files.is_empty() {
+        return Err("no replay files matched benchmark arguments".into());
+    }
+
+    let policy_modes = [
+        PolicyMode::Auto,
+        PolicyMode::Easy,
+        PolicyMode::Medium,
+        PolicyMode::Hard,
+        PolicyMode::Expert,
+    ];
+
+    #[derive(Default)]
+    struct Agg {
+        n: u64,
+        score: f64,
+        orders: f64,
+        avg_plan: f64,
+        p95: f64,
+    }
+    let mut agg = policy_modes
+        .iter()
+        .copied()
+        .map(|mode| (mode, Agg::default()))
+        .collect::<Vec<_>>();
+
+    for file in &files {
+        for mode in policy_modes {
+            let mut cfg = Cli::parse_from(["grocery-agents"]).config.build();
+            cfg.policy_mode = mode;
+            let cfg = Arc::new(cfg);
+            let policy = policy::Policy::new(Arc::clone(&cfg));
+            let summary = net::run_replay_file(file, policy, Arc::clone(&cfg))?;
+            let Some((_, entry)) = agg.iter_mut().find(|(m, _)| *m == mode) else {
+                continue;
+            };
+            entry.n = entry.n.saturating_add(1);
+            entry.score += summary.total_score as f64;
+            entry.orders += summary.orders_completed as f64;
+            entry.avg_plan += summary.avg_planning_time_ms;
+            entry.p95 += summary.p95_planning_time_ms as f64;
+        }
+    }
+
+    println!("policy\truns\tavg_score\tavg_orders\tavg_plan_ms\tavg_p95_ms");
+    for mode in policy_modes {
+        if let Some((_, a)) = agg.iter().find(|(m, _)| *m == mode) {
+            let n = a.n.max(1) as f64;
+            println!(
+                "{:?}\t{}\t{:.2}\t{:.2}\t{:.2}\t{:.2}",
+                mode,
+                a.n,
+                a.score / n,
+                a.orders / n,
+                a.avg_plan / n,
+                a.p95 / n
+            );
+        }
+    }
+    Ok(())
+}
+
+fn expand_replay_pattern(pattern: &str) -> Vec<PathBuf> {
+    let path = Path::new(pattern);
+    if !pattern.contains('*') {
+        if path.exists() {
+            return vec![path.to_path_buf()];
+        }
+        return Vec::new();
+    }
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let needle = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default()
+        .to_owned();
+    let (prefix, suffix) = needle
+        .split_once('*')
+        .map(|(a, b)| (a.to_owned(), b.to_owned()))
+        .unwrap_or_else(|| (needle.clone(), String::new()));
+    let mut out = Vec::new();
+    if let Ok(entries) = fs::read_dir(parent) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            if name.starts_with(&prefix) && name.ends_with(&suffix) {
+                out.push(entry.path());
+            }
+        }
+    }
+    out
 }
 
 fn resolve_connection(

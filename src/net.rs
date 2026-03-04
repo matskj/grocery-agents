@@ -645,7 +645,12 @@ async fn handle_game_state(
     let soft_budget_ms = budget.soft_ms;
     let hard_budget = Duration::from_millis(budget.hard_ms);
     let plan_started = Instant::now();
-    let mut planned = planner.cached_for_state(&game_state);
+    let allow_cached_plan = !has_immediate_conversion_opportunity(&game_state);
+    let mut planned = if allow_cached_plan {
+        planner.cached_for_state(&game_state)
+    } else {
+        None
+    };
     let mut worker_plan_ms = 0u64;
     if planned.is_none() {
         if let Some(req_seq) = planner.submit(&game_state, soft_budget_ms) {
@@ -771,6 +776,33 @@ async fn handle_game_state(
     socket.send(Message::Text(payload.into())).await?;
     info!(tick, "sent round action envelope");
     Ok(budget_pressure_from_team_telemetry(&planned.team_telemetry))
+}
+
+fn has_immediate_conversion_opportunity(state: &GameState) -> bool {
+    let active_kinds = state
+        .orders
+        .iter()
+        .filter(|o| matches!(o.status, OrderStatus::InProgress))
+        .map(|o| o.item_id.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    if active_kinds.is_empty() {
+        return false;
+    }
+    state.bots.iter().any(|bot| {
+        let drop_dist = state
+            .grid
+            .drop_off_tiles
+            .iter()
+            .map(|tile| (tile[0] - bot.x).unsigned_abs() + (tile[1] - bot.y).unsigned_abs())
+            .min()
+            .unwrap_or(u32::MAX);
+        let near_drop = drop_dist <= 1;
+        let carries_active = bot
+            .carrying
+            .iter()
+            .any(|kind| active_kinds.contains(kind.as_str()));
+        near_drop && carries_active
+    })
 }
 
 fn compute_tick_budget(

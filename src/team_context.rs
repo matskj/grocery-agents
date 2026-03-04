@@ -154,6 +154,7 @@ pub struct TeamKnowledge {
     pub expansion_mode_by_bot: HashMap<String, bool>,
     pub local_active_candidate_count_by_bot: HashMap<String, u16>,
     pub local_radius_by_bot: HashMap<String, u16>,
+    pub strategy_role_label_by_bot: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -352,12 +353,30 @@ impl TeamContext {
         self
     }
 
+    pub fn with_strategy_roles(
+        mut self,
+        strategy_role_label_by_bot: &HashMap<String, String>,
+    ) -> Self {
+        self.knowledge.strategy_role_label_by_bot = strategy_role_label_by_bot
+            .iter()
+            .map(|(bot_id, role)| (bot_id.clone(), role.clone()))
+            .collect();
+        self
+    }
+
     pub fn role_for(&self, bot_id: &str) -> BotRole {
         self.queue
             .assignments
             .get(bot_id)
             .map(|a| a.role)
             .unwrap_or(BotRole::Idle)
+    }
+
+    pub fn strategy_role_for(&self, bot_id: &str) -> Option<&str> {
+        self.knowledge
+            .strategy_role_label_by_bot
+            .get(bot_id)
+            .map(|s| s.as_str())
     }
 
     pub fn queue_goal_for(&self, bot_id: &str) -> Option<u16> {
@@ -728,6 +747,7 @@ impl TeamContext {
             "expansion_mode_by_bot": expansion_mode_by_bot,
             "local_active_candidate_count_by_bot": local_active_candidate_count_by_bot,
             "local_radius_by_bot": local_radius_by_bot,
+            "strategy_role_label_by_bot": self.knowledge.strategy_role_label_by_bot,
             "queue_lane_cells": lane_xy,
             "dropoff_ring_cells": ring_xy,
             "dropoff_control_zone_cells": control_zone_xy,
@@ -748,7 +768,9 @@ impl TeamContext {
             "blocked_bot_count": self.traffic.blocked_bot_count,
             "stuck_bot_count": self.traffic.stuck_bot_count,
             "knowledge_active_gap_by_kind": self.knowledge.active_gap_by_kind,
+            "knowledge_active_missing_total": self.order_snapshot.active_remaining_by_item.values().copied().sum::<u64>(),
             "knowledge_effective_supply_by_kind": self.knowledge.effective_supply_by_kind,
+            "knowledge_effective_gap_total": self.knowledge.active_gap_by_kind.values().copied().map(u64::from).sum::<u64>(),
             "knowledge_stand_claim_count": self.knowledge.stand_claims.len(),
             "knowledge_commitment_count": self.knowledge.bot_commitments.len(),
         })
@@ -762,6 +784,24 @@ fn active_item_set(state: &GameState) -> HashSet<String> {
         .filter(|order| matches!(order.status, OrderStatus::InProgress))
         .map(|order| order.item_id.clone())
         .collect()
+}
+
+pub fn active_missing_by_kind(state: &GameState) -> HashMap<String, u16> {
+    let mut out = HashMap::<String, u16>::new();
+    for order in &state.orders {
+        if matches!(order.status, OrderStatus::InProgress) {
+            *out.entry(order.item_id.clone()).or_insert(0) += 1;
+        }
+    }
+    out
+}
+
+pub fn active_missing_total(state: &GameState) -> usize {
+    active_missing_by_kind(state)
+        .values()
+        .copied()
+        .map(usize::from)
+        .sum::<usize>()
 }
 
 fn order_snapshot(state: &GameState) -> OrderSnapshot {
@@ -925,6 +965,7 @@ fn build_team_knowledge(
         expansion_mode_by_bot: HashMap::new(),
         local_active_candidate_count_by_bot: HashMap::new(),
         local_radius_by_bot: HashMap::new(),
+        strategy_role_label_by_bot: HashMap::new(),
     }
 }
 

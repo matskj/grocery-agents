@@ -29,6 +29,7 @@ use crate::{
     },
     policy::Policy,
     scoring::{artifact_load_status, detect_mode_label},
+    team_context::active_missing_total,
     world::World,
 };
 
@@ -75,6 +76,14 @@ struct PlanRoundResult {
     assign_ms: u64,
 }
 
+#[derive(Debug, Clone)]
+struct CachedPlanMeta {
+    tick: u64,
+    active_missing_total: usize,
+    dropoff_ready_bot_count: u16,
+    bot_pos_by_id: HashMap<String, (i32, i32)>,
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 struct BudgetPressure {
     blocked_bots_prev: u64,
@@ -116,7 +125,9 @@ struct PlannerManager {
     request_tx: mpsc::Sender<PlannerWorkerMsg>,
     response_rx: mpsc::Receiver<PlanResponse>,
     pending_by_seq: HashMap<u64, PlanResponse>,
+    submitted_meta_by_seq: HashMap<u64, CachedPlanMeta>,
     last_result: Option<PlanRoundResult>,
+    last_meta: Option<CachedPlanMeta>,
     worker: Option<JoinHandle<()>>,
 }
 
@@ -160,7 +171,9 @@ impl PlannerManager {
             request_tx,
             response_rx,
             pending_by_seq: HashMap::new(),
+            submitted_meta_by_seq: HashMap::new(),
             last_result: None,
+            last_meta: None,
             worker,
         }
     }
@@ -174,11 +187,13 @@ impl PlannerManager {
             soft_budget_ms,
             state: state.clone(),
         };
+        self.submitted_meta_by_seq.insert(seq, cache_meta(state));
         if self
             .request_tx
             .send(PlannerWorkerMsg::Plan(request))
             .is_err()
         {
+            self.submitted_meta_by_seq.remove(&seq);
             return None;
         }
         Some(seq)
@@ -194,13 +209,54 @@ impl PlannerManager {
         self.poll();
         let resp = self.pending_by_seq.remove(&seq)?;
         self.last_result = Some(resp.result.clone());
+        self.last_meta = self.submitted_meta_by_seq.remove(&seq);
         Some(resp)
     }
 
-    fn cached_for_state(&self, state: &GameState) -> Option<PlanRoundResult> {
+    fn cached_for_state(
+        &self,
+        state: &GameState,
+        max_age_ticks: u64,
+        require_progress: bool,
+    ) -> Option<PlanRoundResult> {
         let last = self.last_result.as_ref()?;
+        let meta = self.last_meta.as_ref()?;
         if last.actions.is_empty() || state.bots.is_empty() {
             return None;
+        }
+        if state.tick < meta.tick {
+            return None;
+        }
+        let age_ticks = state.tick.saturating_sub(meta.tick);
+        if age_ticks > max_age_ticks {
+            return None;
+        }
+        if require_progress {
+            if has_immediate_conversion_opportunity(state) {
+                return None;
+            }
+            if active_missing_total(state) > meta.active_missing_total {
+                return None;
+            }
+            if dropoff_ready_bot_count(state) != meta.dropoff_ready_bot_count {
+                return None;
+            }
+            let mut total_delta = 0u64;
+            let mut count = 0u64;
+            for bot in &state.bots {
+                let Some((px, py)) = meta.bot_pos_by_id.get(&bot.id).copied() else {
+                    return None;
+                };
+                let delta = (bot.x - px).unsigned_abs() + (bot.y - py).unsigned_abs();
+                if delta > 2 {
+                    return None;
+                }
+                total_delta = total_delta.saturating_add(u64::from(delta));
+                count = count.saturating_add(1);
+            }
+            if count > 0 && total_delta > count.saturating_mul(2) {
+                return None;
+            }
         }
         let mut action_by_bot = HashMap::<&str, Action>::new();
         for action in &last.actions {
@@ -223,6 +279,10 @@ impl PlannerManager {
             obj.insert(
                 "fallback_level".to_owned(),
                 serde_json::Value::String("cached".to_owned()),
+            );
+            obj.insert(
+                "cached_age_ticks".to_owned(),
+                serde_json::Value::Number(serde_json::Number::from(age_ticks)),
             );
         }
         Some(PlanRoundResult {
@@ -299,6 +359,9 @@ pub async fn run_game_loop(
             "tick_soft_budget_ms": config.tick_soft_budget_ms,
             "tick_hard_budget_ms": config.tick_hard_budget_ms,
             "tick_greedy_fallback_ms": config.tick_greedy_fallback_ms,
+            "active_first_strict": config.active_first_strict,
+            "cache_reuse_max_age_ticks": config.cache_reuse_max_age_ticks,
+            "cache_require_progress": config.cache_require_progress,
             "policy_mode": format!("{:?}", config.policy_mode).to_lowercase(),
             "coord_local_radius_base": config.coord_local_radius_base,
             "coord_local_radius_max": config.coord_local_radius_max,
@@ -647,7 +710,11 @@ async fn handle_game_state(
     let plan_started = Instant::now();
     let allow_cached_plan = !has_immediate_conversion_opportunity(&game_state);
     let mut planned = if allow_cached_plan {
-        planner.cached_for_state(&game_state)
+        planner.cached_for_state(
+            &game_state,
+            config.cache_reuse_max_age_ticks,
+            config.cache_require_progress,
+        )
     } else {
         None
     };
@@ -803,6 +870,47 @@ fn has_immediate_conversion_opportunity(state: &GameState) -> bool {
             .any(|kind| active_kinds.contains(kind.as_str()));
         near_drop && carries_active
     })
+}
+
+fn cache_meta(state: &GameState) -> CachedPlanMeta {
+    let mut bot_pos_by_id = HashMap::with_capacity(state.bots.len());
+    for bot in &state.bots {
+        bot_pos_by_id.insert(bot.id.clone(), (bot.x, bot.y));
+    }
+    CachedPlanMeta {
+        tick: state.tick,
+        active_missing_total: active_missing_total(state),
+        dropoff_ready_bot_count: dropoff_ready_bot_count(state),
+        bot_pos_by_id,
+    }
+}
+
+fn dropoff_ready_bot_count(state: &GameState) -> u16 {
+    let active_kinds = state
+        .orders
+        .iter()
+        .filter(|o| matches!(o.status, OrderStatus::InProgress))
+        .map(|o| o.item_id.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    if active_kinds.is_empty() {
+        return 0;
+    }
+    state
+        .bots
+        .iter()
+        .filter(|bot| {
+            let on_drop = state
+                .grid
+                .drop_off_tiles
+                .iter()
+                .any(|tile| tile[0] == bot.x && tile[1] == bot.y);
+            let carries_active = bot
+                .carrying
+                .iter()
+                .any(|kind| active_kinds.contains(kind.as_str()));
+            on_drop && carries_active
+        })
+        .count() as u16
 }
 
 fn compute_tick_budget(
@@ -2137,6 +2245,9 @@ mod tests {
             tick_soft_budget_ms: 45,
             tick_hard_budget_ms: 150,
             tick_greedy_fallback_ms: 8,
+            active_first_strict: true,
+            cache_reuse_max_age_ticks: 1,
+            cache_require_progress: true,
             log_level: "info".to_owned(),
             structured_bot_log: false,
             ascii_render: false,
@@ -2279,5 +2390,45 @@ mod tests {
             }
         }
         assert!(got0 && got1);
+    }
+
+    #[test]
+    fn cached_plan_rejected_when_stale_or_no_progress() {
+        let cfg = Arc::new(test_config(PlannerBudgetMode::Adaptive));
+        let mut manager = PlannerManager::new(Policy::new(cfg));
+        let base = planner_state(20);
+        let seq = manager
+            .submit(&base, 15)
+            .expect("planner submit should succeed");
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut got = false;
+        while Instant::now() < deadline && !got {
+            if manager.take(seq).is_some() {
+                got = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert!(got, "expected planner response before deadline");
+
+        let stale_state = planner_state(23);
+        assert!(
+            manager.cached_for_state(&stale_state, 1, true).is_none(),
+            "cache should be rejected when older than max age"
+        );
+
+        let mut increased_missing = planner_state(21);
+        increased_missing.orders.push(Order {
+            id: "o2".to_owned(),
+            item_id: "milk".to_owned(),
+            status: OrderStatus::InProgress,
+        });
+        assert!(
+            manager
+                .cached_for_state(&increased_missing, 2, true)
+                .is_none(),
+            "cache should be rejected when active missing has increased"
+        );
     }
 }

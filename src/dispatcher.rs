@@ -4,7 +4,7 @@ use crate::{
     dist::DistanceMap,
     model::{BotState, GameState, OrderStatus},
     scoring::{detect_mode_label, maybe_score_pick, CandidateFeatures},
-    team_context::{BotRole, TeamContext},
+    team_context::{active_missing_total, BotRole, TeamContext},
     world::MapCache,
 };
 
@@ -22,11 +22,23 @@ pub struct BotIntent {
     pub intent: Intent,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Dispatcher {
     item_intern: HashMap<String, u16>,
     item_rev: Vec<String>,
     needed_buf: Vec<u16>,
+    active_first_strict: bool,
+}
+
+impl Default for Dispatcher {
+    fn default() -> Self {
+        Self {
+            item_intern: HashMap::new(),
+            item_rev: Vec::new(),
+            needed_buf: Vec::new(),
+            active_first_strict: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -56,6 +68,13 @@ impl Dispatcher {
         Self::default()
     }
 
+    pub fn with_active_first_strict(active_first_strict: bool) -> Self {
+        Self {
+            active_first_strict,
+            ..Self::default()
+        }
+    }
+
     pub fn dispatch(&self, action: crate::model::Action) -> crate::model::Action {
         action
     }
@@ -73,6 +92,7 @@ impl Dispatcher {
         }
 
         let (active_missing, preview_missing) = self.compute_missing(state);
+        let active_missing_total = active_missing_total(state);
         let mode = detect_mode_label(state);
         let order_urgency = active_missing.values().copied().map(f64::from).sum::<f64>();
         let carried_supply = self.build_effective_carried_supply(state, map, dist, team);
@@ -83,7 +103,16 @@ impl Dispatcher {
                 needed.saturating_sub(covered)
             })
             .sum::<u16>();
-        let preview_enabled = active_gap_total == 0;
+        let preview_enabled = if self.active_first_strict {
+            active_missing_total == 0
+        } else {
+            active_gap_total == 0
+        };
+        let active_carried_supply = if self.active_first_strict {
+            HashMap::new()
+        } else {
+            carried_supply.clone()
+        };
 
         let mut bot_order = state.bots.iter().collect::<Vec<_>>();
         bot_order.sort_by(|a, b| {
@@ -236,7 +265,7 @@ impl Dispatcher {
                         map,
                         dist,
                         &active_missing,
-                        &carried_supply,
+                        &active_carried_supply,
                         5,
                         mode,
                         CandidateFeatures {
@@ -1015,6 +1044,93 @@ mod tests {
                 )
             }),
             "preview pickup should be disabled while active gap exists"
+        );
+    }
+
+    #[test]
+    fn preview_pickups_disabled_when_active_missing_even_if_effective_gap_zero() {
+        let state = GameState {
+            tick: 9,
+            grid: Grid {
+                width: 10,
+                height: 8,
+                drop_off_tiles: vec![[1, 6]],
+                ..Grid::default()
+            },
+            bots: vec![
+                BotState {
+                    id: "0".to_owned(),
+                    x: 7,
+                    y: 5,
+                    carrying: vec![],
+                    capacity: 3,
+                },
+                BotState {
+                    id: "1".to_owned(),
+                    x: 1,
+                    y: 6,
+                    carrying: vec!["milk".to_owned()],
+                    capacity: 3,
+                },
+            ],
+            items: vec![
+                Item {
+                    id: "item_active".to_owned(),
+                    kind: "milk".to_owned(),
+                    x: 8,
+                    y: 3,
+                },
+                Item {
+                    id: "item_preview".to_owned(),
+                    kind: "bread".to_owned(),
+                    x: 8,
+                    y: 5,
+                },
+            ],
+            orders: vec![
+                Order {
+                    id: "o_active".to_owned(),
+                    item_id: "milk".to_owned(),
+                    status: OrderStatus::InProgress,
+                },
+                Order {
+                    id: "o_preview".to_owned(),
+                    item_id: "bread".to_owned(),
+                    status: OrderStatus::Pending,
+                },
+            ],
+            ..GameState::default()
+        };
+        let world = World::new(&state);
+        let map = world.map();
+        let dist = DistanceMap::build(map);
+        let mut dispatcher = Dispatcher::with_active_first_strict(true);
+        let team = TeamContext::build(
+            &state,
+            map,
+            &dist,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            TeamContextConfig::default(),
+        );
+        let intents = dispatcher.build_intents(&state, map, &dist, &HashMap::new(), &team);
+        assert!(
+            intents.iter().all(|it| {
+                !matches!(
+                    &it.intent,
+                    Intent::PickUp { item_id } if item_id == "item_preview"
+                )
+            }),
+            "preview pickup should be disabled while active order has missing items"
         );
     }
 }

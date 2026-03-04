@@ -45,6 +45,9 @@ pub struct Config {
     pub tick_soft_budget_ms: u64,
     pub tick_hard_budget_ms: u64,
     pub tick_greedy_fallback_ms: u64,
+    pub active_first_strict: bool,
+    pub cache_reuse_max_age_ticks: u64,
+    pub cache_require_progress: bool,
     pub log_level: String,
     pub structured_bot_log: bool,
     pub ascii_render: bool,
@@ -150,6 +153,15 @@ pub struct ConfigArgs {
 
     #[arg(long, env = "GROCERY_TICK_GREEDY_FALLBACK_MS", default_value_t = 8)]
     pub tick_greedy_fallback_ms: u64,
+
+    #[arg(long, env = "GROCERY_ACTIVE_FIRST_STRICT", default_value_t = true)]
+    pub active_first_strict: bool,
+
+    #[arg(long, env = "GROCERY_CACHE_REUSE_MAX_AGE_TICKS", default_value_t = 1)]
+    pub cache_reuse_max_age_ticks: u64,
+
+    #[arg(long, env = "GROCERY_CACHE_REQUIRE_PROGRESS", default_value_t = true)]
+    pub cache_require_progress: bool,
 
     #[arg(long, env = "GROCERY_LOG_LEVEL", default_value = "info")]
     pub log_level: String,
@@ -277,6 +289,9 @@ impl ConfigArgs {
             tick_soft_budget_ms: tick_soft,
             tick_hard_budget_ms: tick_hard,
             tick_greedy_fallback_ms: tick_greedy,
+            active_first_strict: self.active_first_strict,
+            cache_reuse_max_age_ticks: self.cache_reuse_max_age_ticks.clamp(0, 8),
+            cache_require_progress: self.cache_require_progress,
             log_level: self.log_level,
             structured_bot_log: self.structured_bot_log,
             ascii_render: self.ascii_render,

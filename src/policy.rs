@@ -22,8 +22,8 @@ use crate::{
         detect_mode_label, maybe_score_ordering, maybe_score_ordering_sequence, OrderingFeatures,
     },
     team_context::{
-        BlockedMove, BotCommitment, BotRole, DemandTier, StandClaim, StickyQueueRole, TeamContext,
-        TeamContextConfig,
+        active_missing_total, BlockedMove, BotCommitment, BotRole, DemandTier, StandClaim,
+        StickyQueueRole, TeamContext, TeamContextConfig,
     },
     world::World,
 };
@@ -105,9 +105,9 @@ impl Policy {
     pub fn new(config: Arc<Config>) -> Self {
         Self {
             planner: MotionPlanner::new(config.horizon),
+            dispatcher: Dispatcher::with_active_first_strict(config.active_first_strict),
             config,
             assigner: AssignmentEngine::new(),
-            dispatcher: Dispatcher::new(),
             memory: HashMap::new(),
             sticky_roles: HashMap::new(),
             last_team_telemetry: serde_json::json!({}),
@@ -321,6 +321,7 @@ impl Policy {
             &local_active_candidate_count_by_bot,
             &local_radius_by_bot,
         );
+        team_ctx = team_ctx.with_strategy_roles(&strategy_plan.role_label_by_bot);
         self.sticky_roles = team_ctx.queue.next_sticky.clone();
 
         let assign_started = Instant::now();
@@ -332,6 +333,8 @@ impl Policy {
         let mut assignment_stand_task_count = 0usize;
         let mut assignment_dropoff_task_count = 0usize;
         let mut assignment_active_gap_total = 0usize;
+        let mut assignment_effective_gap_total = 0usize;
+        let mut assignment_active_missing_total = active_missing_total(state);
         let mut assignment_preview_enabled = true;
         let mut assignment_goal_concentration_top3 = 0.0f64;
         let mut assignment_late_phase_delivery_streak = 0u16;
@@ -368,6 +371,7 @@ impl Policy {
                         local_radius_by_bot: local_radius_by_bot.clone(),
                         out_of_area_penalty: self.config.coord_out_of_area_penalty,
                         out_of_radius_penalty: self.config.coord_out_of_radius_penalty,
+                        active_first_strict: self.config.active_first_strict,
                     },
                     remaining,
                 )
@@ -384,6 +388,8 @@ impl Policy {
             assignment_stand_task_count = result.stand_task_count;
             assignment_dropoff_task_count = result.dropoff_task_count;
             assignment_active_gap_total = result.active_gap_total;
+            assignment_active_missing_total = result.active_missing_total;
+            assignment_effective_gap_total = result.active_gap_total;
             assignment_preview_enabled = result.preview_enabled;
         }
 
@@ -445,6 +451,7 @@ impl Policy {
                                 &dist,
                                 result.intents,
                                 &legacy_intents,
+                                self.config.active_first_strict,
                             )
                         }
                     } else {
@@ -1432,6 +1439,18 @@ impl Policy {
                 "assignment_active_gap_total".to_owned(),
                 serde_json::Value::Number(serde_json::Number::from(
                     assignment_active_gap_total as i64,
+                )),
+            );
+            obj.insert(
+                "assignment_active_missing_total".to_owned(),
+                serde_json::Value::Number(serde_json::Number::from(
+                    assignment_active_missing_total as i64,
+                )),
+            );
+            obj.insert(
+                "assignment_effective_gap_total".to_owned(),
+                serde_json::Value::Number(serde_json::Number::from(
+                    assignment_effective_gap_total as i64,
                 )),
             );
             obj.insert(
@@ -2538,6 +2557,7 @@ fn merge_hybrid_intents(
     dist: &DistanceMap,
     global: Vec<BotIntent>,
     legacy: &[BotIntent],
+    active_first_strict: bool,
 ) -> Vec<BotIntent> {
     let global_by_bot = global
         .into_iter()
@@ -2559,7 +2579,12 @@ fn merge_hybrid_intents(
         .copied()
         .map(usize::from)
         .sum::<usize>();
-    let active_phase = active_gap_total > 0;
+    let active_missing_total = active_missing_total(state);
+    let active_phase = if active_first_strict {
+        active_missing_total > 0
+    } else {
+        active_gap_total > 0
+    };
     let mut bots = state.bots.iter().collect::<Vec<_>>();
     bots.sort_by(|a, b| a.id.cmp(&b.id));
     bots.into_iter()
@@ -3598,13 +3623,7 @@ fn compute_ordering_sequence(
             .carrying
             .iter()
             .any(|item| team.pending_order_items_set.contains(item));
-        let active_gap_total = team
-            .knowledge
-            .active_gap_by_kind
-            .values()
-            .copied()
-            .map(u32::from)
-            .sum::<u32>();
+        let active_missing_total = active_missing_total(state) as u32;
         let watchdog_pressure = memory
             .get(&bot.id)
             .map(|m| {
@@ -3625,7 +3644,7 @@ fn compute_ordering_sequence(
         if carrying_active {
             score += 50.0;
         }
-        if carrying_preview && active_gap_total <= 2 {
+        if carrying_preview && active_missing_total <= 2 {
             score += 12.0;
         }
         if matches!(role, BotRole::LeadCourier) {
@@ -3639,7 +3658,7 @@ fn compute_ordering_sequence(
         score += watchdog_pressure * 10.0;
         score += choke_occupancy * 3.0;
         if !carrying_active
-            && active_gap_total == 0
+            && active_missing_total == 0
             && matches!(role, BotRole::Collector | BotRole::Yield | BotRole::Idle)
         {
             let mut nearest_preview = u16::MAX;
@@ -4085,7 +4104,7 @@ mod tests {
                 },
             },
         ];
-        let merged = merge_hybrid_intents(&state, &ctx, map, &dist, global, &legacy);
+        let merged = merge_hybrid_intents(&state, &ctx, map, &dist, global, &legacy, true);
         let by_bot = merged
             .into_iter()
             .map(|entry| (entry.bot_id, entry.intent))
@@ -4176,11 +4195,121 @@ mod tests {
                 item_id: "item_bread".to_owned(),
             },
         }];
-        let merged = merge_hybrid_intents(&state, &team, map, &dist, global, &legacy);
+        let merged = merge_hybrid_intents(&state, &team, map, &dist, global, &legacy, true);
         assert_eq!(merged.len(), 1);
         assert!(matches!(
             merged[0].intent,
             Intent::MoveTo { cell } if cell == milk_stand
+        ));
+    }
+
+    #[test]
+    fn hybrid_active_phase_uses_active_missing_not_gap() {
+        let state = GameState {
+            grid: Grid {
+                width: 10,
+                height: 8,
+                drop_off_tiles: vec![[1, 6]],
+                ..Grid::default()
+            },
+            bots: vec![
+                BotState {
+                    id: "0".to_owned(),
+                    x: 7,
+                    y: 5,
+                    carrying: vec![],
+                    capacity: 3,
+                },
+                BotState {
+                    id: "1".to_owned(),
+                    x: 1,
+                    y: 6,
+                    carrying: vec!["milk".to_owned()],
+                    capacity: 3,
+                },
+            ],
+            items: vec![
+                Item {
+                    id: "item_milk".to_owned(),
+                    kind: "milk".to_owned(),
+                    x: 8,
+                    y: 3,
+                },
+                Item {
+                    id: "item_bread".to_owned(),
+                    kind: "bread".to_owned(),
+                    x: 8,
+                    y: 5,
+                },
+            ],
+            orders: vec![
+                Order {
+                    id: "o_active".to_owned(),
+                    item_id: "milk".to_owned(),
+                    status: OrderStatus::InProgress,
+                },
+                Order {
+                    id: "o_preview".to_owned(),
+                    item_id: "bread".to_owned(),
+                    status: OrderStatus::Pending,
+                },
+            ],
+            ..GameState::default()
+        };
+        let world = World::new(&state);
+        let map = world.map();
+        let dist = DistanceMap::build(map);
+        let team = TeamContext::build(
+            &state,
+            map,
+            &dist,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            TeamContextConfig::default(),
+        );
+        let global = vec![
+            BotIntent {
+                bot_id: "0".to_owned(),
+                intent: Intent::PickUp {
+                    item_id: "item_milk".to_owned(),
+                },
+            },
+            BotIntent {
+                bot_id: "1".to_owned(),
+                intent: Intent::MoveTo {
+                    cell: map.dropoff_cells[0],
+                },
+            },
+        ];
+        let legacy = vec![
+            BotIntent {
+                bot_id: "0".to_owned(),
+                intent: Intent::PickUp {
+                    item_id: "item_bread".to_owned(),
+                },
+            },
+            BotIntent {
+                bot_id: "1".to_owned(),
+                intent: Intent::Wait,
+            },
+        ];
+        let merged = merge_hybrid_intents(&state, &team, map, &dist, global, &legacy, true);
+        let by_bot = merged
+            .into_iter()
+            .map(|entry| (entry.bot_id, entry.intent))
+            .collect::<HashMap<_, _>>();
+        assert!(matches!(
+            by_bot.get("0"),
+            Some(Intent::PickUp { item_id }) if item_id == "item_milk"
         ));
     }
 
@@ -4259,7 +4388,7 @@ mod tests {
                 cell: preview_stand,
             },
         }];
-        let merged = merge_hybrid_intents(&state, &team, map, &dist, global, &legacy);
+        let merged = merge_hybrid_intents(&state, &team, map, &dist, global, &legacy, true);
         assert_eq!(merged.len(), 1);
         assert!(matches!(merged[0].intent, Intent::MoveTo { .. }));
         if let Intent::MoveTo { cell } = merged[0].intent {
@@ -4346,7 +4475,7 @@ mod tests {
                 cell: preview_stand,
             },
         }];
-        let merged = merge_hybrid_intents(&state, &team, map, &dist, global, &legacy);
+        let merged = merge_hybrid_intents(&state, &team, map, &dist, global, &legacy, true);
         assert_eq!(merged.len(), 1);
         assert!(matches!(merged[0].intent, Intent::Wait));
     }

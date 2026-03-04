@@ -19,13 +19,14 @@ pub struct AssignmentResult {
     pub stand_task_count: usize,
     pub dropoff_task_count: usize,
     pub active_gap_total: usize,
+    pub active_missing_total: usize,
     pub preview_enabled: bool,
     pub goal_concentration_top3: f64,
     pub late_phase_delivery_streak: u16,
     pub commitment_reassign_count: u16,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct AssignmentRuntimeHints {
     pub late_phase_delivery_streak: u16,
     pub commitment_reassign_count: u16,
@@ -37,6 +38,25 @@ pub struct AssignmentRuntimeHints {
     pub local_radius_by_bot: HashMap<String, u16>,
     pub out_of_area_penalty: f64,
     pub out_of_radius_penalty: f64,
+    pub active_first_strict: bool,
+}
+
+impl Default for AssignmentRuntimeHints {
+    fn default() -> Self {
+        Self {
+            late_phase_delivery_streak: 0,
+            commitment_reassign_count: 0,
+            ticks_since_pickup: 0,
+            ticks_since_dropoff: 0,
+            preferred_area_by_bot: HashMap::new(),
+            expansion_mode_by_bot: HashMap::new(),
+            local_active_candidate_count_by_bot: HashMap::new(),
+            local_radius_by_bot: HashMap::new(),
+            out_of_area_penalty: 0.0,
+            out_of_radius_penalty: 0.0,
+            active_first_strict: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -101,6 +121,7 @@ struct TaskBuildResult {
     tasks: Vec<Task>,
     active_gap_by_kind: HashMap<String, u16>,
     active_gap_total: usize,
+    active_missing_total: usize,
     preview_enabled: bool,
 }
 
@@ -127,7 +148,7 @@ impl AssignmentEngine {
         soft_budget: Duration,
     ) -> Option<AssignmentResult> {
         let started = Instant::now();
-        let built = build_tasks(state, map, dist, team)?;
+        let built = build_tasks(state, map, dist, team, runtime_hints.active_first_strict)?;
         let tasks = built.tasks;
         if tasks.is_empty() {
             return Some(AssignmentResult {
@@ -146,6 +167,7 @@ impl AssignmentEngine {
                 stand_task_count: 0,
                 dropoff_task_count: 0,
                 active_gap_total: built.active_gap_total,
+                active_missing_total: built.active_missing_total,
                 preview_enabled: built.preview_enabled,
                 goal_concentration_top3: 0.0,
                 late_phase_delivery_streak: runtime_hints.late_phase_delivery_streak,
@@ -185,6 +207,8 @@ impl AssignmentEngine {
             .copied()
             .sum::<u64>() as f64;
 
+        let strict_active_phase =
+            runtime_hints.active_first_strict && built.active_missing_total > 0;
         let mut all_edges = Vec::<Edge>::new();
         for bot in &bots {
             if started.elapsed() + Duration::from_millis(4) >= soft_budget {
@@ -199,6 +223,10 @@ impl AssignmentEngine {
                 .any(|item| team.active_order_items_set.contains(item));
             let bot_has_capacity = bot.carrying.len() < bot.capacity;
             let role = team.role_for(&bot.id);
+            let strategy_role = team.strategy_role_for(&bot.id).unwrap_or("");
+            let strategy_is_picker = strategy_role.contains("picker");
+            let strategy_is_runner = strategy_role.contains("runner");
+            let strategy_is_buffer = strategy_role.contains("buffer");
             let queue_goal = team.queue_goal_for(&bot.id);
             let queue_distance = team
                 .queue
@@ -297,6 +325,12 @@ impl AssignmentEngine {
                             return false;
                         }
                         let dist_to_stand = f64::from(dist_to(bot_cell, task.target_cell, dist));
+                        if strict_active_phase
+                            && strategy_is_buffer
+                            && dist_to_stand > f64::from(buffer_long_range_pickup_max_dist())
+                        {
+                            return false;
+                        }
                         let in_area = preferred_area
                             .map(|area| area == target_area)
                             .unwrap_or(true);
@@ -377,6 +411,16 @@ impl AssignmentEngine {
                     }
                     if carrying_active && matches!(task.kind, TaskKind::CarryToDropoff) {
                         adjusted -= 30;
+                    }
+                    if strategy_is_runner
+                        && matches!(
+                            task.kind,
+                            TaskKind::CarryToDropoff
+                                | TaskKind::ImmediateDropOff
+                                | TaskKind::QueuePosition
+                        )
+                    {
+                        adjusted -= 24;
                     }
                     if matches!(task.kind, TaskKind::ImmediateDropOff) {
                         adjusted -= 80;
@@ -522,6 +566,9 @@ impl AssignmentEngine {
                         if expansion_mode && out_of_area_target {
                             adjusted += runtime_hints.out_of_area_penalty.round() as i32;
                         }
+                        if strategy_is_picker && out_of_area_target {
+                            adjusted += 12;
+                        }
                         if expansion_mode && out_of_radius_target {
                             let overrun =
                                 ((dist_to_stand - local_radius) / local_radius).clamp(0.0, 3.0);
@@ -656,6 +703,7 @@ impl AssignmentEngine {
             stand_task_count,
             dropoff_task_count,
             active_gap_total: built.active_gap_total,
+            active_missing_total: built.active_missing_total,
             preview_enabled: built.preview_enabled,
             goal_concentration_top3,
             late_phase_delivery_streak: runtime_hints.late_phase_delivery_streak,
@@ -669,12 +717,14 @@ fn build_tasks(
     map: &MapCache,
     dist: &DistanceMap,
     team: &TeamContext,
+    active_first_strict: bool,
 ) -> Option<TaskBuildResult> {
     if state.bots.is_empty() {
         return Some(TaskBuildResult {
             tasks: Vec::new(),
             active_gap_by_kind: HashMap::new(),
             active_gap_total: 0,
+            active_missing_total: 0,
             preview_enabled: true,
         });
     }
@@ -723,7 +773,8 @@ fn build_tasks(
         .copied()
         .map(usize::from)
         .sum::<usize>();
-    let preview_quota = preview_prefetch_quota(active_gap_total, active_missing_total);
+    let preview_quota =
+        preview_prefetch_quota(active_gap_total, active_missing_total, active_first_strict);
     let preview_enabled = preview_quota > 0 && !preview_missing.is_empty();
 
     let mut active_orders = state
@@ -885,6 +936,7 @@ fn build_tasks(
                 tasks,
                 active_gap_by_kind,
                 active_gap_total,
+                active_missing_total,
                 preview_enabled,
             });
         };
@@ -932,6 +984,7 @@ fn build_tasks(
         tasks,
         active_gap_by_kind,
         active_gap_total,
+        active_missing_total,
         preview_enabled,
     })
 }
@@ -1130,9 +1183,13 @@ fn avg_teammate_distance(bot: &BotState, bots: &[BotState]) -> f64 {
     }
 }
 
-fn preview_prefetch_quota(active_gap_total: usize, active_missing_total: usize) -> u16 {
-    // Never let preview prefetch compete while the active order still needs deliveries.
-    if active_missing_total > 0 {
+fn preview_prefetch_quota(
+    active_gap_total: usize,
+    active_missing_total: usize,
+    active_first_strict: bool,
+) -> u16 {
+    // Strict mode never allows preview prefetch while active order still has missing items.
+    if active_first_strict && active_missing_total > 0 {
         return 0;
     }
     if active_gap_total == 0 {
@@ -1155,6 +1212,17 @@ fn preview_stand_limit() -> usize {
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(3)
             .clamp(1, 12)
+    })
+}
+
+fn buffer_long_range_pickup_max_dist() -> u16 {
+    static VALUE: std::sync::OnceLock<u16> = std::sync::OnceLock::new();
+    *VALUE.get_or_init(|| {
+        std::env::var("GROCERY_BUFFER_LONG_PICKUP_MAX_DIST")
+            .ok()
+            .and_then(|v| v.parse::<u16>().ok())
+            .unwrap_or(8)
+            .clamp(2, 24)
     })
 }
 
@@ -1478,6 +1546,188 @@ mod tests {
         assert!(result.active_task_count > 0);
         assert!(result.active_gap_total > 0);
         assert!(result.preview_task_count <= result.task_count);
+    }
+
+    #[test]
+    fn preview_disabled_when_active_missing_even_if_effective_gap_is_zero() {
+        let state = GameState {
+            grid: Grid {
+                width: 12,
+                height: 8,
+                drop_off_tiles: vec![[1, 6]],
+                ..Grid::default()
+            },
+            bots: vec![
+                BotState {
+                    id: "0".to_owned(),
+                    x: 7,
+                    y: 5,
+                    carrying: vec![],
+                    capacity: 3,
+                },
+                BotState {
+                    id: "1".to_owned(),
+                    x: 1,
+                    y: 6,
+                    carrying: vec!["milk".to_owned()],
+                    capacity: 3,
+                },
+            ],
+            items: vec![
+                Item {
+                    id: "item_active".to_owned(),
+                    kind: "milk".to_owned(),
+                    x: 8,
+                    y: 3,
+                },
+                Item {
+                    id: "item_preview".to_owned(),
+                    kind: "bread".to_owned(),
+                    x: 9,
+                    y: 3,
+                },
+            ],
+            orders: vec![
+                Order {
+                    id: "o_active".to_owned(),
+                    item_id: "milk".to_owned(),
+                    status: OrderStatus::InProgress,
+                },
+                Order {
+                    id: "o_preview".to_owned(),
+                    item_id: "bread".to_owned(),
+                    status: OrderStatus::Pending,
+                },
+            ],
+            ..GameState::default()
+        };
+        let world = World::new(&state);
+        let map = world.map();
+        let dist = DistanceMap::build(map);
+        let team = TeamContext::build(
+            &state,
+            map,
+            &dist,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            TeamContextConfig::default(),
+        );
+        let engine = AssignmentEngine::new();
+        let result = engine
+            .build_intents(
+                &state,
+                map,
+                &dist,
+                &team,
+                8,
+                1.0,
+                1.5,
+                1.0,
+                AssignmentRuntimeHints::default(),
+                Duration::from_millis(200),
+            )
+            .expect("assignment");
+        assert!(result.active_missing_total > 0);
+        assert!(!result.preview_enabled);
+        let bot0 = result
+            .intents
+            .iter()
+            .find(|entry| entry.bot_id == "0")
+            .expect("bot intent");
+        assert!(
+            !matches!(
+                &bot0.intent,
+                crate::dispatcher::Intent::PickUp { item_id } if item_id == "item_preview"
+            ),
+            "preview pickup should not be assigned while active order has missing items"
+        );
+    }
+
+    #[test]
+    fn expert_role_override_affects_assignment_choice() {
+        let state = GameState {
+            grid: Grid {
+                width: 14,
+                height: 8,
+                drop_off_tiles: vec![[0, 7]],
+                ..Grid::default()
+            },
+            bots: vec![BotState {
+                id: "0".to_owned(),
+                x: 1,
+                y: 6,
+                carrying: vec![],
+                capacity: 3,
+            }],
+            items: vec![Item {
+                id: "item_far".to_owned(),
+                kind: "milk".to_owned(),
+                x: 12,
+                y: 1,
+            }],
+            orders: vec![Order {
+                id: "o_milk".to_owned(),
+                item_id: "milk".to_owned(),
+                status: OrderStatus::InProgress,
+            }],
+            ..GameState::default()
+        };
+        let world = World::new(&state);
+        let map = world.map();
+        let dist = DistanceMap::build(map);
+        let mut strategy_roles = HashMap::new();
+        strategy_roles.insert("0".to_owned(), "expert_buffer".to_owned());
+        let team = TeamContext::build(
+            &state,
+            map,
+            &dist,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            TeamContextConfig::default(),
+        )
+        .with_strategy_roles(&strategy_roles);
+        let engine = AssignmentEngine::new();
+        let result = engine
+            .build_intents(
+                &state,
+                map,
+                &dist,
+                &team,
+                8,
+                1.0,
+                1.5,
+                1.0,
+                AssignmentRuntimeHints::default(),
+                Duration::from_millis(200),
+            )
+            .expect("assignment");
+        let intent = result
+            .intents
+            .into_iter()
+            .find(|entry| entry.bot_id == "0")
+            .expect("bot intent");
+        assert!(
+            matches!(intent.intent, crate::dispatcher::Intent::Wait),
+            "buffer role should avoid long-range active pickup under strict active-first"
+        );
     }
 
     #[test]

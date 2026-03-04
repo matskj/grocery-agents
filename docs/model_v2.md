@@ -142,6 +142,20 @@ Then enforce:
 
 `soft + slack <= hard`
 
+Planner search upgrades:
+- Conflict-aware weighted A* (reservation-aware penalties)
+- Dynamic CBS budget/node caps tied to remaining tick deadline
+- Optional knobs:
+  - `GROCERY_ASTAR_HEURISTIC_WEIGHT` (default `1.20`)
+  - `GROCERY_ASTAR_MAX_EXPANDED` (default `4096`)
+  - `GROCERY_ASTAR_WAIT_PENALTY` (default `2`)
+  - `GROCERY_ASTAR_RESERVATION_PENALTY` (default `2`)
+
+Preview planning upgrades:
+- Preview prefetch is now opportunistic instead of all-or-nothing.
+- With active gaps, preview tasks are still allowed under a strict quota.
+- Quota is deterministic and can be tuned with `GROCERY_PREVIEW_STAND_LIMIT`.
+
 ## Training + Eval Commands
 ```powershell
 python -m training.extract --logs-dir logs --out data/runs.parquet
@@ -151,6 +165,7 @@ python -m training.evaluate --data data/runs_features.parquet --model models/exp
 python -m training.export --models-dir models --out models/policy_artifacts.json
 python tools/sweep_eval.py --episodes 20 --mode-filter expert --out models/sweep_results.json
 .\cargo-x64.cmd run --bin eval -- --from-logs --episodes 20 --mode-filter medium --strict-all-modes --coord-baseline models/coord_baseline.json
+python tools/train_all_torch.py --logs-dir logs --models-dir models --trainer-backend auto
 ```
 
 ## Dedup Strategy

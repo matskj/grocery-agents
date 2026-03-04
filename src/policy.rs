@@ -3353,6 +3353,17 @@ fn compute_ordering_sequence(
             .get(&bot.id)
             .copied()
             .unwrap_or(false);
+        let carrying_preview = bot
+            .carrying
+            .iter()
+            .any(|item| team.pending_order_items_set.contains(item));
+        let active_gap_total = team
+            .knowledge
+            .active_gap_by_kind
+            .values()
+            .copied()
+            .map(u32::from)
+            .sum::<u32>();
         let watchdog_pressure = memory
             .get(&bot.id)
             .map(|m| {
@@ -3373,6 +3384,9 @@ fn compute_ordering_sequence(
         if carrying_active {
             score += 50.0;
         }
+        if carrying_preview && active_gap_total <= 2 {
+            score += 12.0;
+        }
         if matches!(role, BotRole::LeadCourier) {
             score += 35.0;
         } else if matches!(role, BotRole::QueueCourier) {
@@ -3383,6 +3397,24 @@ fn compute_ordering_sequence(
         score -= dist_to_goal * 0.75;
         score += watchdog_pressure * 10.0;
         score += choke_occupancy * 3.0;
+        if !carrying_active
+            && active_gap_total == 0
+            && matches!(role, BotRole::Collector | BotRole::Yield | BotRole::Idle)
+        {
+            let mut nearest_preview = u16::MAX;
+            let mut pending = team.pending_order_items_set.iter().collect::<Vec<_>>();
+            pending.sort();
+            for kind in pending {
+                if let Some(stands) = team.knowledge.kind_to_stands.get(kind.as_str()) {
+                    for &stand in stands {
+                        nearest_preview = nearest_preview.min(dist.dist(start, stand));
+                    }
+                }
+            }
+            if nearest_preview != u16::MAX {
+                score += (24.0 - f64::from(nearest_preview.min(24))) * 0.8;
+            }
+        }
 
         let model_score = maybe_score_ordering(
             mode,

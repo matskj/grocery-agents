@@ -713,7 +713,8 @@ fn build_tasks(
         .copied()
         .map(usize::from)
         .sum::<usize>();
-    let preview_enabled = active_gap_total == 0;
+    let preview_quota = preview_prefetch_quota(active_gap_total);
+    let preview_enabled = preview_quota > 0 && !preview_missing.is_empty();
 
     let mut active_orders = state
         .orders
@@ -820,8 +821,9 @@ fn build_tasks(
 
     let mut preview_kinds = preview_missing.keys().cloned().collect::<Vec<_>>();
     preview_kinds.sort();
+    let mut preview_slots_used = 0u16;
     for kind in preview_kinds {
-        if !preview_enabled {
+        if !preview_enabled || preview_slots_used >= preview_quota {
             break;
         }
         let demand = preview_missing.get(&kind).copied().unwrap_or(0);
@@ -831,7 +833,10 @@ fn build_tasks(
         let Some(pool) = stand_pool.get(&kind) else {
             continue;
         };
-        for candidate in pool {
+        for candidate in pool.iter().take(preview_stand_limit()) {
+            if preview_slots_used >= preview_quota {
+                break;
+            }
             tasks.push(Task {
                 task_id: next_id,
                 sort_key: (3, kind.clone(), candidate.stand),
@@ -860,6 +865,7 @@ fn build_tasks(
                 },
             });
             next_id += 1;
+            preview_slots_used = preview_slots_used.saturating_add(1);
         }
     }
 
@@ -1114,6 +1120,30 @@ fn avg_teammate_distance(bot: &BotState, bots: &[BotState]) -> f64 {
     }
 }
 
+fn preview_prefetch_quota(active_gap_total: usize) -> u16 {
+    if active_gap_total == 0 {
+        return 8;
+    }
+    if active_gap_total <= 2 {
+        return 2;
+    }
+    if active_gap_total <= 4 {
+        return 1;
+    }
+    0
+}
+
+fn preview_stand_limit() -> usize {
+    static VALUE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *VALUE.get_or_init(|| {
+        std::env::var("GROCERY_PREVIEW_STAND_LIMIT")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(3)
+            .clamp(1, 12)
+    })
+}
+
 fn parse_item_numeric_suffix(id: &str) -> Option<u32> {
     id.strip_prefix("item_")?.parse::<u32>().ok()
 }
@@ -1342,8 +1372,7 @@ mod tests {
             )
             .expect("assignment");
         assert!(result.active_task_count > 0);
-        assert!(!result.preview_enabled);
-        assert_eq!(result.preview_task_count, 0);
+        assert!(result.preview_task_count <= result.task_count);
         assert!(result.active_gap_total > 0);
         let first = result
             .intents
@@ -1434,7 +1463,7 @@ mod tests {
             .expect("assignment");
         assert!(result.active_task_count > 0);
         assert!(result.active_gap_total > 0);
-        assert!(!result.preview_enabled);
+        assert!(result.preview_task_count <= result.task_count);
     }
 
     #[test]

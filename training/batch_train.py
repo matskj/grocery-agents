@@ -84,6 +84,10 @@ def train_modes(
     features_path: Path,
     out_dir: Path,
     min_rows: int,
+    trainer_backend: str,
+    runtime_feature_set: str,
+    dedup_strategy: str,
+    signature_kind: str,
 ) -> Dict[str, Path]:
     frame = read_table(features_path)
     model_paths: Dict[str, Path] = {}
@@ -106,7 +110,13 @@ def train_modes(
                 "--min-rows",
                 str(min_rows),
                 "--runtime-feature-set",
-                "strict",
+                runtime_feature_set,
+                "--dedup-strategy",
+                dedup_strategy,
+                "--signature-kind",
+                signature_kind,
+                "--trainer-backend",
+                trainer_backend,
             ]
         )
         model_paths[mode] = out_model
@@ -286,6 +296,10 @@ def main() -> None:
     parser.add_argument("--data-out", default="data/runs.parquet")
     parser.add_argument("--features-out", default="data/runs_features.parquet")
     parser.add_argument("--min-rows", type=int, default=50)
+    parser.add_argument("--trainer-backend", choices=["auto", "torch", "ridge"], default="auto")
+    parser.add_argument("--runtime-feature-set", choices=["strict", "extended"], default="strict")
+    parser.add_argument("--dedup-strategy", choices=["none", "downweight", "drop"], default="downweight")
+    parser.add_argument("--signature-kind", choices=["action", "state_action"], default="action")
     args = parser.parse_args()
 
     logs_dir = Path(args.logs_dir)
@@ -342,7 +356,16 @@ def main() -> None:
             old.unlink()
         except OSError:
             pass
-    candidate_models = train_modes(modes, features_out, candidate_dir, args.min_rows)
+    candidate_models = train_modes(
+        modes,
+        features_out,
+        candidate_dir,
+        args.min_rows,
+        trainer_backend=args.trainer_backend,
+        runtime_feature_set=args.runtime_feature_set,
+        dedup_strategy=args.dedup_strategy,
+        signature_kind=args.signature_kind,
+    )
     decisions = promote_candidates(
         models_dir=models_dir,
         candidate_dir=candidate_dir,

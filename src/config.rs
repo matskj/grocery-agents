@@ -96,27 +96,27 @@ pub struct ConfigArgs {
     )]
     pub planner_budget_mode: PlannerBudgetMode,
 
-    #[arg(long, env = "GROCERY_PLANNER_SOFT_BUDGET_MS", default_value_t = 1_200)]
+    #[arg(long, env = "GROCERY_PLANNER_SOFT_BUDGET_MS", default_value_t = 1_450)]
     pub planner_soft_budget_ms: u64,
 
     #[arg(
         long,
         env = "GROCERY_PLANNER_SOFT_BUDGET_MIN_MS",
-        default_value_t = 1_350
+        default_value_t = 1_450
     )]
     pub planner_soft_budget_min_ms: u64,
 
     #[arg(
         long,
         env = "GROCERY_PLANNER_SOFT_BUDGET_MAX_MS",
-        default_value_t = 1_900
+        default_value_t = 1_930
     )]
     pub planner_soft_budget_max_ms: u64,
 
-    #[arg(long, env = "GROCERY_PLANNER_HARD_BUDGET_MS", default_value_t = 1_950)]
+    #[arg(long, env = "GROCERY_PLANNER_HARD_BUDGET_MS", default_value_t = 1_980)]
     pub planner_hard_budget_ms: u64,
 
-    #[arg(long, env = "GROCERY_PLANNER_DEADLINE_SLACK_MS", default_value_t = 80)]
+    #[arg(long, env = "GROCERY_PLANNER_DEADLINE_SLACK_MS", default_value_t = 40)]
     pub planner_deadline_slack_ms: u64,
 
     #[arg(long, env = "GROCERY_LOG_LEVEL", default_value = "info")]

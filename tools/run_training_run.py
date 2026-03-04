@@ -43,6 +43,8 @@ def main() -> None:
     parser.add_argument("--target", default="x86_64-pc-windows-msvc")
     parser.add_argument("--no-ui", action="store_true")
     parser.add_argument("--no-batch-train", action="store_true")
+    parser.add_argument("--full-retrain", action="store_true")
+    parser.add_argument("--python-bin", default=None)
     parser.add_argument("--batch-size", type=int, default=10)
     parser.add_argument("--train-modes", default="easy,medium,hard,expert")
     parser.add_argument(
@@ -78,23 +80,45 @@ def main() -> None:
     )
     rc = subprocess.call(cmd, cwd=str(ROOT_DIR), env=env)
     if rc == 0 and not args.no_batch_train:
-        batch_cmd = [
-            sys.executable,
-            "-m",
-            "training.batch_train",
-            "--logs-dir",
-            args.logs_dir,
-            "--models-dir",
-            str(ROOT_DIR / "models"),
-            "--batch-size",
-            str(args.batch_size),
-            "--modes",
-            args.train_modes,
-        ]
-        batch_rc = subprocess.call(batch_cmd, cwd=str(ROOT_DIR), env=env)
-        if batch_rc != 0:
-            print(f"Batch training failed with exit code {batch_rc}", file=sys.stderr)
-            rc = batch_rc
+        if args.full_retrain:
+            py = args.python_bin
+            if not py:
+                torch_venv = ROOT_DIR / ".venv311-torch" / "Scripts" / "python.exe"
+                py = str(torch_venv) if torch_venv.exists() else sys.executable
+            retrain_cmd = [
+                py,
+                str(ROOT_DIR / "tools" / "train_all_torch.py"),
+                "--logs-dir",
+                args.logs_dir,
+                "--models-dir",
+                str(ROOT_DIR / "models"),
+                "--modes",
+                args.train_modes,
+                "--trainer-backend",
+                "auto",
+            ]
+            retrain_rc = subprocess.call(retrain_cmd, cwd=str(ROOT_DIR), env=env)
+            if retrain_rc != 0:
+                print(f"Full retrain failed with exit code {retrain_rc}", file=sys.stderr)
+                rc = retrain_rc
+        else:
+            batch_cmd = [
+                sys.executable,
+                "-m",
+                "training.batch_train",
+                "--logs-dir",
+                args.logs_dir,
+                "--models-dir",
+                str(ROOT_DIR / "models"),
+                "--batch-size",
+                str(args.batch_size),
+                "--modes",
+                args.train_modes,
+            ]
+            batch_rc = subprocess.call(batch_cmd, cwd=str(ROOT_DIR), env=env)
+            if batch_rc != 0:
+                print(f"Batch training failed with exit code {batch_rc}", file=sys.stderr)
+                rc = batch_rc
     raise SystemExit(rc)
 
 

@@ -115,7 +115,7 @@ impl Eq for Node {}
 impl MotionPlanner {
     pub fn new(horizon: u8) -> Self {
         Self {
-            horizon: horizon.clamp(12, 20),
+            horizon: horizon.clamp(12, 28),
         }
     }
 
@@ -134,8 +134,7 @@ impl MotionPlanner {
         let mut res_table = ReservationTable::new(dropoff_capacity);
         let mut diagnostics = MotionPlanDiagnostics::default();
         let cbs_start = Instant::now();
-        let cbs_budget = Duration::from_millis(3);
-        let cbs_node_cap: u16 = 80;
+        let (cbs_budget, cbs_node_cap) = dynamic_cbs_limits(soft_deadline, cbs_start);
         let mut bots = state.bots.iter().collect::<Vec<_>>();
         sort_bots_for_planning(&mut bots, explicit_order);
 
@@ -423,6 +422,11 @@ impl MotionPlanner {
         if start == goal {
             return vec![start];
         }
+        let horizon = max_horizon.min(self.horizon);
+        let heuristic_weight = astar_heuristic_weight();
+        let wait_penalty = astar_wait_penalty();
+        let reservation_penalty = astar_reservation_penalty();
+        let mut expanded_nodes = 0usize;
         let mut open = BinaryHeap::new();
         let mut best_g: HashMap<(u16, u8), u16> = HashMap::new();
         let mut parent: HashMap<(u16, u8), (u16, u8)> = HashMap::new();
@@ -438,6 +442,10 @@ impl MotionPlanner {
         let mut best_terminal = (start, 0u8, u16::MAX);
 
         while let Some(Node { g, cell, t, .. }) = open.pop() {
+            expanded_nodes = expanded_nodes.saturating_add(1);
+            if expanded_nodes >= astar_max_expanded_nodes() {
+                break;
+            }
             let h = dist.dist(cell, goal);
             if h < best_terminal.2 {
                 best_terminal = (cell, t, h);
@@ -446,7 +454,7 @@ impl MotionPlanner {
                 best_terminal = (cell, t, 0);
                 break;
             }
-            if t >= max_horizon.min(self.horizon) {
+            if t >= horizon {
                 continue;
             }
 
@@ -487,6 +495,22 @@ impl MotionPlanner {
                         blocked_moves,
                     )));
                 }
+                if next == cell && dist.dist(cell, goal) > 1 {
+                    penalty = penalty.saturating_add(wait_penalty);
+                }
+                if reservation_penalty > 0 {
+                    let future_t = nt.saturating_add(1);
+                    let mut crowded = 0u16;
+                    if v_res.contains(&(future_t, next)) {
+                        crowded = crowded.saturating_add(1);
+                    }
+                    if e_res.contains(&(future_t, next, cell)) {
+                        crowded = crowded.saturating_add(1);
+                    }
+                    penalty = penalty.saturating_add(
+                        reservation_penalty.saturating_mul(crowded),
+                    );
+                }
                 let ng = g.saturating_add(1).saturating_add(penalty);
                 let key = (next, nt);
                 if best_g.get(&key).map(|v| ng >= *v).unwrap_or(false) {
@@ -494,7 +518,10 @@ impl MotionPlanner {
                 }
                 best_g.insert(key, ng);
                 parent.insert(key, (cell, t));
-                let f = (ng as u16).saturating_add(dist.dist(next, goal));
+                let h_weighted = ((dist.dist(next, goal) as f64) * heuristic_weight)
+                    .round()
+                    .clamp(0.0, f64::from(u16::MAX)) as u16;
+                let f = (ng as u16).saturating_add(h_weighted);
                 open.push(Node {
                     f,
                     g: ng,
@@ -749,6 +776,68 @@ fn sort_bots_for_planning<'a>(
             (None, None) => a.id.cmp(&b.id),
         }
     });
+}
+
+fn dynamic_cbs_limits(soft_deadline: Option<Instant>, started: Instant) -> (Duration, u16) {
+    let mut budget_ms = 8u64;
+    if let Some(deadline) = soft_deadline {
+        let now = Instant::now();
+        if deadline > now {
+            let remaining = deadline.duration_since(now);
+            let adaptive = (remaining.as_millis() as u64 / 8).clamp(8, 120);
+            budget_ms = adaptive;
+        }
+    }
+    let elapsed = started.elapsed().as_millis() as u64;
+    if elapsed > 0 {
+        budget_ms = budget_ms.saturating_sub((elapsed / 4).min(20)).max(4);
+    }
+    let node_cap = (80u64 + budget_ms.saturating_mul(4)).clamp(80, 640) as u16;
+    (Duration::from_millis(budget_ms), node_cap)
+}
+
+fn astar_heuristic_weight() -> f64 {
+    static VALUE: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *VALUE.get_or_init(|| {
+        std::env::var("GROCERY_ASTAR_HEURISTIC_WEIGHT")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(1.20)
+            .clamp(1.0, 2.5)
+    })
+}
+
+fn astar_max_expanded_nodes() -> usize {
+    static VALUE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *VALUE.get_or_init(|| {
+        std::env::var("GROCERY_ASTAR_MAX_EXPANDED")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(4_096)
+            .clamp(256, 20_000)
+    })
+}
+
+fn astar_wait_penalty() -> u16 {
+    static VALUE: std::sync::OnceLock<u16> = std::sync::OnceLock::new();
+    *VALUE.get_or_init(|| {
+        std::env::var("GROCERY_ASTAR_WAIT_PENALTY")
+            .ok()
+            .and_then(|v| v.parse::<u16>().ok())
+            .unwrap_or(2)
+            .min(32)
+    })
+}
+
+fn astar_reservation_penalty() -> u16 {
+    static VALUE: std::sync::OnceLock<u16> = std::sync::OnceLock::new();
+    *VALUE.get_or_init(|| {
+        std::env::var("GROCERY_ASTAR_RESERVATION_PENALTY")
+            .ok()
+            .and_then(|v| v.parse::<u16>().ok())
+            .unwrap_or(2)
+            .min(32)
+    })
 }
 
 #[derive(Debug, Clone, Default)]

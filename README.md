@@ -171,6 +171,29 @@ python tools/run_training_run.py --no-batch-train --auto-token-difficulty expert
 python tools/run_training_run.py --no-batch-train --auto-token-difficulty expert --repeat 10 --cooldown-seconds 62
 ```
 
+Auto-fetch websocket tokens via direct HTTP play endpoint (faster than browser automation):
+
+```powershell
+# set auth/session input used by the site API (choose bearer or cookie depending on your DevTools request)
+$env:AINM_PLAY_ENDPOINT="https://app.ainm.no/api/challenge/play"
+$env:AINM_ACCESS_TOKEN="<access token>"
+
+python tools/run_training_run.py `
+  --no-batch-train `
+  --auto-token-provider http `
+  --auto-token-difficulty expert `
+  --repeat 10 `
+  --cooldown-seconds 62
+```
+
+If your request needs extra headers, pass one or more:
+
+```powershell
+python tools/run_training_run.py --auto-token-provider http --auto-token-difficulty expert `
+  --auto-token-header "X-Requested-With: XMLHttpRequest" `
+  --auto-token-header "Sec-Fetch-Site: same-origin"
+```
+
 Playwright setup:
 
 ```powershell

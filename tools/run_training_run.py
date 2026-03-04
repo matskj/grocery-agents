@@ -91,6 +91,68 @@ def fetch_ws_url_playwright(
     return ws_url
 
 
+def fetch_ws_url_http(
+    python_bin: str,
+    difficulty: str,
+    endpoint: str | None,
+    map_id: str | None,
+    method: str,
+    origin: str,
+    referer: str,
+    bearer_env: str,
+    cookie_env: str,
+    timeout_seconds: float,
+    extra_headers: list[str],
+) -> str:
+    cmd = [
+        python_bin,
+        str(ROOT_DIR / "tools" / "fetch_ws_url_http.py"),
+        "--difficulty",
+        difficulty,
+        "--method",
+        method,
+        "--origin",
+        origin,
+        "--referer",
+        referer,
+        "--bearer-env",
+        bearer_env,
+        "--cookie-env",
+        cookie_env,
+        "--timeout-seconds",
+        str(timeout_seconds),
+    ]
+    if endpoint:
+        cmd.extend(["--endpoint", endpoint])
+    if map_id:
+        cmd.extend(["--map-id", map_id])
+    for header in extra_headers:
+        cmd.extend(["--header", header])
+    proc = subprocess.run(
+        cmd,
+        cwd=str(ROOT_DIR),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        stderr = (proc.stderr or "").strip()
+        stdout = (proc.stdout or "").strip()
+        raise RuntimeError(
+            "Failed to fetch ws url via HTTP play endpoint.\n"
+            f"command: {' '.join(cmd)}\n"
+            f"stdout: {stdout}\n"
+            f"stderr: {stderr}"
+        )
+    ws_url = extract_ws_url(proc.stdout) or extract_ws_url(proc.stderr)
+    if not ws_url:
+        raise RuntimeError(
+            "HTTP fetch completed without returning a ws URL. "
+            "Check endpoint/auth headers/cookies."
+        )
+    return ws_url
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Run one training game and ensure replay UI is running."
@@ -106,10 +168,16 @@ def main() -> None:
     parser.add_argument("--repeat", type=int, default=1)
     parser.add_argument("--cooldown-seconds", type=float, default=62.0)
     parser.add_argument(
+        "--auto-token-provider",
+        choices=["playwright", "http"],
+        default="playwright",
+        help="Token refresh provider used with --auto-token-difficulty.",
+    )
+    parser.add_argument(
         "--auto-token-difficulty",
         choices=["easy", "medium", "hard", "expert"],
         default=None,
-        help="Auto-fetch ws URL for this difficulty via Playwright before each run.",
+        help="Auto-fetch ws URL for this difficulty before each run.",
     )
     parser.add_argument(
         "--auto-token-state-path",
@@ -126,6 +194,54 @@ def main() -> None:
         "--auto-token-headed",
         action="store_true",
         help="Run Playwright in headed mode (useful for first login/session bootstrap).",
+    )
+    parser.add_argument(
+        "--auto-token-endpoint",
+        default=os.getenv("AINM_PLAY_ENDPOINT"),
+        help="HTTP play endpoint (used by --auto-token-provider http).",
+    )
+    parser.add_argument(
+        "--auto-token-map-id",
+        default=None,
+        help="Optional map_id override for HTTP token provider.",
+    )
+    parser.add_argument(
+        "--auto-token-http-method",
+        choices=["POST", "GET"],
+        default="POST",
+        help="HTTP method for token endpoint.",
+    )
+    parser.add_argument(
+        "--auto-token-origin",
+        default="https://app.ainm.no",
+        help="Origin header for HTTP token endpoint.",
+    )
+    parser.add_argument(
+        "--auto-token-referer",
+        default="https://app.ainm.no/challenge",
+        help="Referer header for HTTP token endpoint.",
+    )
+    parser.add_argument(
+        "--auto-token-bearer-env",
+        default="AINM_ACCESS_TOKEN",
+        help="Env var containing bearer token for HTTP provider.",
+    )
+    parser.add_argument(
+        "--auto-token-cookie-env",
+        default="AINM_COOKIE",
+        help="Env var containing cookie header for HTTP provider.",
+    )
+    parser.add_argument(
+        "--auto-token-header",
+        action="append",
+        default=[],
+        help="Extra HTTP header for token endpoint, format 'Key: Value'. Repeatable.",
+    )
+    parser.add_argument(
+        "--auto-token-timeout-seconds",
+        type=float,
+        default=15.0,
+        help="HTTP token fetch timeout in seconds.",
     )
     parser.add_argument("--batch-size", type=int, default=10)
     parser.add_argument("--train-modes", default="easy,medium,hard,expert")
@@ -174,21 +290,44 @@ def main() -> None:
     for run_index in range(args.repeat):
         run_args = cargo_args
         if args.auto_token_difficulty:
-            try:
-                ws_url = fetch_ws_url_playwright(
-                    python_bin=py,
-                    difficulty=args.auto_token_difficulty,
-                    state_path=args.auto_token_state_path,
-                    app_url=args.auto_token_app_url,
-                    timeout_ms=args.auto_token_timeout_ms,
-                    headed=args.auto_token_headed,
-                )
-            except RuntimeError as exc:
-                print(str(exc), file=sys.stderr)
-                rc = 3
-                break
+            if args.auto_token_provider == "playwright":
+                try:
+                    ws_url = fetch_ws_url_playwright(
+                        python_bin=py,
+                        difficulty=args.auto_token_difficulty,
+                        state_path=args.auto_token_state_path,
+                        app_url=args.auto_token_app_url,
+                        timeout_ms=args.auto_token_timeout_ms,
+                        headed=args.auto_token_headed,
+                    )
+                except RuntimeError as exc:
+                    print(str(exc), file=sys.stderr)
+                    rc = 3
+                    break
+            else:
+                try:
+                    ws_url = fetch_ws_url_http(
+                        python_bin=py,
+                        difficulty=args.auto_token_difficulty,
+                        endpoint=args.auto_token_endpoint,
+                        map_id=args.auto_token_map_id,
+                        method=args.auto_token_http_method,
+                        origin=args.auto_token_origin,
+                        referer=args.auto_token_referer,
+                        bearer_env=args.auto_token_bearer_env,
+                        cookie_env=args.auto_token_cookie_env,
+                        timeout_seconds=args.auto_token_timeout_seconds,
+                        extra_headers=args.auto_token_header,
+                    )
+                except RuntimeError as exc:
+                    print(str(exc), file=sys.stderr)
+                    rc = 4
+                    break
             run_args = [ws_url]
-            print(f"[run {run_index + 1}/{args.repeat}] using auto-fetched ws URL")
+            print(
+                f"[run {run_index + 1}/{args.repeat}] using auto-fetched ws URL "
+                f"(provider={args.auto_token_provider})"
+            )
         cmd = build_cmd(args.target, run_args)
         rc = subprocess.call(cmd, cwd=str(ROOT_DIR), env=env)
         if rc != 0:

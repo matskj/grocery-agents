@@ -2,11 +2,15 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 from ensure_replay_server import DEFAULT_HOST, DEFAULT_PORT, ROOT_DIR, ensure_server
+
+WS_URL_PATTERN = re.compile(r"wss://game\.ainm\.no/ws\?token=[A-Za-z0-9._~-]+")
 
 
 def normalize_cargo_args(args: list[str]) -> list[str]:
@@ -33,6 +37,60 @@ def build_cmd(target: str, cargo_args: list[str]) -> list[str]:
     ]
 
 
+def extract_ws_url(text: str) -> str | None:
+    match = WS_URL_PATTERN.search(text)
+    if match:
+        return match.group(0)
+    return None
+
+
+def fetch_ws_url_playwright(
+    python_bin: str,
+    difficulty: str,
+    state_path: str,
+    app_url: str,
+    timeout_ms: int,
+    headed: bool,
+) -> str:
+    cmd = [
+        python_bin,
+        str(ROOT_DIR / "tools" / "fetch_ws_url_playwright.py"),
+        "--difficulty",
+        difficulty,
+        "--state-path",
+        state_path,
+        "--app-url",
+        app_url,
+        "--timeout-ms",
+        str(timeout_ms),
+    ]
+    if headed:
+        cmd.append("--headed")
+    proc = subprocess.run(
+        cmd,
+        cwd=str(ROOT_DIR),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        stderr = (proc.stderr or "").strip()
+        stdout = (proc.stdout or "").strip()
+        raise RuntimeError(
+            "Failed to fetch ws url via Playwright.\n"
+            f"command: {' '.join(cmd)}\n"
+            f"stdout: {stdout}\n"
+            f"stderr: {stderr}"
+        )
+    ws_url = extract_ws_url(proc.stdout) or extract_ws_url(proc.stderr)
+    if not ws_url:
+        raise RuntimeError(
+            "Playwright fetch completed without returning a ws URL. "
+            "Check login state and selector compatibility."
+        )
+    return ws_url
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Run one training game and ensure replay UI is running."
@@ -45,6 +103,30 @@ def main() -> None:
     parser.add_argument("--no-batch-train", action="store_true")
     parser.add_argument("--full-retrain", action="store_true")
     parser.add_argument("--python-bin", default=None)
+    parser.add_argument("--repeat", type=int, default=1)
+    parser.add_argument("--cooldown-seconds", type=float, default=62.0)
+    parser.add_argument(
+        "--auto-token-difficulty",
+        choices=["easy", "medium", "hard", "expert"],
+        default=None,
+        help="Auto-fetch ws URL for this difficulty via Playwright before each run.",
+    )
+    parser.add_argument(
+        "--auto-token-state-path",
+        default=str(ROOT_DIR / ".secrets" / "ainm_storage_state.json"),
+        help="Persistent Playwright storage state file (login cookies/session).",
+    )
+    parser.add_argument(
+        "--auto-token-app-url",
+        default="https://app.ainm.no/challenge",
+        help="Challenge page URL used by Playwright token fetcher.",
+    )
+    parser.add_argument("--auto-token-timeout-ms", type=int, default=30_000)
+    parser.add_argument(
+        "--auto-token-headed",
+        action="store_true",
+        help="Run Playwright in headed mode (useful for first login/session bootstrap).",
+    )
     parser.add_argument("--batch-size", type=int, default=10)
     parser.add_argument("--train-modes", default="easy,medium,hard,expert")
     parser.add_argument(
@@ -65,28 +147,64 @@ def main() -> None:
         print(f"Replay UI: http://{args.host}:{args.port}")
 
     cargo_args = normalize_cargo_args(args.cargo_args)
-    if not cargo_args:
+    if not cargo_args and not args.auto_token_difficulty:
         print(
-            "Missing bot run arguments. Example:\n"
+            "Missing bot run arguments or auto token mode. Example:\n"
             "  python tools/run_training_run.py -- \"wss://game.ainm.no/ws?token=...\"",
             file=sys.stderr,
         )
         raise SystemExit(2)
+    if args.repeat < 1:
+        raise SystemExit("--repeat must be >= 1")
 
-    cmd = build_cmd(args.target, cargo_args)
+    if cargo_args and args.auto_token_difficulty:
+        print(
+            "Both cargo args and --auto-token-difficulty provided; "
+            "auto-token mode will be used.",
+            file=sys.stderr,
+        )
+
     env = dict(os.environ)
     env.setdefault(
         "POLICY_ARTIFACT_PATH", str((ROOT_DIR / "models" / "policy_artifacts.json").resolve())
     )
-    rc = subprocess.call(cmd, cwd=str(ROOT_DIR), env=env)
-    if rc == 0 and not args.no_batch_train:
+    py = args.python_bin or sys.executable
+    rc = 0
+    successful_runs = 0
+    for run_index in range(args.repeat):
+        run_args = cargo_args
+        if args.auto_token_difficulty:
+            try:
+                ws_url = fetch_ws_url_playwright(
+                    python_bin=py,
+                    difficulty=args.auto_token_difficulty,
+                    state_path=args.auto_token_state_path,
+                    app_url=args.auto_token_app_url,
+                    timeout_ms=args.auto_token_timeout_ms,
+                    headed=args.auto_token_headed,
+                )
+            except RuntimeError as exc:
+                print(str(exc), file=sys.stderr)
+                rc = 3
+                break
+            run_args = [ws_url]
+            print(f"[run {run_index + 1}/{args.repeat}] using auto-fetched ws URL")
+        cmd = build_cmd(args.target, run_args)
+        rc = subprocess.call(cmd, cwd=str(ROOT_DIR), env=env)
+        if rc != 0:
+            break
+        successful_runs += 1
+        if run_index + 1 < args.repeat:
+            time.sleep(max(0.0, args.cooldown_seconds))
+
+    if rc == 0 and successful_runs > 0 and not args.no_batch_train:
         if args.full_retrain:
-            py = args.python_bin
-            if not py:
+            py_train = args.python_bin
+            if not py_train:
                 torch_venv = ROOT_DIR / ".venv311-torch" / "Scripts" / "python.exe"
-                py = str(torch_venv) if torch_venv.exists() else sys.executable
+                py_train = str(torch_venv) if torch_venv.exists() else sys.executable
             retrain_cmd = [
-                py,
+                py_train,
                 str(ROOT_DIR / "tools" / "train_all_torch.py"),
                 "--logs-dir",
                 args.logs_dir,

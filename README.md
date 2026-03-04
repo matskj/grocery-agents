@@ -161,6 +161,23 @@ python tools/run_training_run.py --no-batch-train -- "wss://game.ainm.no/ws?toke
 python tools/run_training_run.py --batch-size 10 --train-modes "easy,expert" -- "wss://game.ainm.no/ws?token=eyJ..."
 ```
 
+Auto-fetch websocket tokens via Playwright (no manual token paste):
+
+```powershell
+# first run: headed mode so you can complete login; storage saved to .secrets/ainm_storage_state.json
+python tools/run_training_run.py --no-batch-train --auto-token-difficulty expert --auto-token-headed
+
+# subsequent runs: headless, auto-refreshes token each run
+python tools/run_training_run.py --no-batch-train --auto-token-difficulty expert --repeat 10 --cooldown-seconds 62
+```
+
+Playwright setup:
+
+```powershell
+python -m pip install playwright
+python -m playwright install chromium
+```
+
 ### Token input behavior (CLI + env fallback)
 
 The token is configured with Clap as `--token` plus an environment fallback:

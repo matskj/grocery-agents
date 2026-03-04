@@ -42,6 +42,12 @@ pub struct Config {
     pub coord_max_bots_per_stand: u8,
     pub coord_post_dropoff_retask_ticks: u8,
     pub coord_area_balance_weight: f64,
+    pub coord_local_radius_base: u8,
+    pub coord_local_radius_max: u8,
+    pub coord_expansion_stall_ticks: u8,
+    pub coord_preferred_area_ttl_ticks: u8,
+    pub coord_out_of_area_penalty: f64,
+    pub coord_out_of_radius_penalty: f64,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -154,6 +160,40 @@ pub struct ConfigArgs {
 
     #[arg(long, env = "GROCERY_COORD_AREA_BALANCE_WEIGHT", default_value_t = 1.0)]
     pub coord_area_balance_weight: f64,
+
+    #[arg(long, env = "GROCERY_COORD_LOCAL_RADIUS_BASE", default_value_t = 8)]
+    pub coord_local_radius_base: u8,
+
+    #[arg(long, env = "GROCERY_COORD_LOCAL_RADIUS_MAX", default_value_t = 14)]
+    pub coord_local_radius_max: u8,
+
+    #[arg(
+        long,
+        env = "GROCERY_COORD_EXPANSION_STALL_TICKS",
+        default_value_t = 10
+    )]
+    pub coord_expansion_stall_ticks: u8,
+
+    #[arg(
+        long,
+        env = "GROCERY_COORD_PREFERRED_AREA_TTL_TICKS",
+        default_value_t = 10
+    )]
+    pub coord_preferred_area_ttl_ticks: u8,
+
+    #[arg(
+        long,
+        env = "GROCERY_COORD_OUT_OF_AREA_PENALTY",
+        default_value_t = 28.0
+    )]
+    pub coord_out_of_area_penalty: f64,
+
+    #[arg(
+        long,
+        env = "GROCERY_COORD_OUT_OF_RADIUS_PENALTY",
+        default_value_t = 45.0
+    )]
+    pub coord_out_of_radius_penalty: f64,
 }
 
 impl ConfigArgs {
@@ -168,6 +208,10 @@ impl ConfigArgs {
         let max_soft_allowed = hard_budget.saturating_sub(slack).max(100);
         soft_min = soft_min.min(max_soft_allowed);
         soft_max = soft_max.min(max_soft_allowed).max(soft_min);
+        let local_radius_base = self.coord_local_radius_base.clamp(4, 24);
+        let local_radius_max = self
+            .coord_local_radius_max
+            .clamp(local_radius_base, 32);
 
         Config {
             horizon: self.horizon.clamp(8, 32),
@@ -199,6 +243,12 @@ impl ConfigArgs {
             coord_max_bots_per_stand: self.coord_max_bots_per_stand.clamp(1, 3),
             coord_post_dropoff_retask_ticks: self.coord_post_dropoff_retask_ticks.clamp(1, 24),
             coord_area_balance_weight: self.coord_area_balance_weight.clamp(0.0, 10.0),
+            coord_local_radius_base: local_radius_base,
+            coord_local_radius_max: local_radius_max,
+            coord_expansion_stall_ticks: self.coord_expansion_stall_ticks.clamp(2, 60),
+            coord_preferred_area_ttl_ticks: self.coord_preferred_area_ttl_ticks.clamp(2, 60),
+            coord_out_of_area_penalty: self.coord_out_of_area_penalty.clamp(0.0, 200.0),
+            coord_out_of_radius_penalty: self.coord_out_of_radius_penalty.clamp(0.0, 200.0),
         }
     }
 }

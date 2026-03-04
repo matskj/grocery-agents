@@ -217,10 +217,19 @@ def build_rows(logs_dir: Path) -> List[Dict]:
             ordering_score_by_bot = bot_metric_map(team_summary, "ordering_score_by_bot")
             ordering_stage_by_bot = bot_metric_map(team_summary, "ordering_stage_by_bot")
             goal_cell_by_bot = bot_goal_cell_map(team_summary, "goal_cell_by_bot")
+            goal_area_id_by_bot = bot_metric_map(team_summary, "goal_area_id_by_bot")
             pickup_fail_streak_by_bot = bot_metric_map(team_summary, "pickup_fail_streak_by_bot")
             last_successful_drop_tick_by_bot = bot_metric_map(
                 team_summary, "last_successful_drop_tick_by_bot"
             )
+            preferred_area_id_by_bot = bot_metric_map(
+                team_summary, "preferred_area_id_by_bot"
+            )
+            expansion_mode_by_bot = bot_metric_map(team_summary, "expansion_mode_by_bot")
+            local_active_candidate_count_by_bot = bot_metric_map(
+                team_summary, "local_active_candidate_count_by_bot"
+            )
+            local_radius_by_bot = bot_metric_map(team_summary, "local_radius_by_bot")
 
             for bot in bots:
                 bot_id = str(bot.get("id", ""))
@@ -325,6 +334,19 @@ def build_rows(logs_dir: Path) -> List[Dict]:
                 ordering_rank = as_int(ordering_rank_by_bot.get(bot_id), -1)
                 ordering_score = float(ordering_score_by_bot.get(bot_id, 0.0) or 0.0)
                 ordering_stage = str(ordering_stage_by_bot.get(bot_id, "none"))
+                preferred_area_id = as_int(preferred_area_id_by_bot.get(bot_id), -1)
+                if preferred_area_id >= 65535:
+                    preferred_area_id = -1
+                expansion_mode_active = bool_flag(
+                    expansion_mode_by_bot.get(bot_id, False)
+                )
+                local_active_candidate_count = as_int(
+                    local_active_candidate_count_by_bot.get(bot_id), 0
+                )
+                local_radius = as_int(local_radius_by_bot.get(bot_id), 0)
+                goal_area_id = as_int(goal_area_id_by_bot.get(bot_id), -1)
+                if goal_area_id >= 65535:
+                    goal_area_id = -1
 
                 meta = run_meta.get(run_id, {})
                 row = {
@@ -388,6 +410,13 @@ def build_rows(logs_dir: Path) -> List[Dict]:
                     "ordering_rank": float(ordering_rank),
                     "ordering_score": ordering_score,
                     "ordering_stage": ordering_stage,
+                    "preferred_area_id": preferred_area_id,
+                    "expansion_mode_active": expansion_mode_active,
+                    "local_active_candidate_count": float(
+                        max(0, local_active_candidate_count)
+                    ),
+                    "local_radius": float(max(0, local_radius)),
+                    "goal_area_id": goal_area_id,
                     "action_kind": action_kind,
                     "action_dx": action_dx,
                     "action_dy": action_dy,

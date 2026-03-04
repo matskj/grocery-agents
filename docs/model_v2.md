@@ -1,9 +1,9 @@
-# Model v2: Conversion-First Multi-Head Scoring
+# Model v2/v1.3: Conversion-First + Local-First Coordination
 
 ## Overview
 Model v2 extends the per-mode policy artifacts with conversion-aware heads while preserving v1 compatibility.
 
-- Schema version: `1.2.0`
+- Schema version: `1.3.0`
 - Artifact file: `models/policy_artifacts.json`
 - Layout: per-mode map under `modes`
 
@@ -42,6 +42,27 @@ Labels are inferred with one-tick alignment via carrying deltas.
 - `time_since_last_conversion_tick`
 - `last_conversion_was_pickup`
 - `last_conversion_was_dropoff`
+
+### Local-first coordination features
+- `preferred_area_match`
+- `expansion_mode_active`
+- `local_active_candidate_count`
+- `local_radius`
+- `out_of_area_target`
+- `out_of_radius_target`
+
+Runtime emits matching telemetry maps:
+- `preferred_area_id_by_bot`
+- `expansion_mode_by_bot`
+- `local_active_candidate_count_by_bot`
+- `local_radius_by_bot`
+- `goal_area_id_by_bot`
+
+Local-first envelope behavior:
+- Collectors are assigned sticky preferred areas (TTL-based) and effective local radius.
+- Non-expansion ticks hard-filter out-of-envelope pickups.
+- Expansion mode activates deterministically when local supply is absent or pickup progress stalls.
+- ML remains the primary ranker among feasible candidates.
 
 ## Artifact Schema (per mode)
 ```json
@@ -129,6 +150,7 @@ python -m training.train --mode expert --data data/runs_features.parquet --out m
 python -m training.evaluate --data data/runs_features.parquet --model models/expert.json --mode expert --reference-score 101 --candidate-score 85
 python -m training.export --models-dir models --out models/policy_artifacts.json
 python tools/sweep_eval.py --episodes 20 --mode-filter expert --out models/sweep_results.json
+.\cargo-x64.cmd run --bin eval -- --from-logs --episodes 20 --mode-filter medium --strict-all-modes --coord-baseline models/coord_baseline.json
 ```
 
 ## Dedup Strategy
@@ -150,6 +172,16 @@ Use the Rust eval binary to print conversion KPIs and optional hard-fail gates:
 ```powershell
 .\cargo-x64.cmd run --bin eval -- --from-logs --episodes 20 --mode-filter expert
 .\cargo-x64.cmd run --bin eval -- --from-logs --episodes 20 --mode-filter expert --enforce-gates
+```
+
+Strict all-mode locality rollout:
+- Write baseline snapshot:
+```powershell
+.\cargo-x64.cmd run --bin eval -- --from-logs --episodes 20 --write-coord-baseline --coord-baseline models/coord_baseline.json
+```
+- Enforce medium/hard/expert comparison vs baseline:
+```powershell
+.\cargo-x64.cmd run --bin eval -- --from-logs --episodes 20 --strict-all-modes --coord-baseline models/coord_baseline.json --enforce-gates
 ```
 
 ## Reproducibility Contract

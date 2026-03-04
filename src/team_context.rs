@@ -150,6 +150,10 @@ pub struct TeamKnowledge {
     pub effective_supply_by_kind: HashMap<String, u16>,
     pub stand_claims: HashMap<u16, StandClaim>,
     pub bot_commitments: HashMap<String, BotCommitment>,
+    pub preferred_area_id_by_bot: HashMap<String, u16>,
+    pub expansion_mode_by_bot: HashMap<String, bool>,
+    pub local_active_candidate_count_by_bot: HashMap<String, u16>,
+    pub local_radius_by_bot: HashMap<String, u16>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -322,6 +326,32 @@ impl TeamContext {
         self
     }
 
+    pub fn with_locality(
+        mut self,
+        preferred_area_id_by_bot: &HashMap<String, u16>,
+        expansion_mode_by_bot: &HashMap<String, bool>,
+        local_active_candidate_count_by_bot: &HashMap<String, u16>,
+        local_radius_by_bot: &HashMap<String, u16>,
+    ) -> Self {
+        self.knowledge.preferred_area_id_by_bot = preferred_area_id_by_bot
+            .iter()
+            .map(|(bot_id, area)| (bot_id.clone(), *area))
+            .collect();
+        self.knowledge.expansion_mode_by_bot = expansion_mode_by_bot
+            .iter()
+            .map(|(bot_id, active)| (bot_id.clone(), *active))
+            .collect();
+        self.knowledge.local_active_candidate_count_by_bot = local_active_candidate_count_by_bot
+            .iter()
+            .map(|(bot_id, count)| (bot_id.clone(), *count))
+            .collect();
+        self.knowledge.local_radius_by_bot = local_radius_by_bot
+            .iter()
+            .map(|(bot_id, radius)| (bot_id.clone(), *radius))
+            .collect();
+        self
+    }
+
     pub fn role_for(&self, bot_id: &str) -> BotRole {
         self.queue
             .assignments
@@ -355,6 +385,11 @@ impl TeamContext {
         let mut loop_two_cycle_count_by_bot = serde_json::Map::new();
         let mut coverage_gain_by_bot = serde_json::Map::new();
         let mut dropoff_watchdog_triggered_by_bot = serde_json::Map::new();
+        let mut preferred_area_id_by_bot = serde_json::Map::new();
+        let mut expansion_mode_by_bot = serde_json::Map::new();
+        let mut local_active_candidate_count_by_bot = serde_json::Map::new();
+        let mut local_radius_by_bot = serde_json::Map::new();
+        let mut goal_area_id_by_bot = serde_json::Map::new();
 
         for (bot_id, assignment) in &self.queue.assignments {
             queue_roles.insert(
@@ -447,6 +482,46 @@ impl TeamContext {
                         .unwrap_or(false),
                 ),
             );
+            preferred_area_id_by_bot.insert(
+                bot_id.clone(),
+                serde_json::Value::Number(serde_json::Number::from(
+                    self.knowledge
+                        .preferred_area_id_by_bot
+                        .get(bot_id)
+                        .copied()
+                        .unwrap_or(u16::MAX) as i64,
+                )),
+            );
+            expansion_mode_by_bot.insert(
+                bot_id.clone(),
+                serde_json::Value::Bool(
+                    self.knowledge
+                        .expansion_mode_by_bot
+                        .get(bot_id)
+                        .copied()
+                        .unwrap_or(false),
+                ),
+            );
+            local_active_candidate_count_by_bot.insert(
+                bot_id.clone(),
+                serde_json::Value::Number(serde_json::Number::from(
+                    self.knowledge
+                        .local_active_candidate_count_by_bot
+                        .get(bot_id)
+                        .copied()
+                        .unwrap_or(0) as i64,
+                )),
+            );
+            local_radius_by_bot.insert(
+                bot_id.clone(),
+                serde_json::Value::Number(serde_json::Number::from(
+                    self.knowledge
+                        .local_radius_by_bot
+                        .get(bot_id)
+                        .copied()
+                        .unwrap_or(0) as i64,
+                )),
+            );
         }
 
         for (bot_id, snap) in &self.bot_snapshot {
@@ -490,6 +565,19 @@ impl TeamContext {
                         serde_json::json!([x, y])
                     }
                     None => serde_json::Value::Null,
+                },
+            );
+            goal_area_id_by_bot.insert(
+                bot_id.clone(),
+                match plan_state.and_then(|s| s.goal_cell) {
+                    Some(goal) => serde_json::Value::Number(serde_json::Number::from(
+                        self.knowledge
+                            .area_id_by_cell
+                            .get(goal as usize)
+                            .copied()
+                            .unwrap_or(u16::MAX) as i64,
+                    )),
+                    None => serde_json::Value::Number(serde_json::Number::from(-1)),
                 },
             );
             path_preview_by_bot.insert(
@@ -636,6 +724,10 @@ impl TeamContext {
             "loop_two_cycle_count_by_bot": loop_two_cycle_count_by_bot,
             "coverage_gain_by_bot": coverage_gain_by_bot,
             "dropoff_watchdog_triggered_by_bot": dropoff_watchdog_triggered_by_bot,
+            "preferred_area_id_by_bot": preferred_area_id_by_bot,
+            "expansion_mode_by_bot": expansion_mode_by_bot,
+            "local_active_candidate_count_by_bot": local_active_candidate_count_by_bot,
+            "local_radius_by_bot": local_radius_by_bot,
             "queue_lane_cells": lane_xy,
             "dropoff_ring_cells": ring_xy,
             "dropoff_control_zone_cells": control_zone_xy,
@@ -649,6 +741,7 @@ impl TeamContext {
             "escape_macro_active_by_bot": escape_macro_active,
             "escape_macro_ticks_remaining_by_bot": escape_macro_ticks_remaining,
             "goal_cell_by_bot": goal_cell_by_bot,
+            "goal_area_id_by_bot": goal_area_id_by_bot,
             "path_preview_by_bot": path_preview_by_bot,
             "queue_violation_count": self.queue.violations.len(),
             "lane_congestion": self.traffic.lane_congestion,
@@ -828,6 +921,10 @@ fn build_team_knowledge(
         effective_supply_by_kind,
         stand_claims: HashMap::new(),
         bot_commitments: HashMap::new(),
+        preferred_area_id_by_bot: HashMap::new(),
+        expansion_mode_by_bot: HashMap::new(),
+        local_active_candidate_count_by_bot: HashMap::new(),
+        local_radius_by_bot: HashMap::new(),
     }
 }
 

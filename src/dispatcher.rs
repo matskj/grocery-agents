@@ -279,6 +279,12 @@ impl Dispatcher {
                             time_since_last_conversion_tick: 0.0,
                             last_conversion_was_pickup: 0.0,
                             last_conversion_was_dropoff: 0.0,
+                            preferred_area_match: 0.0,
+                            expansion_mode_active: 0.0,
+                            local_active_candidate_count: 0.0,
+                            local_radius: 0.0,
+                            out_of_area_target: 0.0,
+                            out_of_radius_target: 0.0,
                         },
                     );
                     if blocked >= 2 && active_pickups.len() > 1 {
@@ -350,6 +356,12 @@ impl Dispatcher {
                                 time_since_last_conversion_tick: 0.0,
                                 last_conversion_was_pickup: 0.0,
                                 last_conversion_was_dropoff: 0.0,
+                                preferred_area_match: 0.0,
+                                expansion_mode_active: 0.0,
+                                local_active_candidate_count: 0.0,
+                                local_radius: 0.0,
+                                out_of_area_target: 0.0,
+                                out_of_radius_target: 0.0,
                             },
                         );
                         if blocked >= 2 && preview_pickups.len() > 1 {

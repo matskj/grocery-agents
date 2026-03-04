@@ -56,6 +56,12 @@ struct PickupAttempt {
     carrying_len: usize,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct AreaAssignment {
+    area_id: u16,
+    expires_tick: u64,
+}
+
 #[derive(Debug)]
 pub struct Policy {
     config: Arc<Config>,
@@ -74,6 +80,8 @@ pub struct Policy {
     bot_commitments: HashMap<String, BotCommitment>,
     depleted_item_ids: HashSet<String>,
     pickup_failures_by_item: HashMap<String, u8>,
+    preferred_area_by_bot: HashMap<String, AreaAssignment>,
+    expansion_mode_by_bot: HashMap<String, bool>,
 }
 
 impl Policy {
@@ -95,6 +103,8 @@ impl Policy {
             bot_commitments: HashMap::new(),
             depleted_item_ids: HashSet::new(),
             pickup_failures_by_item: HashMap::new(),
+            preferred_area_by_bot: HashMap::new(),
+            expansion_mode_by_bot: HashMap::new(),
         }
     }
 
@@ -103,6 +113,8 @@ impl Policy {
         if state.tick == 0 {
             self.depleted_item_ids.clear();
             self.pickup_failures_by_item.clear();
+            self.preferred_area_by_bot.clear();
+            self.expansion_mode_by_bot.clear();
         }
         let world = World::new(state.clone());
         let map = world.map();
@@ -254,6 +266,18 @@ impl Policy {
             )
             .with_claims(&self.stand_claims, &self.bot_commitments, state.tick);
         }
+        let (
+            preferred_area_by_bot,
+            expansion_mode_by_bot,
+            local_active_candidate_count_by_bot,
+            local_radius_by_bot,
+        ) = self.compute_locality_hints(state, map, &dist, &team_ctx);
+        team_ctx = team_ctx.with_locality(
+            &preferred_area_by_bot,
+            &expansion_mode_by_bot,
+            &local_active_candidate_count_by_bot,
+            &local_radius_by_bot,
+        );
         self.sticky_roles = team_ctx.queue.next_sticky.clone();
 
         let assign_started = Instant::now();
@@ -294,6 +318,13 @@ impl Policy {
                         commitment_reassign_count: 0,
                         ticks_since_pickup: self.ticks_since_pickup,
                         ticks_since_dropoff: self.ticks_since_dropoff,
+                        preferred_area_by_bot: preferred_area_by_bot.clone(),
+                        expansion_mode_by_bot: expansion_mode_by_bot.clone(),
+                        local_active_candidate_count_by_bot: local_active_candidate_count_by_bot
+                            .clone(),
+                        local_radius_by_bot: local_radius_by_bot.clone(),
+                        out_of_area_penalty: self.config.coord_out_of_area_penalty,
+                        out_of_radius_penalty: self.config.coord_out_of_radius_penalty,
                     },
                     remaining,
                 )
@@ -1398,6 +1429,179 @@ impl Policy {
 
     pub fn last_team_telemetry(&self) -> serde_json::Value {
         self.last_team_telemetry.clone()
+    }
+
+    fn compute_locality_hints(
+        &mut self,
+        state: &GameState,
+        map: &crate::world::MapCache,
+        dist: &DistanceMap,
+        team: &TeamContext,
+    ) -> (
+        HashMap<String, u16>,
+        HashMap<String, bool>,
+        HashMap<String, u16>,
+        HashMap<String, u16>,
+    ) {
+        let mut active_stands_by_area = HashMap::<u16, Vec<u16>>::new();
+        for (kind, gap) in &team.knowledge.active_gap_by_kind {
+            if *gap == 0 {
+                continue;
+            }
+            let Some(stands) = team.knowledge.kind_to_stands.get(kind) else {
+                continue;
+            };
+            for &stand in stands {
+                let area = team
+                    .knowledge
+                    .area_id_by_cell
+                    .get(stand as usize)
+                    .copied()
+                    .unwrap_or(u16::MAX);
+                active_stands_by_area.entry(area).or_default().push(stand);
+            }
+        }
+        for stands in active_stands_by_area.values_mut() {
+            stands.sort_unstable();
+            stands.dedup();
+        }
+
+        let mut min_dropoff_dist_by_area = HashMap::<u16, u16>::new();
+        for (area, stands) in &active_stands_by_area {
+            let mut best = u16::MAX;
+            for &stand in stands {
+                for &drop in &map.dropoff_cells {
+                    best = best.min(dist.dist(stand, drop));
+                }
+            }
+            min_dropoff_dist_by_area.insert(*area, best);
+        }
+
+        let mut preferred_area_by_bot = HashMap::<String, u16>::new();
+        let mut expansion_mode_by_bot = HashMap::<String, bool>::new();
+        let mut local_active_candidate_count_by_bot = HashMap::<String, u16>::new();
+        let mut local_radius_by_bot = HashMap::<String, u16>::new();
+
+        let mode_adjust = mode_radius_adjustment(team.mode.as_str());
+        let base_radius = i32::from(self.config.coord_local_radius_base) + mode_adjust;
+        let base_radius = base_radius.clamp(4, i32::from(self.config.coord_local_radius_max)) as u16;
+        let ttl = u64::from(self.config.coord_preferred_area_ttl_ticks);
+
+        let mut known_bot_ids = HashSet::<String>::new();
+        let mut bots = state.bots.iter().collect::<Vec<_>>();
+        bots.sort_by(|a, b| a.id.cmp(&b.id));
+        for bot in bots {
+            known_bot_ids.insert(bot.id.clone());
+            let role = team.role_for(&bot.id);
+            let is_courier = matches!(role, BotRole::LeadCourier | BotRole::QueueCourier);
+            let blocked = team
+                .bot_snapshot
+                .get(&bot.id)
+                .map(|snap| snap.blocked_ticks)
+                .unwrap_or(0);
+            let local_radius = base_radius.min(u16::from(self.config.coord_local_radius_max));
+            let local_radius_f = f64::from(local_radius.max(1));
+            let Some(start) = map.idx(bot.x, bot.y) else {
+                preferred_area_by_bot.insert(bot.id.clone(), u16::MAX);
+                expansion_mode_by_bot.insert(bot.id.clone(), true);
+                local_active_candidate_count_by_bot.insert(bot.id.clone(), 0);
+                local_radius_by_bot.insert(bot.id.clone(), local_radius);
+                continue;
+            };
+
+            let mut preferred = self
+                .preferred_area_by_bot
+                .get(&bot.id)
+                .copied()
+                .filter(|entry| {
+                    entry.expires_tick >= state.tick
+                        && active_stands_by_area
+                            .get(&entry.area_id)
+                            .map(|stands| !stands.is_empty())
+                            .unwrap_or(false)
+                })
+                .map(|entry| entry.area_id);
+
+            if preferred.is_none() {
+                let mut candidates = active_stands_by_area.keys().copied().collect::<Vec<_>>();
+                candidates.sort_unstable();
+                let mut best = None::<(i32, u16)>;
+                for area_id in candidates {
+                    let Some(stands) = active_stands_by_area.get(&area_id) else {
+                        continue;
+                    };
+                    if stands.is_empty() {
+                        continue;
+                    }
+                    let min_dist = stands
+                        .iter()
+                        .copied()
+                        .map(|stand| dist.dist(start, stand))
+                        .min()
+                        .unwrap_or(u16::MAX);
+                    let min_drop = min_dropoff_dist_by_area
+                        .get(&area_id)
+                        .copied()
+                        .unwrap_or(u16::MAX);
+                    let area_load = team
+                        .knowledge
+                        .area_load_by_id
+                        .get(&area_id)
+                        .copied()
+                        .unwrap_or(0);
+                    let score = i32::from(min_dist.min(200)) * 2
+                        + i32::from(min_drop.min(200))
+                        + i32::from(area_load) * 3;
+                    match best {
+                        Some((best_score, best_area))
+                            if score > best_score
+                                || (score == best_score && area_id > best_area) => {}
+                        _ => best = Some((score, area_id)),
+                    }
+                }
+                preferred = best.map(|(_, area)| area);
+            }
+
+            let preferred_area = preferred.unwrap_or(u16::MAX);
+            self.preferred_area_by_bot.insert(
+                bot.id.clone(),
+                AreaAssignment {
+                    area_id: preferred_area,
+                    expires_tick: state.tick.saturating_add(ttl),
+                },
+            );
+            let local_count = active_stands_by_area
+                .get(&preferred_area)
+                .map(|stands| {
+                    stands
+                        .iter()
+                        .copied()
+                        .filter(|stand| f64::from(dist.dist(start, *stand)) <= local_radius_f)
+                        .count() as u16
+                })
+                .unwrap_or(0);
+            let expansion = is_courier
+                || local_count == 0
+                || blocked >= 3
+                || self.ticks_since_pickup >= u16::from(self.config.coord_expansion_stall_ticks);
+            self.expansion_mode_by_bot.insert(bot.id.clone(), expansion);
+            preferred_area_by_bot.insert(bot.id.clone(), preferred_area);
+            expansion_mode_by_bot.insert(bot.id.clone(), expansion);
+            local_active_candidate_count_by_bot.insert(bot.id.clone(), local_count);
+            local_radius_by_bot.insert(bot.id.clone(), local_radius);
+        }
+
+        self.preferred_area_by_bot
+            .retain(|bot_id, _| known_bot_ids.contains(bot_id));
+        self.expansion_mode_by_bot
+            .retain(|bot_id, _| known_bot_ids.contains(bot_id));
+
+        (
+            preferred_area_by_bot,
+            expansion_mode_by_bot,
+            local_active_candidate_count_by_bot,
+            local_radius_by_bot,
+        )
     }
 
     fn recent_cell_visits_team(&self) -> HashMap<u16, u16> {
@@ -4079,6 +4283,16 @@ fn queue_max_ring_entrants() -> usize {
             .unwrap_or(1)
             .max(1)
     })
+}
+
+fn mode_radius_adjustment(mode: &str) -> i32 {
+    match mode {
+        "easy" => -1,
+        "medium" => 0,
+        "hard" => 1,
+        "expert" => 2,
+        _ => 0,
+    }
 }
 
 fn assignment_no_progress_trigger_ticks() -> u8 {

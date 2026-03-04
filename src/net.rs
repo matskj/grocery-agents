@@ -30,7 +30,7 @@ use crate::{
 };
 
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
-const LOG_SCHEMA_VERSION: &str = "1.2.0";
+const LOG_SCHEMA_VERSION: &str = "1.3.0";
 
 #[derive(Debug, serde::Deserialize)]
 #[serde(untagged)]
@@ -111,6 +111,12 @@ pub async fn run_game_loop(
             "planner_soft_budget_max_ms": config.planner_soft_budget_max_ms,
             "planner_hard_budget_ms": config.planner_hard_budget_ms,
             "planner_deadline_slack_ms": config.planner_deadline_slack_ms,
+            "coord_local_radius_base": config.coord_local_radius_base,
+            "coord_local_radius_max": config.coord_local_radius_max,
+            "coord_expansion_stall_ticks": config.coord_expansion_stall_ticks,
+            "coord_preferred_area_ttl_ticks": config.coord_preferred_area_ttl_ticks,
+            "coord_out_of_area_penalty": config.coord_out_of_area_penalty,
+            "coord_out_of_radius_penalty": config.coord_out_of_radius_penalty,
             "mode": ctx.session.difficulty.as_deref().unwrap_or("unknown"),
             "map_id": ctx.session.map_id,
             "difficulty": ctx.session.difficulty,
@@ -1337,6 +1343,12 @@ mod tests {
             coord_max_bots_per_stand: 1,
             coord_post_dropoff_retask_ticks: 6,
             coord_area_balance_weight: 1.0,
+            coord_local_radius_base: 8,
+            coord_local_radius_max: 14,
+            coord_expansion_stall_ticks: 10,
+            coord_preferred_area_ttl_ticks: 10,
+            coord_out_of_area_penalty: 28.0,
+            coord_out_of_radius_penalty: 45.0,
         }
     }
 

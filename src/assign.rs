@@ -25,12 +25,18 @@ pub struct AssignmentResult {
     pub commitment_reassign_count: u16,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct AssignmentRuntimeHints {
     pub late_phase_delivery_streak: u16,
     pub commitment_reassign_count: u16,
     pub ticks_since_pickup: u16,
     pub ticks_since_dropoff: u16,
+    pub preferred_area_by_bot: HashMap<String, u16>,
+    pub expansion_mode_by_bot: HashMap<String, bool>,
+    pub local_active_candidate_count_by_bot: HashMap<String, u16>,
+    pub local_radius_by_bot: HashMap<String, u16>,
+    pub out_of_area_penalty: f64,
+    pub out_of_radius_penalty: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -233,6 +239,28 @@ impl AssignmentEngine {
                 .idx(bot.x, bot.y)
                 .map(|cell| map.dropoff_cells.contains(&cell))
                 .unwrap_or(false);
+            let preferred_area = runtime_hints.preferred_area_by_bot.get(&bot.id).copied();
+            let expansion_mode = runtime_hints
+                .expansion_mode_by_bot
+                .get(&bot.id)
+                .copied()
+                .unwrap_or(false);
+            let local_active_candidate_count = f64::from(
+                runtime_hints
+                    .local_active_candidate_count_by_bot
+                    .get(&bot.id)
+                    .copied()
+                    .unwrap_or(0),
+            );
+            let local_radius = f64::from(
+                runtime_hints
+                    .local_radius_by_bot
+                    .get(&bot.id)
+                    .copied()
+                    .unwrap_or(1)
+                    .max(1),
+            );
+            let enforce_local_first = !matches!(role, BotRole::LeadCourier | BotRole::QueueCourier);
 
             let mut ranked = tasks
                 .iter()
@@ -244,6 +272,33 @@ impl AssignmentEngine {
                         && !bot_has_capacity
                     {
                         return false;
+                    }
+                    if matches!(task.kind, TaskKind::PickupStand | TaskKind::ImmediatePickup)
+                        && enforce_local_first
+                    {
+                        let target_area = team
+                            .knowledge
+                            .area_id_by_cell
+                            .get(task.target_cell as usize)
+                            .copied()
+                            .unwrap_or(u16::MAX);
+                        let stand_claimed_by_other = team
+                            .knowledge
+                            .stand_claims
+                            .get(&task.target_cell)
+                            .map(|claim| claim.bot_id != bot.id && claim.expires_tick >= state.tick)
+                            .unwrap_or(false);
+                        if stand_claimed_by_other && !expansion_mode {
+                            return false;
+                        }
+                        let dist_to_stand = f64::from(dist_to(bot_cell, task.target_cell, dist));
+                        let in_area = preferred_area
+                            .map(|area| area == target_area)
+                            .unwrap_or(true);
+                        let in_radius = dist_to_stand <= local_radius;
+                        if !expansion_mode && (!in_area || !in_radius) {
+                            return false;
+                        }
                     }
                     if matches!(task.kind, TaskKind::QueuePosition)
                         && !matches!(role, BotRole::LeadCourier | BotRole::QueueCourier)
@@ -346,6 +401,19 @@ impl AssignmentEngine {
                             f64::from(nearest_drop_dist(bot_cell, map, dist).min(64));
                         let roundtrip_eta =
                             dist_to_stand + 0.7 * f64::from(task.nearest_drop_dist.min(64));
+                        let target_area = team
+                            .knowledge
+                            .area_id_by_cell
+                            .get(task.target_cell as usize)
+                            .copied()
+                            .unwrap_or(u16::MAX);
+                        let preferred_area_match = preferred_area
+                            .map(|area| area == target_area)
+                            .unwrap_or(false);
+                        let out_of_area_target = preferred_area
+                            .map(|area| area != target_area)
+                            .unwrap_or(false);
+                        let out_of_radius_target = dist_to_stand > local_radius;
                         let stand_claimed_by_other = team
                             .knowledge
                             .stand_claims
@@ -425,11 +493,17 @@ impl AssignmentEngine {
                             time_since_last_conversion_tick: time_since_last_conversion,
                             last_conversion_was_pickup,
                             last_conversion_was_dropoff: 1.0 - last_conversion_was_pickup,
+                            preferred_area_match: if preferred_area_match { 1.0 } else { 0.0 },
+                            expansion_mode_active: if expansion_mode { 1.0 } else { 0.0 },
+                            local_active_candidate_count,
+                            local_radius,
+                            out_of_area_target: if out_of_area_target { 1.0 } else { 0.0 },
+                            out_of_radius_target: if out_of_radius_target { 1.0 } else { 0.0 },
                         };
                         let mode = team.mode.as_str();
                         let model_score = maybe_score_pick(mode, features);
                         if let Some(score) = model_score {
-                            adjusted -= (score.combined_expected_score * 6.0).round() as i32;
+                            adjusted -= (score.combined_expected_score * 10.0).round() as i32;
                             if score.pickup_prob < 0.35 {
                                 adjusted += ((0.35 - score.pickup_prob) * 120.0).round() as i32;
                             }
@@ -439,6 +513,15 @@ impl AssignmentEngine {
                             if contention > 0.0 {
                                 adjusted += (contention * 10.0).round() as i32;
                             }
+                        }
+                        if expansion_mode && out_of_area_target {
+                            adjusted += runtime_hints.out_of_area_penalty.round() as i32;
+                        }
+                        if expansion_mode && out_of_radius_target {
+                            let overrun = ((dist_to_stand - local_radius) / local_radius)
+                                .clamp(0.0, 3.0);
+                            adjusted +=
+                                (runtime_hints.out_of_radius_penalty * overrun).round() as i32;
                         }
                         let pickup_stall_ticks = runtime_hints.ticks_since_pickup.saturating_sub(8);
                         if pickup_stall_ticks > 0 {
@@ -1359,5 +1442,177 @@ mod tests {
         let low = roundtrip_idle_pressure_penalty(12.0, 6.0, 4.0);
         let high = roundtrip_idle_pressure_penalty(28.0, 20.0, 24.0);
         assert!(high > low);
+    }
+
+    #[test]
+    fn local_first_filters_far_pickups_when_local_exists() {
+        let state = GameState {
+            grid: Grid {
+                width: 14,
+                height: 8,
+                drop_off_tiles: vec![[0, 7]],
+                ..Grid::default()
+            },
+            bots: vec![BotState {
+                id: "0".to_owned(),
+                x: 2,
+                y: 6,
+                carrying: vec![],
+                capacity: 3,
+            }],
+            items: vec![
+                Item {
+                    id: "item_local".to_owned(),
+                    kind: "milk".to_owned(),
+                    x: 3,
+                    y: 3,
+                },
+                Item {
+                    id: "item_far".to_owned(),
+                    kind: "bread".to_owned(),
+                    x: 12,
+                    y: 1,
+                },
+            ],
+            orders: vec![
+                Order {
+                    id: "o_milk".to_owned(),
+                    item_id: "milk".to_owned(),
+                    status: OrderStatus::InProgress,
+                },
+                Order {
+                    id: "o_bread".to_owned(),
+                    item_id: "bread".to_owned(),
+                    status: OrderStatus::InProgress,
+                },
+            ],
+            ..GameState::default()
+        };
+        let world = World::new(state.clone());
+        let map = world.map();
+        let dist = DistanceMap::build(map);
+        let team = TeamContext::build(
+            &state,
+            map,
+            &dist,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            TeamContextConfig::default(),
+        );
+        let local_stand = map.stand_cells_for_item("item_local")[0];
+        let local_area = team
+            .knowledge
+            .area_id_by_cell
+            .get(local_stand as usize)
+            .copied()
+            .unwrap_or(u16::MAX);
+        let mut hints = AssignmentRuntimeHints::default();
+        hints.preferred_area_by_bot.insert("0".to_owned(), local_area);
+        hints.expansion_mode_by_bot.insert("0".to_owned(), false);
+        hints.local_active_candidate_count_by_bot.insert("0".to_owned(), 1);
+        hints.local_radius_by_bot.insert("0".to_owned(), 5);
+        hints.out_of_area_penalty = 28.0;
+        hints.out_of_radius_penalty = 45.0;
+
+        let engine = AssignmentEngine::new();
+        let result = engine
+            .build_intents(&state, map, &dist, &team, 8, 1.0, 1.5, 1.0, hints, Duration::from_millis(200))
+            .expect("assignment");
+        let intent = result
+            .intents
+            .into_iter()
+            .find(|entry| entry.bot_id == "0")
+            .expect("bot intent");
+        match intent.intent {
+            crate::dispatcher::Intent::PickUp { item_id } => assert_eq!(item_id, "item_local"),
+            crate::dispatcher::Intent::MoveTo { cell } => {
+                assert_eq!(cell, local_stand);
+            }
+            _ => panic!("expected local pickup/move intent"),
+        }
+    }
+
+    #[test]
+    fn expansion_mode_allows_far_pickup_after_stall() {
+        let state = GameState {
+            grid: Grid {
+                width: 14,
+                height: 8,
+                drop_off_tiles: vec![[0, 7]],
+                ..Grid::default()
+            },
+            bots: vec![BotState {
+                id: "0".to_owned(),
+                x: 1,
+                y: 6,
+                carrying: vec![],
+                capacity: 3,
+            }],
+            items: vec![Item {
+                id: "item_far".to_owned(),
+                kind: "milk".to_owned(),
+                x: 12,
+                y: 1,
+            }],
+            orders: vec![Order {
+                id: "o_milk".to_owned(),
+                item_id: "milk".to_owned(),
+                status: OrderStatus::InProgress,
+            }],
+            ..GameState::default()
+        };
+        let world = World::new(state.clone());
+        let map = world.map();
+        let dist = DistanceMap::build(map);
+        let team = TeamContext::build(
+            &state,
+            map,
+            &dist,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            TeamContextConfig::default(),
+        );
+        let mut hints = AssignmentRuntimeHints::default();
+        hints.preferred_area_by_bot.insert("0".to_owned(), u16::MAX);
+        hints.expansion_mode_by_bot.insert("0".to_owned(), true);
+        hints.local_active_candidate_count_by_bot.insert("0".to_owned(), 0);
+        hints.local_radius_by_bot.insert("0".to_owned(), 2);
+        hints.out_of_area_penalty = 28.0;
+        hints.out_of_radius_penalty = 45.0;
+
+        let engine = AssignmentEngine::new();
+        let result = engine
+            .build_intents(&state, map, &dist, &team, 8, 1.0, 1.5, 1.0, hints, Duration::from_millis(200))
+            .expect("assignment");
+        let intent = result
+            .intents
+            .into_iter()
+            .find(|entry| entry.bot_id == "0")
+            .expect("bot intent");
+        assert!(
+            matches!(
+                intent.intent,
+                crate::dispatcher::Intent::PickUp { .. } | crate::dispatcher::Intent::MoveTo { .. }
+            ),
+            "expansion mode should still produce an active pickup path"
+        );
     }
 }

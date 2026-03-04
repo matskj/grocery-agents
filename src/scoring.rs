@@ -148,6 +148,12 @@ pub struct CandidateFeatures {
     pub time_since_last_conversion_tick: f64,
     pub last_conversion_was_pickup: f64,
     pub last_conversion_was_dropoff: f64,
+    pub preferred_area_match: f64,
+    pub expansion_mode_active: f64,
+    pub local_active_candidate_count: f64,
+    pub local_radius: f64,
+    pub out_of_area_target: f64,
+    pub out_of_radius_target: f64,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -315,6 +321,12 @@ fn candidate_feature_value(name: &str, features: CandidateFeatures) -> f64 {
         "time_since_last_conversion_tick" => features.time_since_last_conversion_tick,
         "last_conversion_was_pickup" => features.last_conversion_was_pickup,
         "last_conversion_was_dropoff" => features.last_conversion_was_dropoff,
+        "preferred_area_match" => features.preferred_area_match,
+        "expansion_mode_active" => features.expansion_mode_active,
+        "local_active_candidate_count" => features.local_active_candidate_count,
+        "local_radius" => features.local_radius,
+        "out_of_area_target" => features.out_of_area_target,
+        "out_of_radius_target" => features.out_of_radius_target,
         _ => 0.0,
     }
 }
@@ -390,6 +402,13 @@ fn score_with_weights(weights: &HashMap<String, f64>, features: CandidateFeature
         * *weights.get("last_conversion_was_pickup").unwrap_or(&0.0);
     score += features.last_conversion_was_dropoff
         * *weights.get("last_conversion_was_dropoff").unwrap_or(&0.0);
+    score += features.preferred_area_match * *weights.get("preferred_area_match").unwrap_or(&0.0);
+    score += features.expansion_mode_active * *weights.get("expansion_mode_active").unwrap_or(&0.0);
+    score += features.local_active_candidate_count
+        * *weights.get("local_active_candidate_count").unwrap_or(&0.0);
+    score += features.local_radius * *weights.get("local_radius").unwrap_or(&0.0);
+    score += features.out_of_area_target * *weights.get("out_of_area_target").unwrap_or(&0.0);
+    score += features.out_of_radius_target * *weights.get("out_of_radius_target").unwrap_or(&0.0);
     score
 }
 

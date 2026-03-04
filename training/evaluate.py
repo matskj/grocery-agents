@@ -410,9 +410,30 @@ def main() -> None:
         carrying_only_inactive = frame.get(
             "carrying_only_inactive", pd.Series(np.zeros(len(frame)))
         ).to_numpy(dtype=float)
+        preferred_area_match = frame.get(
+            "preferred_area_match", pd.Series(np.zeros(len(frame)))
+        ).to_numpy(dtype=float)
+        expansion_mode_active = frame.get(
+            "expansion_mode_active", pd.Series(np.zeros(len(frame)))
+        ).to_numpy(dtype=float)
+        out_of_area_target = frame.get(
+            "out_of_area_target", pd.Series(np.zeros(len(frame)))
+        ).to_numpy(dtype=float)
+        out_of_radius_target = frame.get(
+            "out_of_radius_target", pd.Series(np.zeros(len(frame)))
+        ).to_numpy(dtype=float)
+        goal_valid = frame.get("goal_cell_valid", pd.Series(np.zeros(len(frame)))).to_numpy(dtype=float)
         idle_far_inactive = (
             ((idle_far > 0.5) & (carrying_only_inactive > 0.5)).sum()
             / max(1, int((carrying_only_inactive > 0.5).sum()))
+        )
+        local_first_violation = (
+            ((expansion_mode_active <= 0.5) & ((out_of_area_target > 0.5) | (out_of_radius_target > 0.5))).sum()
+            / max(1, int((expansion_mode_active <= 0.5).sum()))
+        )
+        preferred_area_match_rate = (
+            ((preferred_area_match > 0.5) & (goal_valid > 0.5)).sum()
+            / max(1, int((goal_valid > 0.5).sum()))
         )
 
         pickup_mask = frame["pickup_attempt"].to_numpy(dtype=float) > 0.5
@@ -497,6 +518,19 @@ def main() -> None:
                 if carrying_only_inactive.size
                 else 0.0,
                 "idle_far_given_carrying_only_inactive_rate": float(idle_far_inactive),
+            },
+            "locality": {
+                "preferred_area_match_rate": float(preferred_area_match_rate),
+                "out_of_area_target_rate": float((out_of_area_target > 0.5).mean())
+                if out_of_area_target.size
+                else 0.0,
+                "out_of_radius_target_rate": float((out_of_radius_target > 0.5).mean())
+                if out_of_radius_target.size
+                else 0.0,
+                "expansion_mode_tick_ratio": float((expansion_mode_active > 0.5).mean())
+                if expansion_mode_active.size
+                else 0.0,
+                "local_first_violation_ratio": float(local_first_violation),
             },
             "ordering_sequence": ordering_sequence_metrics,
         }

@@ -141,17 +141,58 @@ def fit_binary_prob_head(
     alpha: float,
     sample_weight_train: np.ndarray | None = None,
     clip: float = 8.0,
+    trainer_backend: str = "auto",
 ) -> Tuple[Dict, Dict[str, float]]:
     if x_train.size == 0 or y_train.size == 0:
         weights = np.zeros((x_train.shape[1] + 1 if x_train.ndim == 2 else 1,), dtype=float)
         logits_val = np.zeros_like(y_val, dtype=float)
+        backend = "none"
     else:
-        weights = ridge_fit(
-            x_train,
-            y_train,
-            alpha=alpha,
-            sample_weight=sample_weight_train,
-        )
+        backend = "ridge"
+        weights = None
+        if trainer_backend in {"auto", "torch"}:
+            try:
+                import torch
+                import torch.nn.functional as F
+
+                torch.manual_seed(0)
+                x_train_t = torch.from_numpy(x_train.astype(np.float32))
+                y_train_t = torch.from_numpy(y_train.astype(np.float32))
+                w = torch.zeros((x_train.shape[1],), dtype=torch.float32, requires_grad=True)
+                b = torch.zeros((1,), dtype=torch.float32, requires_grad=True)
+                opt = torch.optim.Adam([w, b], lr=0.03)
+                sw_t = None
+                if sample_weight_train is not None and sample_weight_train.size == x_train.shape[0]:
+                    sw = np.clip(sample_weight_train.astype(np.float32), 1e-6, None)
+                    sw_t = torch.from_numpy(sw)
+                    sw_t = sw_t / sw_t.mean().clamp(min=1e-6)
+                for _ in range(300):
+                    logits = x_train_t.matmul(w) + b
+                    loss_vec = F.binary_cross_entropy_with_logits(
+                        logits, y_train_t, reduction="none"
+                    )
+                    if sw_t is not None:
+                        loss = (loss_vec * sw_t).mean()
+                    else:
+                        loss = loss_vec.mean()
+                    loss = loss + (alpha * 1e-3) * (w.pow(2).mean())
+                    opt.zero_grad()
+                    loss.backward()
+                    opt.step()
+                w_np = w.detach().cpu().numpy().astype(float)
+                b_np = float(b.detach().cpu().numpy()[0])
+                weights = np.concatenate([np.array([b_np], dtype=float), w_np], axis=0)
+                backend = "torch_cpu"
+            except Exception:
+                if trainer_backend == "torch":
+                    raise
+        if weights is None:
+            weights = ridge_fit(
+                x_train,
+                y_train,
+                alpha=alpha,
+                sample_weight=sample_weight_train,
+            )
         logits_val = predict(weights, x_val) if x_val.size else np.zeros((0,), dtype=float)
     temp = fit_temperature(logits_val, y_val)
     probs_val = sigmoid(np.clip(logits_val, -clip, clip) / temp) if logits_val.size else np.zeros((0,))
@@ -167,6 +208,7 @@ def fit_binary_prob_head(
         "rows_validation": int(y_val.size),
         "logloss": prob_logloss(y_val, probs_val),
         "auc": auc_roc(y_val, probs_val),
+        "backend": backend,
     }
     return head, head_metrics
 
@@ -434,6 +476,12 @@ def main() -> None:
         default="strict",
         help="Feature contract for v2 runtime heads.",
     )
+    parser.add_argument(
+        "--trainer-backend",
+        choices=["auto", "torch", "ridge"],
+        default="auto",
+        help="Training backend for pickup/dropoff conversion heads.",
+    )
     args = parser.parse_args()
 
     frame = read_table(Path(args.data))
@@ -524,6 +572,7 @@ def main() -> None:
         val["pickup_success"].to_numpy(dtype=float)[pickup_val_mask] if not val.empty else np.zeros((0,)),
         alpha=args.alpha,
         sample_weight_train=train_weights[pickup_train_mask],
+        trainer_backend=args.trainer_backend,
     )
     dropoff_head, dropoff_metrics = fit_binary_prob_head(
         x_train_v2[dropoff_train_mask],
@@ -532,6 +581,7 @@ def main() -> None:
         val["dropoff_success"].to_numpy(dtype=float)[dropoff_val_mask] if not val.empty else np.zeros((0,)),
         alpha=args.alpha,
         sample_weight_train=train_weights[dropoff_train_mask],
+        trainer_backend=args.trainer_backend,
     )
     ordering_head_raw = ridge_fit(
         x_train_v2,
@@ -613,6 +663,7 @@ def main() -> None:
         "metrics": {
             "rows_train": int(len(train)),
             "rows_validation": int(len(val)),
+            "trainer_backend": args.trainer_backend,
             **metrics(y_val, y_hat),
         },
         "dedup": dedup,

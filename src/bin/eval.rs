@@ -5,6 +5,7 @@ use std::process::Command;
 use std::time::SystemTime;
 
 use clap::{Parser, ValueEnum};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 const PHASE_COUNT: usize = 3;
@@ -41,6 +42,15 @@ struct Cli {
 
     #[arg(long, default_value_t = GateProfile::Default, value_enum)]
     gate_profile: GateProfile,
+
+    #[arg(long)]
+    coord_baseline: Option<PathBuf>,
+
+    #[arg(long, default_value_t = false)]
+    write_coord_baseline: bool,
+
+    #[arg(long, default_value_t = false)]
+    strict_all_modes: bool,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum, Default)]
@@ -113,6 +123,12 @@ struct EpisodeMetrics {
     collector_far_waits: u64,
     full_inactive_waits: u64,
     full_inactive_far_waits: u64,
+    local_first_checks: u64,
+    local_first_violations: u64,
+    expansion_mode_true: u64,
+    expansion_mode_samples: u64,
+    preferred_area_matches: u64,
+    preferred_area_samples: u64,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -130,10 +146,42 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     print_summary(&metrics);
     let failed = evaluate_gates(&metrics, cli.gate_profile);
-    if failed && cli.enforce_gates {
+    let baseline_path = cli
+        .coord_baseline
+        .clone()
+        .unwrap_or_else(|| PathBuf::from("models/coord_baseline.json"));
+    if cli.write_coord_baseline {
+        let baseline = aggregate_mode_metrics(&metrics);
+        let payload = serde_json::to_string_pretty(&baseline)?;
+        if let Some(parent) = baseline_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&baseline_path, payload)?;
+        println!(
+            "coord-baseline status=WRITE path={} modes={}",
+            baseline_path.display(),
+            baseline.len()
+        );
+    }
+    let strict_failed = if cli.strict_all_modes {
+        let baseline_payload = fs::read_to_string(&baseline_path)?;
+        let baseline: HashMap<String, CoordBaselineMetrics> =
+            serde_json::from_str(&baseline_payload)?;
+        evaluate_strict_all_modes(&metrics, &baseline)
+    } else {
+        false
+    };
+    if (failed || strict_failed) && cli.enforce_gates {
         return Err("regression gate failure".into());
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct CoordBaselineMetrics {
+    delivered_per_100_ticks: f64,
+    pickup_success_ratio: f64,
+    repeated_goal_concentration: f64,
 }
 
 fn run_episodes(cli: &Cli) -> Result<Vec<EpisodeMetrics>, Box<dyn std::error::Error>> {
@@ -446,6 +494,7 @@ fn parse_metrics(path: &Path) -> Result<EpisodeMetrics, Box<dyn std::error::Erro
             let mut carrying_items_by_bot = HashMap::<String, Vec<String>>::new();
             let mut capacity_by_bot = HashMap::<String, usize>::new();
             let mut bot_dropoff_dist_by_bot = HashMap::<String, f64>::new();
+            let mut bot_pos_by_bot = HashMap::<String, (i64, i64)>::new();
             if let Some(bots) = data
                 .get("game_state")
                 .and_then(|s| s.get("bots"))
@@ -481,9 +530,82 @@ fn parse_metrics(path: &Path) -> Result<EpisodeMetrics, Box<dyn std::error::Erro
                     let y = bot.get("y").and_then(Value::as_i64).unwrap_or(0);
                     let bot_dropoff_dist = nearest_dropoff_distance(x, y, &dropoff_tiles);
                     bot_dropoff_dist_by_bot.insert(bot_id.clone(), bot_dropoff_dist);
+                    bot_pos_by_bot.insert(bot_id.clone(), (x, y));
                     carrying_items_by_bot.insert(bot_id.clone(), carrying_items);
                     capacity_by_bot.insert(bot_id.clone(), capacity);
                     carrying_by_bot.insert(bot_id, carrying);
+                }
+            }
+            let preferred_area_by_bot = team_summary
+                .get("preferred_area_id_by_bot")
+                .and_then(Value::as_object);
+            let expansion_mode_by_bot = team_summary
+                .get("expansion_mode_by_bot")
+                .and_then(Value::as_object);
+            let local_radius_by_bot = team_summary
+                .get("local_radius_by_bot")
+                .and_then(Value::as_object);
+            let goal_area_by_bot = team_summary
+                .get("goal_area_id_by_bot")
+                .and_then(Value::as_object);
+            let goal_cell_by_bot = team_summary
+                .get("goal_cell_by_bot")
+                .and_then(Value::as_object);
+            for (bot_id, (bx, by)) in &bot_pos_by_bot {
+                let expansion = expansion_mode_by_bot
+                    .and_then(|m| m.get(bot_id))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                metrics.expansion_mode_samples = metrics.expansion_mode_samples.saturating_add(1);
+                if expansion {
+                    metrics.expansion_mode_true = metrics.expansion_mode_true.saturating_add(1);
+                }
+                let pref_area = preferred_area_by_bot
+                    .and_then(|m| m.get(bot_id))
+                    .and_then(Value::as_i64)
+                    .unwrap_or(-1);
+                let goal_area = goal_area_by_bot
+                    .and_then(|m| m.get(bot_id))
+                    .and_then(Value::as_i64)
+                    .unwrap_or(-1);
+                let local_radius = local_radius_by_bot
+                    .and_then(|m| m.get(bot_id))
+                    .and_then(Value::as_f64)
+                    .or_else(|| {
+                        local_radius_by_bot
+                            .and_then(|m| m.get(bot_id))
+                            .and_then(Value::as_i64)
+                            .map(|v| v as f64)
+                    })
+                    .unwrap_or(0.0);
+                let goal_xy = goal_cell_by_bot
+                    .and_then(|m| m.get(bot_id))
+                    .and_then(Value::as_array)
+                    .and_then(|arr| {
+                        if arr.len() != 2 {
+                            return None;
+                        }
+                        Some((arr[0].as_i64()?, arr[1].as_i64()?))
+                    });
+
+                if pref_area >= 0 && goal_area >= 0 {
+                    metrics.preferred_area_samples = metrics.preferred_area_samples.saturating_add(1);
+                    if pref_area == goal_area {
+                        metrics.preferred_area_matches =
+                            metrics.preferred_area_matches.saturating_add(1);
+                    }
+                }
+                if !expansion {
+                    if let Some((gx, gy)) = goal_xy {
+                        metrics.local_first_checks = metrics.local_first_checks.saturating_add(1);
+                        let out_of_area = pref_area >= 0 && goal_area >= 0 && pref_area != goal_area;
+                        let dist_to_goal = (bx - gx).abs() as f64 + (by - gy).abs() as f64;
+                        let out_of_radius = local_radius > 0.0 && dist_to_goal > local_radius;
+                        if out_of_area || out_of_radius {
+                            metrics.local_first_violations =
+                                metrics.local_first_violations.saturating_add(1);
+                        }
+                    }
                 }
             }
             if let Some(actions) = data.get("actions").and_then(Value::as_array) {
@@ -765,6 +887,12 @@ fn print_summary(metrics: &[EpisodeMetrics]) {
             acc.collector_far_waits += item.collector_far_waits;
             acc.full_inactive_waits += item.full_inactive_waits;
             acc.full_inactive_far_waits += item.full_inactive_far_waits;
+            acc.local_first_checks += item.local_first_checks;
+            acc.local_first_violations += item.local_first_violations;
+            acc.expansion_mode_true += item.expansion_mode_true;
+            acc.expansion_mode_samples += item.expansion_mode_samples;
+            acc.preferred_area_matches += item.preferred_area_matches;
+            acc.preferred_area_samples += item.preferred_area_samples;
             for phase_idx in 0..PHASE_COUNT {
                 let src = item.phase[phase_idx];
                 let dst = &mut acc.phase[phase_idx];
@@ -839,6 +967,21 @@ fn print_summary(metrics: &[EpisodeMetrics]) {
     } else {
         totals.full_inactive_far_waits as f64 / totals.full_inactive_waits as f64
     };
+    let local_first_violation_ratio = if totals.local_first_checks == 0 {
+        0.0
+    } else {
+        totals.local_first_violations as f64 / totals.local_first_checks as f64
+    };
+    let expansion_mode_tick_ratio = if totals.expansion_mode_samples == 0 {
+        0.0
+    } else {
+        totals.expansion_mode_true as f64 / totals.expansion_mode_samples as f64
+    };
+    let preferred_area_match_ratio = if totals.preferred_area_samples == 0 {
+        0.0
+    } else {
+        totals.preferred_area_matches as f64 / totals.preferred_area_samples as f64
+    };
     println!(
         "conversion delivered_per_100_ticks={:.3} pickup_success_ratio={:.3} ({}/{}) dropoff_success_ratio={:.3} ({}/{})",
         delivered_per_100_ticks,
@@ -858,6 +1001,12 @@ fn print_summary(metrics: &[EpisodeMetrics]) {
         full_inactive_far_wait_ratio,
         totals.full_inactive_far_waits,
         totals.full_inactive_waits
+    );
+    println!(
+        "locality local_first_violation_ratio={:.3} expansion_mode_tick_ratio={:.3} preferred_area_match_ratio={:.3}",
+        local_first_violation_ratio,
+        expansion_mode_tick_ratio,
+        preferred_area_match_ratio,
     );
     println!(
         "collapse_alarms late_no_delivery_streak_avg={:.2} goal_collapse_ratio={:.3} guard_fallback_ratio={:.3}",
@@ -1062,6 +1211,105 @@ fn evaluate_gates(metrics: &[EpisodeMetrics], profile: GateProfile) -> bool {
                 guard_fallback_ratio,
                 repeated_goal_concentration,
                 late_no_delivery_streak,
+            );
+        }
+    }
+    any_failed
+}
+
+fn aggregate_mode_metrics(metrics: &[EpisodeMetrics]) -> HashMap<String, CoordBaselineMetrics> {
+    let mut by_mode = HashMap::<String, Vec<&EpisodeMetrics>>::new();
+    for item in metrics {
+        by_mode.entry(item.mode.clone()).or_default().push(item);
+    }
+    let mut out = HashMap::<String, CoordBaselineMetrics>::new();
+    for (mode, rows) in by_mode {
+        let ticks = rows.iter().map(|r| r.tick_count).sum::<u64>();
+        let delivered = rows.iter().map(|r| r.items_delivered).sum::<u64>();
+        let pickup_attempts = rows.iter().map(|r| r.pickup_attempts).sum::<u64>();
+        let pickup_successes = rows.iter().map(|r| r.pickup_successes).sum::<u64>();
+        let repeated_goal_concentration = rows
+            .iter()
+            .map(|r| r.repeated_goal_concentration)
+            .sum::<f64>()
+            / rows.len() as f64;
+        let delivered_per_100_ticks = if ticks == 0 {
+            0.0
+        } else {
+            delivered as f64 * 100.0 / ticks as f64
+        };
+        let pickup_success_ratio = if pickup_attempts == 0 {
+            0.0
+        } else {
+            pickup_successes as f64 / pickup_attempts as f64
+        };
+        out.insert(
+            mode,
+            CoordBaselineMetrics {
+                delivered_per_100_ticks,
+                pickup_success_ratio,
+                repeated_goal_concentration,
+            },
+        );
+    }
+    out
+}
+
+fn evaluate_strict_all_modes(
+    metrics: &[EpisodeMetrics],
+    baseline: &HashMap<String, CoordBaselineMetrics>,
+) -> bool {
+    let current = aggregate_mode_metrics(metrics);
+    let required_modes = ["medium", "hard", "expert"];
+    let mut any_failed = false;
+    for mode in required_modes {
+        let Some(cur) = current.get(mode) else {
+            println!("coord-strict mode={} status=FAIL failed=missing_current_mode", mode);
+            any_failed = true;
+            continue;
+        };
+        let Some(base) = baseline.get(mode) else {
+            println!("coord-strict mode={} status=FAIL failed=missing_baseline_mode", mode);
+            any_failed = true;
+            continue;
+        };
+        let repeated_ok =
+            cur.repeated_goal_concentration <= base.repeated_goal_concentration - 0.01;
+        let pickup_ok = cur.pickup_success_ratio >= base.pickup_success_ratio - 0.03;
+        let delivered_ok = cur.delivered_per_100_ticks >= base.delivered_per_100_ticks - 0.20;
+        let mut failed = Vec::<&str>::new();
+        if !repeated_ok {
+            failed.push("repeated_goal_concentration");
+        }
+        if !pickup_ok {
+            failed.push("pickup_success_ratio_regression");
+        }
+        if !delivered_ok {
+            failed.push("delivered_per_100_ticks_regression");
+        }
+        if failed.is_empty() {
+            println!(
+                "coord-strict mode={} status=PASS repeated_goal_concentration={:.3} baseline={:.3} pickup_success_ratio={:.3} baseline={:.3} delivered_per_100_ticks={:.3} baseline={:.3}",
+                mode,
+                cur.repeated_goal_concentration,
+                base.repeated_goal_concentration,
+                cur.pickup_success_ratio,
+                base.pickup_success_ratio,
+                cur.delivered_per_100_ticks,
+                base.delivered_per_100_ticks,
+            );
+        } else {
+            any_failed = true;
+            println!(
+                "coord-strict mode={} status=FAIL failed={} repeated_goal_concentration={:.3} baseline={:.3} pickup_success_ratio={:.3} baseline={:.3} delivered_per_100_ticks={:.3} baseline={:.3}",
+                mode,
+                failed.join(","),
+                cur.repeated_goal_concentration,
+                base.repeated_goal_concentration,
+                cur.pickup_success_ratio,
+                base.pickup_success_ratio,
+                cur.delivered_per_100_ticks,
+                base.delivered_per_100_ticks,
             );
         }
     }

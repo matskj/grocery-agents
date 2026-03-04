@@ -19,6 +19,8 @@ METRIC_PATTERN = {
     "dropoff_success_ratio": re.compile(r"dropoff_success_ratio=([0-9.]+)"),
     "far_no_conversion_tick_ratio": re.compile(r"far_no_conversion_tick_ratio=([0-9.]+)"),
     "collector_far_wait_ratio": re.compile(r"collector_far_wait_ratio=([0-9.]+)"),
+    "local_first_violation_ratio": re.compile(r"local_first_violation_ratio=([0-9.]+)"),
+    "preferred_area_match_ratio": re.compile(r"preferred_area_match_ratio=([0-9.]+)"),
 }
 
 
@@ -38,6 +40,8 @@ def objective(metrics: Dict[str, float]) -> float:
         + 0.20 * metrics.get("dropoff_success_ratio", 0.0)
         - 0.10 * metrics.get("far_no_conversion_tick_ratio", 1.0)
         - 0.05 * metrics.get("collector_far_wait_ratio", 1.0)
+        - 0.05 * metrics.get("local_first_violation_ratio", 1.0)
+        + 0.05 * metrics.get("preferred_area_match_ratio", 0.0)
     )
 
 
@@ -74,6 +78,9 @@ def main() -> None:
     parser.add_argument("--run-live", action="store_true")
     parser.add_argument("--ws-url", default=None)
     parser.add_argument("--token", default=None)
+    parser.add_argument("--coord-baseline", default="models/coord_baseline.json")
+    parser.add_argument("--strict-all-modes", action="store_true")
+    parser.add_argument("--write-coord-baseline", action="store_true")
     args = parser.parse_args()
 
     horizons = [16, 18, 20]
@@ -92,6 +99,15 @@ def main() -> None:
     ]
     if args.mode_filter:
         replay_cmd += ["--mode-filter", args.mode_filter]
+    if args.strict_all_modes and not args.mode_filter:
+        replay_cmd += [
+            "--strict-all-modes",
+            "--coord-baseline",
+            args.coord_baseline,
+            "--enforce-gates",
+        ]
+    if args.write_coord_baseline:
+        replay_cmd += ["--write-coord-baseline", "--coord-baseline", args.coord_baseline]
 
     if args.run_live:
         if not args.ws_url or not args.token:

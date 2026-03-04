@@ -10,6 +10,7 @@ import pandas as pd
 
 from .common import (
     CONVERSION_LABEL_COLUMNS,
+    LOCALITY_FEATURE_COLUMNS,
     RELIABILITY_FEATURE_COLUMNS,
     ensure_columns,
     read_table,
@@ -23,6 +24,8 @@ MAX_STREAK_CLIP = 20.0
 MAX_CONTENTION_CLIP = 8.0
 MAX_TIME_SINCE_CONVERSION = 200.0
 MAX_DELTA_DIST_CLIP = 24.0
+MAX_LOCAL_COUNT_CLIP = 32.0
+MAX_LOCAL_RADIUS_CLIP = 32.0
 FAR_DIST_THRESHOLD = 8.0
 W_ITEM_PROGRESS = 0.18
 W_DROP_PROGRESS = 0.24
@@ -78,6 +81,9 @@ def reward_proxy(frame: pd.DataFrame) -> pd.Series:
         + 0.25 * col(frame, "coverage_gain")
         + 0.20 * col(frame, "serviceable_dropoff")
         + 0.50 * col(frame, "dropoff_target_in_progress")
+        + 0.08 * col(frame, "preferred_area_match")
+        - 0.12 * col(frame, "out_of_area_target")
+        - 0.18 * col(frame, "out_of_radius_target")
     )
 
 
@@ -278,6 +284,11 @@ def main() -> None:
         "serviceable_dropoff",
         "ordering_rank",
         "ordering_score",
+        "preferred_area_id",
+        "expansion_mode_active",
+        "local_active_candidate_count",
+        "local_radius",
+        "goal_area_id",
     ]:
         if required not in frame.columns:
             frame[required] = 0
@@ -381,6 +392,45 @@ def main() -> None:
         ((frame["is_wait"] == 1) | (frame["noop_move"] == 1))
         & (frame["dist_to_dropoff"] >= FAR_DIST_THRESHOLD)
     ).astype(int)
+    frame["preferred_area_id"] = (
+        frame.get("preferred_area_id", -1).astype(float).fillna(-1).astype(int)
+    )
+    frame["goal_area_id"] = frame.get("goal_area_id", -1).astype(float).fillna(-1).astype(int)
+    frame.loc[frame["preferred_area_id"] >= 65535, "preferred_area_id"] = -1
+    frame.loc[frame["goal_area_id"] >= 65535, "goal_area_id"] = -1
+    frame["expansion_mode_active"] = frame.get("expansion_mode_active", 0).astype(float).clip(
+        lower=0.0, upper=1.0
+    )
+    frame["local_active_candidate_count"] = frame.get(
+        "local_active_candidate_count", 0
+    ).astype(float)
+    frame["local_active_candidate_count"] = clip_series(
+        frame["local_active_candidate_count"], MAX_LOCAL_COUNT_CLIP
+    )
+    frame["local_radius"] = frame.get("local_radius", 0).astype(float)
+    frame["local_radius"] = clip_series(frame["local_radius"], MAX_LOCAL_RADIUS_CLIP)
+    frame["dist_to_goal"] = np.where(
+        frame["goal_cell_valid"] == 1,
+        np.abs(frame["goal_cell_x"] - frame["bot_x"].astype(int))
+        + np.abs(frame["goal_cell_y"] - frame["bot_y"].astype(int)),
+        0,
+    ).astype(float)
+    area_known = (
+        (frame["preferred_area_id"] >= 0)
+        & (frame["goal_area_id"] >= 0)
+        & (frame["goal_cell_valid"] == 1)
+    )
+    frame["preferred_area_match"] = (
+        area_known & (frame["preferred_area_id"] == frame["goal_area_id"])
+    ).astype(int)
+    frame["out_of_area_target"] = (
+        area_known & (frame["preferred_area_id"] != frame["goal_area_id"])
+    ).astype(int)
+    frame["out_of_radius_target"] = (
+        (frame["goal_cell_valid"] == 1)
+        & (frame["local_radius"] > 0.0)
+        & (frame["dist_to_goal"] > frame["local_radius"])
+    ).astype(int)
     # Defragment after the large block of per-column inserts to keep downstream writes fast.
     frame = frame.copy()
     frame["carrying_active"] = frame.get("serviceable_dropoff", 0).astype(float)
@@ -421,6 +471,7 @@ def main() -> None:
     frame = compute_reliability_features(frame)
     frame = ensure_columns(frame, CONVERSION_LABEL_COLUMNS, default=0.0)
     frame = ensure_columns(frame, RELIABILITY_FEATURE_COLUMNS, default=0.0)
+    frame = ensure_columns(frame, LOCALITY_FEATURE_COLUMNS, default=0.0)
 
     result = []
     for (_, _, _), group in frame.groupby(["run_id", "bot_id", "mode"], sort=False):

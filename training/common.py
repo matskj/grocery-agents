@@ -8,7 +8,7 @@ from typing import Dict, Iterable, Iterator, Optional, Sequence
 import pandas as pd
 
 
-SCHEMA_VERSION = "1.2.0"
+SCHEMA_VERSION = "1.3.0"
 CONVERSION_LABEL_COLUMNS = [
     "pickup_attempt",
     "pickup_success",
@@ -25,6 +25,14 @@ RELIABILITY_FEATURE_COLUMNS = [
     "time_since_last_conversion_tick",
     "last_conversion_was_pickup",
     "last_conversion_was_dropoff",
+]
+LOCALITY_FEATURE_COLUMNS = [
+    "preferred_area_match",
+    "expansion_mode_active",
+    "local_active_candidate_count",
+    "local_radius",
+    "out_of_area_target",
+    "out_of_radius_target",
 ]
 FEATURE_COLUMNS = [
     "dist_to_nearest_active_item",
@@ -78,6 +86,7 @@ FEATURE_COLUMNS = [
     "wait_reason_no_path_with_constraints",
     "wait_reason_timeout_fallback",
     *RELIABILITY_FEATURE_COLUMNS,
+    *LOCALITY_FEATURE_COLUMNS,
 ]
 
 RUNTIME_FEATURE_COLUMNS = [
@@ -100,6 +109,12 @@ RUNTIME_FEATURE_COLUMNS = [
     "time_since_last_conversion_tick",
     "last_conversion_was_pickup",
     "last_conversion_was_dropoff",
+    "preferred_area_match",
+    "expansion_mode_active",
+    "local_active_candidate_count",
+    "local_radius",
+    "out_of_area_target",
+    "out_of_radius_target",
 ]
 
 ORDERING_FEATURE_COLUMNS = [

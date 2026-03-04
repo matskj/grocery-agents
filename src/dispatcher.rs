@@ -849,7 +849,7 @@ mod tests {
     #[test]
     fn spawn_stack_produces_non_wait_distribution() {
         let state = medium_like_state();
-        let world = World::new(state.clone());
+        let world = World::new(&state);
         let map = world.map();
         let dist = DistanceMap::build(map);
         let mut dispatcher = Dispatcher::new();
@@ -909,7 +909,7 @@ mod tests {
             }],
             ..GameState::default()
         };
-        let world = World::new(state.clone());
+        let world = World::new(&state);
         let map = world.map();
         let dist = DistanceMap::build(map);
         let mut dispatcher = Dispatcher::new();
@@ -985,7 +985,7 @@ mod tests {
             ],
             ..GameState::default()
         };
-        let world = World::new(state.clone());
+        let world = World::new(&state);
         let map = world.map();
         let dist = DistanceMap::build(map);
         let mut dispatcher = Dispatcher::new();

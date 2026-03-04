@@ -2,7 +2,7 @@ use std::{collections::HashMap, fs, sync::OnceLock};
 
 use serde::Deserialize;
 
-use crate::model::GameState;
+use crate::{difficulty::infer_difficulty, model::GameState};
 
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct PolicyArtifact {
@@ -178,13 +178,7 @@ pub struct PickScore {
 }
 
 pub fn detect_mode_label(state: &GameState) -> &'static str {
-    match (state.bots.len(), state.grid.width, state.grid.height) {
-        (1, 12, 10) => "easy",
-        (3, 16, 12) => "medium",
-        (5, 22, 14) => "hard",
-        (10, 28, 18) => "expert",
-        _ => "custom",
-    }
+    infer_difficulty(state).as_label()
 }
 
 pub fn maybe_score_pick(mode: &str, features: CandidateFeatures) -> Option<PickScore> {

@@ -1,4 +1,7 @@
-use std::collections::VecDeque;
+use std::{
+    collections::{HashMap, VecDeque},
+    sync::{Arc, Mutex, OnceLock},
+};
 
 use crate::world::MapCache;
 
@@ -68,5 +71,18 @@ impl DistanceMap {
 
     pub fn dist_to_dropoff(&self, a: u16) -> u16 {
         self.dist_to_dropoff[a as usize]
+    }
+
+    pub fn shared_for(map: &MapCache) -> Arc<Self> {
+        static CACHE: OnceLock<Mutex<HashMap<usize, Arc<DistanceMap>>>> = OnceLock::new();
+        let key = map as *const MapCache as usize;
+        let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+        let mut guard = cache.lock().expect("distance cache poisoned");
+        if let Some(found) = guard.get(&key) {
+            return Arc::clone(found);
+        }
+        let built = Arc::new(Self::build(map));
+        guard.insert(key, Arc::clone(&built));
+        built
     }
 }

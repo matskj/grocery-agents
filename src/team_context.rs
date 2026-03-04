@@ -1564,7 +1564,7 @@ mod tests {
             }],
             ..GameState::default()
         };
-        let world = World::new(state.clone());
+        let world = World::new(&state);
         let map = world.map();
         let dist = DistanceMap::build(map);
         let ctx = TeamContext::build(
@@ -1631,7 +1631,7 @@ mod tests {
             }],
             ..GameState::default()
         };
-        let world = World::new(state.clone());
+        let world = World::new(&state);
         let map = world.map();
         let dist = DistanceMap::build(map);
         let a = TeamContext::build(
@@ -1699,7 +1699,7 @@ mod tests {
             orders: vec![],
             ..GameState::default()
         };
-        let world = World::new(state.clone());
+        let world = World::new(&state);
         let map = world.map();
         let dist = DistanceMap::build(map);
         let ctx = TeamContext::build(
@@ -1771,7 +1771,7 @@ mod tests {
             ],
             ..GameState::default()
         };
-        let world = World::new(state.clone());
+        let world = World::new(&state);
         let map = world.map();
         let dist = DistanceMap::build(map);
         let ctx = TeamContext::build(

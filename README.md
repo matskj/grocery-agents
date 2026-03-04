@@ -45,6 +45,12 @@ You can also paste the full websocket URL directly (token auto-extracted):
 cargo run --bin grocery-agents -- 'wss://game.ainm.no/ws?token=eyJ...'
 ```
 
+Explicit policy override:
+
+```bash
+cargo run --bin grocery-agents -- --policy expert --token <jwt>
+```
+
 Windows ARM64 helper (uses VS `vcvars64` + x64 Rust toolchain):
 
 ```powershell
@@ -73,6 +79,12 @@ Expert-only regression gate from logs:
 
 ```powershell
 .\cargo-x64.cmd run --bin eval -- --from-logs --episodes 20 --mode-filter expert
+```
+
+Deterministic replay latency benchmark:
+
+```powershell
+.\cargo-x64.cmd run --bin replay_bench -- --replay logs\run-<timestamp>.jsonl --policy auto --budget-profile balanced --determinism-check
 ```
 
 Run fresh episodes against local websocket simulator:
@@ -269,10 +281,18 @@ $env:GAME_LOG_DIR="my-logs"
 
 ### Planning timeout strategy
 
-Per tick, round planning runs under a fixed budget (`1400ms`). If planning times out:
+Per tick planning now uses a real-time budget ladder:
+
+- default soft target: `45ms`
+- default hard cap: `150ms`
+- fair-share adaptation from remaining wall-clock (`120s`) and remaining rounds (`300`)
+- deterministic single-worker planner thread with sequence IDs
+- fallback order: worker plan -> greedy-safe per-bot fallback -> `wait` only when no valid move exists
+
+If planning exceeds hard deadline:
 
 - The client logs a warning.
-- It emits a full fallback envelope where every bot executes `wait`.
+- It emits a safe fallback envelope (greedy non-wait actions when valid, otherwise `wait`).
 - Normal planning resumes on the next received tick.
 
 ## Training pipeline (per-mode specialists)
@@ -301,9 +321,11 @@ POLICY_ARTIFACT_PATH=models/policy_artifacts.json
 - `model`: Shared protocol/domain types (`GameState`, `Action`, envelopes, runtime context).
 - `world`: Board/map cache generation (indices, neighbors, item/drop-off lookup tables).
 - `dist`: All-pairs grid distance precomputation used by heuristics/planning.
+- `difficulty`: Difficulty inference (`easy|medium|hard|expert|custom`) from map dimensions + bot count.
 - `dispatcher`: Converts state into per-bot intents (pickup/dropoff/move/wait).
 - `motion`: Time-expanded path planning with reservation tables to avoid conflicts.
-- `policy`: High-level round decision logic that combines dispatcher + motion and short-term bot memory.
+- `policy`: Orchestration layer selecting per-difficulty strategies and merging strategy hints with assignment/motion.
+- `policies/*`: Specialized strategy modules (`easy`, `medium`, `hard`, `expert`) with shared helpers in `policies/common`.
 - `team_context`: Shared per-tick blackboard (roles, strict queue lanes, conflict/deadlock context, movement reservations).
 - `net`: Websocket networking loop, message parsing, timeout enforcement, action validation.
 
@@ -331,6 +353,7 @@ Coordination knobs:
 - `GROCERY_CANDIDATE_K=8`
 - `GROCERY_ASSIGNMENT_ENABLED=true`
 - `GROCERY_ASSIGNMENT_MODE=hybrid` (`hybrid`, `global-only`, `legacy-only`)
+- `GROCERY_POLICY=auto` (`auto`, `easy`, `medium`, `hard`, `expert`)
 - `GROCERY_DROPOFF_SCHEDULING_ENABLED=true`
 - `GROCERY_DROPOFF_WINDOW=12`
 - `GROCERY_DROPOFF_CAPACITY=1`
@@ -342,6 +365,9 @@ Coordination knobs:
 - `GROCERY_PLANNER_SOFT_BUDGET_MAX_MS=1900`
 - `GROCERY_PLANNER_HARD_BUDGET_MS=1950`
 - `GROCERY_PLANNER_DEADLINE_SLACK_MS=80`
+- `GROCERY_TICK_SOFT_BUDGET_MS=45`
+- `GROCERY_TICK_HARD_BUDGET_MS=150`
+- `GROCERY_TICK_GREEDY_FALLBACK_MS=8`
 - `GROCERY_STRUCTURED_BOT_LOG=1`
 - `GROCERY_ASCII_RENDER=1`
 - `GROCERY_REPLAY_DUMP_PATH=logs/replay_dump.jsonl`

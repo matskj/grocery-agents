@@ -507,9 +507,7 @@ impl MotionPlanner {
                     if e_res.contains(&(future_t, next, cell)) {
                         crowded = crowded.saturating_add(1);
                     }
-                    penalty = penalty.saturating_add(
-                        reservation_penalty.saturating_mul(crowded),
-                    );
+                    penalty = penalty.saturating_add(reservation_penalty.saturating_mul(crowded));
                 }
                 let ng = g.saturating_add(1).saturating_add(penalty);
                 let key = (next, nt);
@@ -1163,7 +1161,7 @@ mod tests {
             },
             ..GameState::default()
         };
-        let world = World::new(state);
+        let world = World::new(&state);
         let map = world.map();
         let start = map.idx(0, 0).expect("start");
         let next = map.idx(1, 0).expect("next");
@@ -1216,7 +1214,7 @@ mod tests {
             ],
             ..GameState::default()
         };
-        let world = World::new(state.clone());
+        let world = World::new(&state);
         let map = world.map();
         let dist = DistanceMap::build(map);
         let planner = MotionPlanner::new(16);
@@ -1271,7 +1269,7 @@ mod tests {
             ],
             ..GameState::default()
         };
-        let world = World::new(state.clone());
+        let world = World::new(&state);
         let map = world.map();
         let dist = DistanceMap::build(map);
         let planner = MotionPlanner::new(16);

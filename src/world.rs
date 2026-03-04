@@ -10,7 +10,6 @@ use crate::model::GameState;
 
 #[derive(Debug)]
 pub struct World {
-    state: GameState,
     map: Arc<MapCache>,
 }
 
@@ -27,21 +26,17 @@ pub struct MapCache {
 }
 
 impl World {
-    pub fn new(state: GameState) -> Self {
+    pub fn new(state: &GameState) -> Self {
         let map = shared_map_cache(&state);
-        Self { state, map }
-    }
-
-    pub fn state(&self) -> &GameState {
-        &self.state
-    }
-
-    pub fn state_mut(&mut self) -> &mut GameState {
-        &mut self.state
+        Self { map }
     }
 
     pub fn map(&self) -> &MapCache {
         &self.map
+    }
+
+    pub fn map_arc(&self) -> Arc<MapCache> {
+        Arc::clone(&self.map)
     }
 }
 
@@ -242,7 +237,7 @@ mod tests {
             ..GameState::default()
         };
 
-        let world = World::new(state);
+        let world = World::new(&state);
         let map = world.map();
         let shelf_idx = map.idx(2, 2).expect("shelf idx");
         let left_idx = map.idx(1, 2).expect("left idx");

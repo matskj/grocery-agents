@@ -8,11 +8,16 @@ use tracing::info;
 
 use crate::{
     assign::{AssignmentEngine, AssignmentRuntimeHints},
-    config::{AssignmentMode, Config},
+    config::{AssignmentMode, Config, PolicyMode},
+    difficulty::{infer_difficulty, Difficulty},
     dispatcher::{BotIntent, Dispatcher, Intent},
     dist::DistanceMap,
     model::{Action, GameState},
     motion::{MotionPlanner, PlannedAction},
+    policies::{
+        easy::EasyStrategy, expert::ExpertStrategy, hard::HardStrategy, medium::MediumStrategy,
+        Strategy, StrategyPlan, TickInput,
+    },
     scoring::{
         detect_mode_label, maybe_score_ordering, maybe_score_ordering_sequence, OrderingFeatures,
     },
@@ -82,6 +87,10 @@ pub struct Policy {
     pickup_failures_by_item: HashMap<String, u8>,
     preferred_area_by_bot: HashMap<String, AreaAssignment>,
     expansion_mode_by_bot: HashMap<String, bool>,
+    easy_strategy: EasyStrategy,
+    medium_strategy: MediumStrategy,
+    hard_strategy: HardStrategy,
+    expert_strategy: ExpertStrategy,
 }
 
 impl Policy {
@@ -105,6 +114,10 @@ impl Policy {
             pickup_failures_by_item: HashMap::new(),
             preferred_area_by_bot: HashMap::new(),
             expansion_mode_by_bot: HashMap::new(),
+            easy_strategy: EasyStrategy::default(),
+            medium_strategy: MediumStrategy::default(),
+            hard_strategy: HardStrategy::default(),
+            expert_strategy: ExpertStrategy::default(),
         }
     }
 
@@ -116,9 +129,10 @@ impl Policy {
             self.preferred_area_by_bot.clear();
             self.expansion_mode_by_bot.clear();
         }
-        let world = World::new(state.clone());
+        let world = World::new(state);
         let map = world.map();
-        let dist = DistanceMap::build(map);
+        let dist_arc = DistanceMap::shared_for(map);
+        let dist = dist_arc.as_ref();
         let active_items = active_item_set(state);
         let (pickup_events, dropoff_events) = self.detect_inventory_events(state);
         self.update_progress_watchdog(pickup_events, dropoff_events);
@@ -180,6 +194,7 @@ impl Policy {
         let prohibited_moves = build_prohibited_move_map(&self.memory);
 
         let mode = detect_mode_label(state);
+        let difficulty = self.selected_difficulty(state);
         let strict_queue = queue_strict_mode(mode);
         let cfg = TeamContextConfig {
             strict_queue,
@@ -266,12 +281,30 @@ impl Policy {
             )
             .with_claims(&self.stand_claims, &self.bot_commitments, state.tick);
         }
+        let strategy_plan = self.run_strategy(
+            difficulty,
+            state,
+            map,
+            dist,
+            &team_ctx,
+            self.ticks_since_pickup,
+            self.ticks_since_dropoff,
+        );
+
         let (
             preferred_area_by_bot,
             expansion_mode_by_bot,
             local_active_candidate_count_by_bot,
             local_radius_by_bot,
         ) = self.compute_locality_hints(state, map, &dist, &team_ctx);
+        let mut preferred_area_by_bot = preferred_area_by_bot;
+        let mut expansion_mode_by_bot = expansion_mode_by_bot;
+        for (bot_id, area) in &strategy_plan.preferred_area_by_bot {
+            preferred_area_by_bot.insert(bot_id.clone(), *area);
+        }
+        for (bot_id, expansion) in &strategy_plan.expansion_mode_by_bot {
+            expansion_mode_by_bot.insert(bot_id.clone(), *expansion);
+        }
         team_ctx = team_ctx.with_locality(
             &preferred_area_by_bot,
             &expansion_mode_by_bot,
@@ -450,6 +483,13 @@ impl Policy {
             self.apply_stand_commitments(state, map, &dist, &team_ctx, &active_items, &mut intents);
         let egress_forced_bots =
             self.apply_recent_dropoff_egress(state, map, &dist, &team_ctx, &mut intents);
+        if !strategy_plan.forced_intents.is_empty() {
+            for bot_intent in &mut intents {
+                if let Some(forced) = strategy_plan.forced_intents.get(&bot_intent.bot_id) {
+                    bot_intent.intent = forced.clone();
+                }
+            }
+        }
         assignment_commitment_reassign_count =
             self.invalidate_stale_commitments(state, &team_ctx, assignment_source);
         assignment_goal_concentration_top3 = goal_concentration_top3(&intents);
@@ -892,8 +932,10 @@ impl Policy {
         }
         self.update_recent_goal_cells(&goals);
 
-        let (ordering_sequence, ordering_scores, ordering_ranks) =
+        let (ordering_sequence_base, ordering_scores, ordering_ranks) =
             compute_ordering_sequence(state, map, &dist, &goals, &team_ctx, &self.memory, mode);
+        let ordering_sequence =
+            merge_strategy_ordering(&strategy_plan.explicit_order, ordering_sequence_base);
 
         let plan_result = self.planner.plan(
             state,
@@ -1255,6 +1297,26 @@ impl Policy {
                 serde_json::Value::Number(serde_json::Number::from(assign_ms)),
             );
             obj.insert(
+                "policy_name".to_owned(),
+                serde_json::Value::String(strategy_plan.policy_name.to_owned()),
+            );
+            obj.insert(
+                "strategy_stage".to_owned(),
+                serde_json::Value::String(strategy_plan.strategy_stage.to_owned()),
+            );
+            obj.insert(
+                "strategy_role_by_bot".to_owned(),
+                serde_json::Value::Object(
+                    strategy_plan
+                        .role_label_by_bot
+                        .iter()
+                        .map(|(bot_id, role)| {
+                            (bot_id.clone(), serde_json::Value::String(role.clone()))
+                        })
+                        .collect::<serde_json::Map<_, _>>(),
+                ),
+            );
+            obj.insert(
                 "assignment_source".to_owned(),
                 serde_json::Value::String(assignment_source.to_owned()),
             );
@@ -1431,6 +1493,44 @@ impl Policy {
         self.last_team_telemetry.clone()
     }
 
+    fn selected_difficulty(&self, state: &GameState) -> Difficulty {
+        match self.config.policy_mode {
+            PolicyMode::Auto => infer_difficulty(state),
+            PolicyMode::Easy => Difficulty::Easy,
+            PolicyMode::Medium => Difficulty::Medium,
+            PolicyMode::Hard => Difficulty::Hard,
+            PolicyMode::Expert => Difficulty::Expert,
+        }
+    }
+
+    fn run_strategy(
+        &mut self,
+        difficulty: Difficulty,
+        state: &GameState,
+        map: &crate::world::MapCache,
+        dist: &DistanceMap,
+        team: &TeamContext,
+        ticks_since_pickup: u16,
+        ticks_since_dropoff: u16,
+    ) -> StrategyPlan {
+        let input = TickInput {
+            difficulty,
+            state,
+            map,
+            dist,
+            team,
+            ticks_since_pickup,
+            ticks_since_dropoff,
+        };
+        match difficulty {
+            Difficulty::Easy => self.easy_strategy.tick(input),
+            Difficulty::Medium => self.medium_strategy.tick(input),
+            Difficulty::Hard => self.hard_strategy.tick(input),
+            Difficulty::Expert => self.expert_strategy.tick(input),
+            Difficulty::Custom => self.hard_strategy.tick(input),
+        }
+    }
+
     fn compute_locality_hints(
         &mut self,
         state: &GameState,
@@ -1484,7 +1584,8 @@ impl Policy {
 
         let mode_adjust = mode_radius_adjustment(team.mode.as_str());
         let base_radius = i32::from(self.config.coord_local_radius_base) + mode_adjust;
-        let base_radius = base_radius.clamp(4, i32::from(self.config.coord_local_radius_max)) as u16;
+        let base_radius =
+            base_radius.clamp(4, i32::from(self.config.coord_local_radius_max)) as u16;
         let ttl = u64::from(self.config.coord_preferred_area_ttl_ticks);
 
         let mut known_bot_ids = HashSet::<String>::new();
@@ -3485,6 +3586,25 @@ fn compute_ordering_sequence(
     (ordering, scores, ranks)
 }
 
+fn merge_strategy_ordering(preferred: &[String], fallback: Vec<String>) -> Vec<String> {
+    if preferred.is_empty() {
+        return fallback;
+    }
+    let mut seen = HashSet::<String>::new();
+    let mut out = Vec::with_capacity(preferred.len() + fallback.len());
+    for bot_id in preferred {
+        if seen.insert(bot_id.clone()) {
+            out.push(bot_id.clone());
+        }
+    }
+    for bot_id in fallback {
+        if seen.insert(bot_id.clone()) {
+            out.push(bot_id);
+        }
+    }
+    out
+}
+
 fn queue_strict_mode(mode: &str) -> bool {
     static OVERRIDE: OnceLock<Option<bool>> = OnceLock::new();
     if let Some(value) = *OVERRIDE.get_or_init(|| {
@@ -3547,7 +3667,7 @@ mod tests {
             },
             ..GameState::default()
         };
-        let world = World::new(state);
+        let world = World::new(&state);
         let map = world.map();
         let dist = DistanceMap::build(map);
         let drop = map.idx(3, 3).expect("dropoff");
@@ -3570,7 +3690,7 @@ mod tests {
             },
             ..GameState::default()
         };
-        let world = World::new(state);
+        let world = World::new(&state);
         let map = world.map();
         let dist = DistanceMap::build(map);
         let drop = map.idx(3, 3).expect("dropoff");
@@ -3629,7 +3749,7 @@ mod tests {
             }],
             ..GameState::default()
         };
-        let world = World::new(state.clone());
+        let world = World::new(&state);
         let map = world.map();
         let dist = DistanceMap::build(map);
         let ctx = TeamContext::build(
@@ -3706,7 +3826,7 @@ mod tests {
             }],
             ..GameState::default()
         };
-        let world = World::new(state.clone());
+        let world = World::new(&state);
         let map = world.map();
         let dist = DistanceMap::build(map);
         let ctx = TeamContext::build(
@@ -3779,7 +3899,7 @@ mod tests {
             }],
             ..GameState::default()
         };
-        let world = World::new(state.clone());
+        let world = World::new(&state);
         let map = world.map();
         let dist = DistanceMap::build(map);
         let ctx = TeamContext::build(
@@ -3885,7 +4005,7 @@ mod tests {
             ],
             ..GameState::default()
         };
-        let world = World::new(state.clone());
+        let world = World::new(&state);
         let map = world.map();
         let dist = DistanceMap::build(map);
         let team = TeamContext::build(
@@ -3968,7 +4088,7 @@ mod tests {
             ],
             ..GameState::default()
         };
-        let world = World::new(state.clone());
+        let world = World::new(&state);
         let map = world.map();
         let dist = DistanceMap::build(map);
         let team = TeamContext::build(
@@ -4055,7 +4175,7 @@ mod tests {
             ],
             ..GameState::default()
         };
-        let world = World::new(state.clone());
+        let world = World::new(&state);
         let map = world.map();
         let dist = DistanceMap::build(map);
         let team = TeamContext::build(
@@ -4168,7 +4288,7 @@ mod tests {
             }],
             ..GameState::default()
         };
-        let world = World::new(state.clone());
+        let world = World::new(&state);
         let map = world.map();
         let dist = DistanceMap::build(map);
         let team = TeamContext::build(
@@ -4241,7 +4361,7 @@ mod tests {
             ],
             ..GameState::default()
         };
-        let world = World::new(state.clone());
+        let world = World::new(&state);
         let map = world.map();
         let dist = DistanceMap::build(map);
         let start = map.stand_cells_for_item("item_1")[0];
@@ -4288,7 +4408,7 @@ mod tests {
             ],
             ..GameState::default()
         };
-        let world = World::new(state.clone());
+        let world = World::new(&state);
         let map = world.map();
         let dist = DistanceMap::build(map);
         let goal = map.stand_cells_for_item("item_1")[0];

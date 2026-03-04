@@ -15,10 +15,20 @@ pub enum PlannerBudgetMode {
     Adaptive,
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq, ValueEnum)]
+pub enum PolicyMode {
+    Auto,
+    Easy,
+    Medium,
+    Hard,
+    Expert,
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub horizon: u8,
     pub candidate_k: usize,
+    pub policy_mode: PolicyMode,
     pub assignment_enabled: bool,
     pub assignment_mode: AssignmentMode,
     pub dropoff_scheduling_enabled: bool,
@@ -32,9 +42,13 @@ pub struct Config {
     pub planner_soft_budget_max_ms: u64,
     pub planner_hard_budget_ms: u64,
     pub planner_deadline_slack_ms: u64,
+    pub tick_soft_budget_ms: u64,
+    pub tick_hard_budget_ms: u64,
+    pub tick_greedy_fallback_ms: u64,
     pub log_level: String,
     pub structured_bot_log: bool,
     pub ascii_render: bool,
+    pub debug: bool,
     pub replay_dump_path: Option<PathBuf>,
     pub coord_claim_ttl_ticks: u8,
     pub coord_reassign_no_progress_ticks: u8,
@@ -57,6 +71,14 @@ pub struct ConfigArgs {
 
     #[arg(long, env = "GROCERY_CANDIDATE_K", default_value_t = 8)]
     pub candidate_k: usize,
+
+    #[arg(
+        long,
+        env = "GROCERY_POLICY",
+        value_enum,
+        default_value_t = PolicyMode::Auto
+    )]
+    pub policy_mode: PolicyMode,
 
     #[arg(long, env = "GROCERY_ASSIGNMENT_ENABLED", default_value_t = true)]
     pub assignment_enabled: bool,
@@ -119,6 +141,15 @@ pub struct ConfigArgs {
     #[arg(long, env = "GROCERY_PLANNER_DEADLINE_SLACK_MS", default_value_t = 40)]
     pub planner_deadline_slack_ms: u64,
 
+    #[arg(long, env = "GROCERY_TICK_SOFT_BUDGET_MS", default_value_t = 45)]
+    pub tick_soft_budget_ms: u64,
+
+    #[arg(long, env = "GROCERY_TICK_HARD_BUDGET_MS", default_value_t = 150)]
+    pub tick_hard_budget_ms: u64,
+
+    #[arg(long, env = "GROCERY_TICK_GREEDY_FALLBACK_MS", default_value_t = 8)]
+    pub tick_greedy_fallback_ms: u64,
+
     #[arg(long, env = "GROCERY_LOG_LEVEL", default_value = "info")]
     pub log_level: String,
 
@@ -128,8 +159,14 @@ pub struct ConfigArgs {
     #[arg(long, env = "GROCERY_ASCII_RENDER", default_value_t = false)]
     pub ascii_render: bool,
 
+    #[arg(long, env = "GROCERY_DEBUG", default_value_t = false)]
+    pub debug: bool,
+
     #[arg(long, env = "GROCERY_REPLAY_DUMP_PATH")]
     pub replay_dump_path: Option<PathBuf>,
+
+    #[arg(long, env = "GROCERY_RECORD_PATH")]
+    pub record_path: Option<PathBuf>,
 
     #[arg(long, env = "GROCERY_COORD_CLAIM_TTL_TICKS", default_value_t = 10)]
     pub coord_claim_ttl_ticks: u8,
@@ -208,14 +245,17 @@ impl ConfigArgs {
         let max_soft_allowed = hard_budget.saturating_sub(slack).max(100);
         soft_min = soft_min.min(max_soft_allowed);
         soft_max = soft_max.min(max_soft_allowed).max(soft_min);
+        let tick_hard = self.tick_hard_budget_ms.clamp(20, 500);
+        let tick_soft = self.tick_soft_budget_ms.clamp(10, tick_hard);
+        let tick_greedy = self.tick_greedy_fallback_ms.clamp(1, tick_soft);
+        let replay_dump_path = self.replay_dump_path.or(self.record_path);
         let local_radius_base = self.coord_local_radius_base.clamp(4, 24);
-        let local_radius_max = self
-            .coord_local_radius_max
-            .clamp(local_radius_base, 32);
+        let local_radius_max = self.coord_local_radius_max.clamp(local_radius_base, 32);
 
         Config {
             horizon: self.horizon.clamp(8, 32),
             candidate_k: self.candidate_k.clamp(1, 32),
+            policy_mode: self.policy_mode,
             assignment_enabled: self.assignment_enabled,
             assignment_mode: if self.assignment_enabled {
                 self.assignment_mode
@@ -233,10 +273,14 @@ impl ConfigArgs {
             planner_soft_budget_max_ms: soft_max,
             planner_hard_budget_ms: hard_budget,
             planner_deadline_slack_ms: slack,
+            tick_soft_budget_ms: tick_soft,
+            tick_hard_budget_ms: tick_hard,
+            tick_greedy_fallback_ms: tick_greedy,
             log_level: self.log_level,
             structured_bot_log: self.structured_bot_log,
             ascii_render: self.ascii_render,
-            replay_dump_path: self.replay_dump_path,
+            debug: self.debug,
+            replay_dump_path,
             coord_claim_ttl_ticks: self.coord_claim_ttl_ticks.clamp(2, 60),
             coord_reassign_no_progress_ticks: self.coord_reassign_no_progress_ticks.clamp(2, 64),
             coord_goal_collapse_threshold: self.coord_goal_collapse_threshold.clamp(2, 32),

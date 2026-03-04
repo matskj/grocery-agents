@@ -518,8 +518,8 @@ impl AssignmentEngine {
                             adjusted += runtime_hints.out_of_area_penalty.round() as i32;
                         }
                         if expansion_mode && out_of_radius_target {
-                            let overrun = ((dist_to_stand - local_radius) / local_radius)
-                                .clamp(0.0, 3.0);
+                            let overrun =
+                                ((dist_to_stand - local_radius) / local_radius).clamp(0.0, 3.0);
                             adjusted +=
                                 (runtime_hints.out_of_radius_penalty * overrun).round() as i32;
                         }
@@ -1230,7 +1230,7 @@ mod tests {
             }],
             ..GameState::default()
         };
-        let world = World::new(state.clone());
+        let world = World::new(&state);
         let map = world.map();
         let dist = DistanceMap::build(map);
         let team = TeamContext::build(
@@ -1336,7 +1336,7 @@ mod tests {
             ],
             ..GameState::default()
         };
-        let world = World::new(state.clone());
+        let world = World::new(&state);
         let map = world.map();
         let dist = DistanceMap::build(map);
         let team = TeamContext::build(
@@ -1426,7 +1426,7 @@ mod tests {
             }],
             ..GameState::default()
         };
-        let world = World::new(state.clone());
+        let world = World::new(&state);
         let map = world.map();
         let dist = DistanceMap::build(map);
         let team = TeamContext::build(
@@ -1517,7 +1517,7 @@ mod tests {
             ],
             ..GameState::default()
         };
-        let world = World::new(state.clone());
+        let world = World::new(&state);
         let map = world.map();
         let dist = DistanceMap::build(map);
         let team = TeamContext::build(
@@ -1545,16 +1545,31 @@ mod tests {
             .copied()
             .unwrap_or(u16::MAX);
         let mut hints = AssignmentRuntimeHints::default();
-        hints.preferred_area_by_bot.insert("0".to_owned(), local_area);
+        hints
+            .preferred_area_by_bot
+            .insert("0".to_owned(), local_area);
         hints.expansion_mode_by_bot.insert("0".to_owned(), false);
-        hints.local_active_candidate_count_by_bot.insert("0".to_owned(), 1);
+        hints
+            .local_active_candidate_count_by_bot
+            .insert("0".to_owned(), 1);
         hints.local_radius_by_bot.insert("0".to_owned(), 5);
         hints.out_of_area_penalty = 28.0;
         hints.out_of_radius_penalty = 45.0;
 
         let engine = AssignmentEngine::new();
         let result = engine
-            .build_intents(&state, map, &dist, &team, 8, 1.0, 1.5, 1.0, hints, Duration::from_millis(200))
+            .build_intents(
+                &state,
+                map,
+                &dist,
+                &team,
+                8,
+                1.0,
+                1.5,
+                1.0,
+                hints,
+                Duration::from_millis(200),
+            )
             .expect("assignment");
         let intent = result
             .intents
@@ -1599,7 +1614,7 @@ mod tests {
             }],
             ..GameState::default()
         };
-        let world = World::new(state.clone());
+        let world = World::new(&state);
         let map = world.map();
         let dist = DistanceMap::build(map);
         let team = TeamContext::build(
@@ -1622,14 +1637,27 @@ mod tests {
         let mut hints = AssignmentRuntimeHints::default();
         hints.preferred_area_by_bot.insert("0".to_owned(), u16::MAX);
         hints.expansion_mode_by_bot.insert("0".to_owned(), true);
-        hints.local_active_candidate_count_by_bot.insert("0".to_owned(), 0);
+        hints
+            .local_active_candidate_count_by_bot
+            .insert("0".to_owned(), 0);
         hints.local_radius_by_bot.insert("0".to_owned(), 2);
         hints.out_of_area_penalty = 28.0;
         hints.out_of_radius_penalty = 45.0;
 
         let engine = AssignmentEngine::new();
         let result = engine
-            .build_intents(&state, map, &dist, &team, 8, 1.0, 1.5, 1.0, hints, Duration::from_millis(200))
+            .build_intents(
+                &state,
+                map,
+                &dist,
+                &team,
+                8,
+                1.0,
+                1.5,
+                1.0,
+                hints,
+                Duration::from_millis(200),
+            )
             .expect("assignment");
         let intent = result
             .intents

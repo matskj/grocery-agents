@@ -2,11 +2,13 @@
 
 mod assign;
 mod config;
+mod difficulty;
 mod dispatcher;
 mod dist;
 mod model;
 mod motion;
 mod net;
+mod policies;
 mod policy;
 mod scoring;
 mod team_context;

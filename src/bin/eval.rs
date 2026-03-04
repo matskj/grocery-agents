@@ -589,7 +589,8 @@ fn parse_metrics(path: &Path) -> Result<EpisodeMetrics, Box<dyn std::error::Erro
                     });
 
                 if pref_area >= 0 && goal_area >= 0 {
-                    metrics.preferred_area_samples = metrics.preferred_area_samples.saturating_add(1);
+                    metrics.preferred_area_samples =
+                        metrics.preferred_area_samples.saturating_add(1);
                     if pref_area == goal_area {
                         metrics.preferred_area_matches =
                             metrics.preferred_area_matches.saturating_add(1);
@@ -598,7 +599,8 @@ fn parse_metrics(path: &Path) -> Result<EpisodeMetrics, Box<dyn std::error::Erro
                 if !expansion {
                     if let Some((gx, gy)) = goal_xy {
                         metrics.local_first_checks = metrics.local_first_checks.saturating_add(1);
-                        let out_of_area = pref_area >= 0 && goal_area >= 0 && pref_area != goal_area;
+                        let out_of_area =
+                            pref_area >= 0 && goal_area >= 0 && pref_area != goal_area;
                         let dist_to_goal = (bx - gx).abs() as f64 + (by - gy).abs() as f64;
                         let out_of_radius = local_radius > 0.0 && dist_to_goal > local_radius;
                         if out_of_area || out_of_radius {
@@ -1264,12 +1266,18 @@ fn evaluate_strict_all_modes(
     let mut any_failed = false;
     for mode in required_modes {
         let Some(cur) = current.get(mode) else {
-            println!("coord-strict mode={} status=FAIL failed=missing_current_mode", mode);
+            println!(
+                "coord-strict mode={} status=FAIL failed=missing_current_mode",
+                mode
+            );
             any_failed = true;
             continue;
         };
         let Some(base) = baseline.get(mode) else {
-            println!("coord-strict mode={} status=FAIL failed=missing_baseline_mode", mode);
+            println!(
+                "coord-strict mode={} status=FAIL failed=missing_baseline_mode",
+                mode
+            );
             any_failed = true;
             continue;
         };

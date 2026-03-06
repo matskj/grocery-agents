@@ -9,30 +9,7 @@ pub enum Difficulty {
     Custom,
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct DifficultyConfig {
-    pub label: &'static str,
-    pub map_width: i32,
-    pub map_height: i32,
-    pub bot_count: usize,
-    pub reservation_horizon: u8,
-    pub deep_plan_bot_cap: usize,
-    pub regional_picker_count: usize,
-    pub runner_count: usize,
-    pub buffer_count: usize,
-}
-
 impl Difficulty {
-    pub fn from_label(label: &str) -> Self {
-        match label {
-            "easy" => Self::Easy,
-            "medium" => Self::Medium,
-            "hard" => Self::Hard,
-            "expert" => Self::Expert,
-            _ => Self::Custom,
-        }
-    }
-
     pub fn as_label(self) -> &'static str {
         match self {
             Self::Easy => "easy",
@@ -40,66 +17,6 @@ impl Difficulty {
             Self::Hard => "hard",
             Self::Expert => "expert",
             Self::Custom => "custom",
-        }
-    }
-
-    pub fn config(self) -> DifficultyConfig {
-        match self {
-            Self::Easy => DifficultyConfig {
-                label: "easy",
-                map_width: 12,
-                map_height: 10,
-                bot_count: 1,
-                reservation_horizon: 2,
-                deep_plan_bot_cap: 1,
-                regional_picker_count: 1,
-                runner_count: 0,
-                buffer_count: 0,
-            },
-            Self::Medium => DifficultyConfig {
-                label: "medium",
-                map_width: 16,
-                map_height: 12,
-                bot_count: 3,
-                reservation_horizon: 4,
-                deep_plan_bot_cap: 3,
-                regional_picker_count: 2,
-                runner_count: 1,
-                buffer_count: 0,
-            },
-            Self::Hard => DifficultyConfig {
-                label: "hard",
-                map_width: 22,
-                map_height: 14,
-                bot_count: 5,
-                reservation_horizon: 6,
-                deep_plan_bot_cap: 4,
-                regional_picker_count: 4,
-                runner_count: 1,
-                buffer_count: 0,
-            },
-            Self::Expert => DifficultyConfig {
-                label: "expert",
-                map_width: 28,
-                map_height: 18,
-                bot_count: 10,
-                reservation_horizon: 7,
-                deep_plan_bot_cap: 5,
-                regional_picker_count: 5,
-                runner_count: 3,
-                buffer_count: 2,
-            },
-            Self::Custom => DifficultyConfig {
-                label: "custom",
-                map_width: 0,
-                map_height: 0,
-                bot_count: 0,
-                reservation_horizon: 5,
-                deep_plan_bot_cap: 4,
-                regional_picker_count: 3,
-                runner_count: 1,
-                buffer_count: 0,
-            },
         }
     }
 }
@@ -112,6 +29,10 @@ pub fn infer_difficulty(state: &GameState) -> Difficulty {
         (10, 28, 18) => Difficulty::Expert,
         _ => Difficulty::Custom,
     }
+}
+
+pub fn detect_mode_label(state: &GameState) -> &'static str {
+    infer_difficulty(state).as_label()
 }
 
 #[cfg(test)]

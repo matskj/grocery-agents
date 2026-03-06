@@ -1,20 +1,3 @@
-#![recursion_limit = "512"]
-
-mod assign;
-mod config;
-mod difficulty;
-mod dispatcher;
-mod dist;
-mod metrics;
-mod model;
-mod motion;
-mod net;
-mod policies;
-mod policy;
-mod scoring;
-mod team_context;
-mod world;
-
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -23,8 +6,11 @@ use std::{
 
 use base64::Engine;
 use clap::Parser;
-use config::{ConfigArgs, PolicyMode};
-use model::{RuntimeContext, SessionMetadata};
+use grocery_agents::{
+    config::{ConfigArgs, PolicyMode},
+    model::{RuntimeContext, SessionMetadata},
+    net, policy,
+};
 use serde::Deserialize;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 

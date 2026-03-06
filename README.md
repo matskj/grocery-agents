@@ -1,405 +1,106 @@
 # grocery-agents
 
-A Rust bot client for the Norwegian AI Championship warm-up grocery game.
+Deterministic Rust bot for the grocery challenge, optimized for throughput:
+
+- deliver as many active-order items as possible in 300 rounds
+- collect +5 order-completion bonuses by minimizing order transition latency
+- pipeline preview-order items without delaying active completion
+
+## Runtime Focus
+
+This repository is runtime-only.
+
+Implemented planners by difficulty:
+
+- `easy` (1 bot, 12x10): exact small-horizon routing via brute-force permutations
+- `medium` (3 bots, 16x12): centralized assignment + short-horizon reservations + dedicated stager
+- `hard` (5 bots, 22x14): regional pickers + runner/stager + claim-based duplication control
+- `expert` (10 bots, 28x18): role-specialized swarm (pickers/runners/buffers) + marginal-gain scheduler
 
 ## Prerequisites
 
-- Rust toolchain (install with rustup): https://rustup.rs/
-- `cargo` available on your `PATH`
-- Python 3.10+ (for offline training pipeline)
+- Rust toolchain: https://rustup.rs/
+- On Windows: Visual Studio C++ Build Tools (for `link.exe`)
 
-Quick verify:
-
-```bash
-cargo --version
-rustc --version
-```
-
-### Windows setup notes (PowerShell)
-
-If `cargo`/`rustc` are not found after install, close and reopen PowerShell.
-
-Install required tooling:
+## Build
 
 ```powershell
-winget install -e --id Rustlang.Rustup --source winget --accept-source-agreements --accept-package-agreements
-winget install -e --id Microsoft.VisualStudio.2022.BuildTools --source winget --accept-source-agreements --accept-package-agreements --override "--quiet --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"
+cargo check
+cargo test
 ```
 
-On Windows ARM64, use the x64 Rust toolchain for this repo:
+## Run
+
+Use token directly:
 
 ```powershell
-rustup toolchain install stable-x86_64-pc-windows-msvc --force-non-host
-rustup target add x86_64-pc-windows-msvc
+cargo run --bin grocery-agents -- --token <jwt>
 ```
 
-## Build and run
+Or full websocket URL:
 
-```bash
-RUST_LOG=info cargo run --bin grocery-agents -- --token <jwt>
+```powershell
+cargo run --bin grocery-agents -- "wss://game.ainm.no/ws?token=<jwt>"
 ```
 
-You can also paste the full websocket URL directly (token auto-extracted):
+Policy override:
 
-```bash
-cargo run --bin grocery-agents -- 'wss://game.ainm.no/ws?token=eyJ...'
-```
-
-Explicit policy override:
-
-```bash
+```powershell
 cargo run --bin grocery-agents -- --policy expert --token <jwt>
 ```
 
-Replay recorded states without websocket:
+Replay mode:
 
-```bash
+```powershell
 cargo run --bin grocery-agents -- --replay logs/run-<timestamp>.jsonl
 ```
 
-Benchmark recordings across all policies:
+## Offline Planner Lab
 
-```bash
-cargo run --bin grocery-agents -- benchmark logs/run-*.jsonl
-```
-
-Windows ARM64 helper (uses VS `vcvars64` + x64 Rust toolchain):
+Local deterministic replay + what-if UI:
 
 ```powershell
-.\cargo-x64.cmd check --target x86_64-pc-windows-msvc
-.\cargo-x64.cmd run --target x86_64-pc-windows-msvc -- --token eyJ...
-.\cargo-x64.cmd run --target x86_64-pc-windows-msvc -- "wss://game.ainm.no/ws?token=eyJ..."
+cargo run --bin lab -- --logs-dir logs --port 8085 --seed 42
 ```
 
-## Optional Python training setup
+Then open `http://127.0.0.1:8085`.
 
-Install offline training dependencies:
-
-```bash
-python -m pip install -r requirements.txt
-```
-
-## Local evaluation runner (Rust)
-
-Run quick metric summaries from existing logs:
+Offline batch scoring:
 
 ```powershell
-.\cargo-x64.cmd run --bin eval -- --from-logs --episodes 10
+cargo run --bin sim_eval -- --logs-dir logs --episodes 20 --policy auto --seed 42 --out reports/eval.json
 ```
 
-Expert-only regression gate from logs:
-
-```powershell
-.\cargo-x64.cmd run --bin eval -- --from-logs --episodes 20 --mode-filter expert
-```
-
-Deterministic replay latency benchmark:
-
-```powershell
-.\cargo-x64.cmd run --bin replay_bench -- --replay logs\run-<timestamp>.jsonl --policy auto --budget-profile balanced --determinism-check
-```
-
-Run fresh episodes against local websocket simulator:
-
-```powershell
-.\cargo-x64.cmd run --bin eval -- --episodes 10 --ws-url ws://localhost:8765/ws --token <jwt>
-```
-
-Profiles:
-
-```powershell
-# conservative planning budget
-.\cargo-x64.cmd run --bin eval -- --episodes 10 --profile safe --ws-url ws://localhost:8765/ws --token <jwt>
-
-# wider search / longer horizon
-.\cargo-x64.cmd run --bin eval -- --episodes 10 --profile aggressive --ws-url ws://localhost:8765/ws --token <jwt>
-```
-
-Profile behavior:
-
-- `safe`: `legacy_only` assignment mode
-- `default`: `hybrid` assignment mode
-- `aggressive`: `global_only` assignment mode
-
-The eval summary prints score mean/p50/p90, wait ratio, move/pickup/dropoff counts,
-blocked events, and near-dropoff congestion events.
-
-It also prints collapse-focused metrics:
-
-- `collapse_alarms`: late no-delivery streak, goal-collapse ratio, guard-fallback ratio
-- phase slices (`early`, `mid`, `late`): score gain, delivered/completed, avg blocked/stuck,
-  avg unique-goals, avg goal concentration top-3
-
-## Local Replay UI
-
-You can inspect run behavior visually with a local browser replay tool.
-
-Start server:
-
-```bash
-python tools/replay_server.py --port 8085
-```
-
-Open:
-
-```text
-http://127.0.0.1:8085
-```
-
-Features:
-
-- run selector for `logs/run-*.jsonl`
-- board rendering with walls, shelf/item cells, dropoff tile, and bot positions
-- queue/ring overlays, conflict hotspots, failed-move arrows, and role badges (`L/Q/C/Y`)
-- tick playback controls (play/pause, prev/next, speed, slider)
-- live refresh while a run file is still being written
-- side panel with active/preview order counts, queue congestion metrics, and per-tick actions
-
-### Training-run wrapper (auto-starts UI)
-
-For training games, use the wrapper below so replay UI is always available:
-
-```powershell
-.\run-training.cmd -- "wss://game.ainm.no/ws?token=eyJ..."
-```
-
-Equivalent Python entrypoint:
-
-```powershell
-python tools/run_training_run.py -- "wss://game.ainm.no/ws?token=eyJ..."
-```
-
-This does two things each run:
-
-1. Ensures replay server is running on `http://127.0.0.1:8085`
-2. Starts bot run via `cargo-x64.cmd run --target x86_64-pc-windows-msvc`
-3. Triggers batch retraining whenever at least 10 new completed runs are available
-
-Optional flags:
-
-```powershell
-# disable post-run batch retraining for a single run
-python tools/run_training_run.py --no-batch-train -- "wss://game.ainm.no/ws?token=eyJ..."
-
-# custom batch size / mode subset
-python tools/run_training_run.py --batch-size 10 --train-modes "easy,expert" -- "wss://game.ainm.no/ws?token=eyJ..."
-```
-
-Auto-fetch websocket tokens via Playwright (no manual token paste):
-
-```powershell
-# first run: headed mode so you can complete login; storage saved to .secrets/ainm_storage_state.json
-python tools/run_training_run.py --no-batch-train --auto-token-difficulty expert --auto-token-headed
-
-# subsequent runs: headless, auto-refreshes token each run
-python tools/run_training_run.py --no-batch-train --auto-token-difficulty expert --repeat 10 --cooldown-seconds 62
-```
-
-Auto-fetch websocket tokens via direct HTTP play endpoint (faster than browser automation):
-
-```powershell
-# set auth/session input used by the site API (choose bearer or cookie depending on your DevTools request)
-$env:AINM_PLAY_ENDPOINT="https://app.ainm.no/api/challenge/play"
-$env:AINM_ACCESS_TOKEN="<access token>"
-
-python tools/run_training_run.py `
-  --no-batch-train `
-  --auto-token-provider http `
-  --auto-token-difficulty expert `
-  --repeat 10 `
-  --cooldown-seconds 62
-```
-
-If your request needs extra headers, pass one or more:
-
-```powershell
-python tools/run_training_run.py --auto-token-provider http --auto-token-difficulty expert `
-  --auto-token-header "X-Requested-With: XMLHttpRequest" `
-  --auto-token-header "Sec-Fetch-Site: same-origin"
-```
-
-Playwright setup:
-
-```powershell
-python -m pip install playwright
-python -m playwright install chromium
-```
-
-### Token input behavior (CLI + env fallback)
-
-The token is configured with Clap as `--token` plus an environment fallback:
-
-- `--token <jwt>` has highest precedence.
-- If `--token` is omitted, `GROCERY_TOKEN` is used.
-- If still missing, token can be read from a full websocket URL passed as positional argument or `--ws-url`.
-- If no token source is provided, startup fails with a CLI argument error.
-
-Examples:
-
-```bash
-# Explicit CLI token
-RUST_LOG=info cargo run -- --token eyJ...
-
-# Environment fallback
-export GROCERY_TOKEN=eyJ...
-RUST_LOG=info cargo run
-```
-
-PowerShell equivalents:
-
-```powershell
-# Explicit CLI token
-$env:RUST_LOG="info"
-cargo run -- --token eyJ...
-
-# Environment fallback
-$env:GROCERY_TOKEN="eyJ..."
-$env:RUST_LOG="info"
-cargo run
-```
-
-## Runtime message flow and timeout strategy
-
-1. Connect to websocket (`GROCERY_WS_URL`, default `ws://localhost:8765/ws`) with `?token=...` query.
-2. Receive `game_state` or `game_over` messages.
-3. For each `game_state` tick:
-   - Build intents via dispatcher.
-   - Build movement plan via motion planner.
-   - Validate actions before send.
-   - Send one `ActionEnvelope` back to server.
-4. On `game_over`, log final score/reason and exit loop.
-
-### Per-run game logs (JSONL)
-
-The client writes a run log automatically to `logs/run-<timestamp>.jsonl`.
-
-Each line is a JSON event with top-level `schema_version` and `run_id`, including:
-
-- `session_start` (ws url preview + metadata)
-- `game_mode` (detected mode label + bots/grid dimensions)
-- `tick` (full `game_state`, chosen `actions`, team summary, and `tick_outcome`)
-- `tick_outcome` (`delta_score`, `items_delivered_delta`, `order_completed_delta`, `invalid_action_count`)
-- `game_over` (final score + reason)
-
-`team_summary` now also includes coordination telemetry (queue role/slot/distance by bot, queue violations,
-near-dropoff blocking flags, repeated failed-move counts, conflict degrees/hotspots, and failed-move arrows).
-
-You can override the output directory with `GAME_LOG_DIR`:
-
-```powershell
-$env:GAME_LOG_DIR="my-logs"
-.\cargo-x64.cmd run --target x86_64-pc-windows-msvc -- --token eyJ...
-```
-
-Explicit recording output:
-
-```powershell
-.\cargo-x64.cmd run --bin grocery-agents -- --record logs\recording.jsonl --token eyJ...
-```
-
-### Planning timeout strategy
-
-Per tick planning now uses a real-time budget ladder:
-
-- default soft target: `50ms`
-- default hard cap: `150ms`
-- fair-share adaptation from remaining wall-clock (`120s`) and remaining rounds (`300`)
-- deterministic single-worker planner thread with sequence IDs
-- fallback order: worker plan -> greedy-safe per-bot fallback -> `wait` only when no valid move exists
-
-If planning exceeds hard deadline:
-
-- The client logs a warning.
-- It emits a safe fallback envelope (greedy non-wait actions when valid, otherwise `wait`).
-- Normal planning resumes on the next received tick.
-- At `game_over`, the client prints a concise throughput report:
-  - score, orders completed, items delivered
-  - avg rounds/order, avg planning time, p95 planning time
-  - wait actions and corrected invalid actions
-
-## Training pipeline (per-mode specialists)
-
-The repository includes a Python pipeline under `training/` for log-based training:
-
-```bash
-python -m training.extract --logs-dir logs --out data/runs.parquet
-python -m training.featurize --data data/runs.parquet --out data/runs_features.parquet --n-step 5
-python -m training.train --mode medium --data data/runs_features.parquet --out models/medium.json
-python -m training.evaluate --data data/runs_features.parquet --model models/medium.json
-python -m training.export --models-dir models --out models/policy_artifacts.json
-python -m training.batch_train --logs-dir logs --models-dir models --batch-size 10
-```
-
-Train one model per mode (`easy`, `medium`, `hard`, `expert`) and export a combined artifact.
-
-At runtime, the Rust bot can consume that artifact by setting:
-
-```bash
-POLICY_ARTIFACT_PATH=models/policy_artifacts.json
-```
-
-## Architecture by module
-
-- `model`: Shared protocol/domain types (`GameState`, `Action`, envelopes, runtime context).
-- `world`: Board/map cache generation (indices, neighbors, item/drop-off lookup tables).
-- `dist`: All-pairs grid distance precomputation used by heuristics/planning.
-- `difficulty`: Difficulty inference (`easy|medium|hard|expert|custom`) from map dimensions + bot count.
-- `dispatcher`: Converts state into per-bot intents (pickup/dropoff/move/wait).
-- `motion`: Time-expanded path planning with reservation tables to avoid conflicts.
-- `policy`: Orchestration layer selecting per-difficulty strategies and merging strategy hints with assignment/motion.
-- `policies/*`: Specialized strategy modules (`easy`, `medium`, `hard`, `expert`) with shared helpers in `policies/common`.
-- `team_context`: Shared per-tick blackboard (roles, strict queue lanes, conflict/deadlock context, movement reservations).
-- `net`: Websocket networking loop, message parsing, timeout enforcement, action validation.
-
-## Debug logging toggle
-
-Set `BOT_DEBUG=1` (or `true`/`yes`) to enable additional operational logs.
-
-```bash
-BOT_DEBUG=1 RUST_LOG=info cargo run --bin grocery-agents -- --token <jwt>
-```
-
-When enabled, logs include:
-
-- assignment selection per bot intent
-- congestion/jam detection (blocked bot memory and drop-off crowding)
-- evacuation trigger events
-- fallback/time-budget events (timeout fallback, validation fallback-to-wait)
-
-Coordination knobs:
-
-- `QUEUE_STRICT_MODE=1` (default on in medium/hard/expert)
-- `QUEUE_MAX_RING_ENTRANTS=1` (strict queue default)
-- `DEADLOCK_ESCAPE_TICKS=3`
-- `GROCERY_HORIZON=16`
-- `GROCERY_CANDIDATE_K=8`
-- `GROCERY_ASSIGNMENT_ENABLED=true`
-- `GROCERY_ASSIGNMENT_MODE=hybrid` (`hybrid`, `global-only`, `legacy-only`)
-- `GROCERY_POLICY=auto` (`auto`, `easy`, `medium`, `hard`, `expert`)
-- `GROCERY_DROPOFF_SCHEDULING_ENABLED=true`
-- `GROCERY_DROPOFF_WINDOW=12`
-- `GROCERY_DROPOFF_CAPACITY=1`
-- `GROCERY_LAMBDA_DENSITY=1.0`
-- `GROCERY_LAMBDA_CHOKE=1.5`
-- `GROCERY_PLANNER_BUDGET_MODE=adaptive` (`adaptive`, `fixed`)
-- `GROCERY_PLANNER_SOFT_BUDGET_MS=1200`
-- `GROCERY_PLANNER_SOFT_BUDGET_MIN_MS=1350`
-- `GROCERY_PLANNER_SOFT_BUDGET_MAX_MS=1900`
-- `GROCERY_PLANNER_HARD_BUDGET_MS=1950`
-- `GROCERY_PLANNER_DEADLINE_SLACK_MS=80`
-- `GROCERY_TICK_SOFT_BUDGET_MS=45`
-- `GROCERY_TICK_HARD_BUDGET_MS=150`
-- `GROCERY_TICK_GREEDY_FALLBACK_MS=8`
+## Key Environment Variables
+
+- `GROCERY_POLICY=auto|easy|medium|hard|expert`
+- `GROCERY_PLANNER_BUDGET_MODE=adaptive|fixed`
+- `GROCERY_TICK_SOFT_BUDGET_MS`
+- `GROCERY_TICK_HARD_BUDGET_MS`
+- `GROCERY_TICK_GREEDY_FALLBACK_MS`
+- `GROCERY_CACHE_REUSE_MAX_AGE_TICKS`
+- `GROCERY_CACHE_REQUIRE_PROGRESS=true|false`
+- `GROCERY_LOG_LEVEL=info|debug|...`
 - `GROCERY_STRUCTURED_BOT_LOG=1`
 - `GROCERY_ASCII_RENDER=1`
-- `GROCERY_REPLAY_DUMP_PATH=logs/replay_dump.jsonl`
+- `GROCERY_DEBUG=1`
 
-## Safety fallback behavior (`wait`)
+## Module Layout
 
-Bots intentionally `wait` in safety-first scenarios:
+- `src/model.rs`: protocol/domain types and wire conversion
+- `src/world.rs`: static map cache and walkability
+- `src/dist.rs`: distance precomputation
+- `src/difficulty.rs`: difficulty inference
+- `src/planner/*`: per-difficulty planning + shared helpers + MAPF
+- `src/policy.rs`: planner orchestration + telemetry
+- `src/net.rs`: websocket loop, timeout handling, safe validation, replay playback
 
-- round planning exceeded time budget
-- proposed action is invalid during client-side validation (bad target bot, blocked/out-of-bounds move, invalid pickup/drop-off)
-- no safe or useful intent/path is available for that bot this tick
+## Testing Scope
 
-This prevents sending risky/invalid actions and keeps the client responsive under pressure.
+Primary tests target planner correctness and safety-critical behavior:
+
+- exact easy-trip construction
+- medium stager/finisher behavior
+- hard role + claim behavior
+- expert role partitioning
+- map/path invariants from existing map/model tests

@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Planner Lab</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;600;700&family=IBM+Plex+Mono:wght@400;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <div class="shell">
+    <header>
+      <h1>Deterministic Planner Lab</h1>
+      <p>Replay runs, inspect tick deltas, fork what-if simulations, and score policies offline.</p>
+    </header>
+
+    <section class="controls card">
+      <div>
+        <label for="runSelect">Run</label>
+        <select id="runSelect"></select>
+      </div>
+      <div>
+        <label for="tickInput">Tick</label>
+        <input id="tickInput" type="number" min="0" step="1" value="0" />
+      </div>
+      <div class="buttons">
+        <button id="prevBtn">Prev</button>
+        <button id="nextBtn">Next</button>
+        <button id="playBtn">Play</button>
+      </div>
+      <div>
+        <label for="speedInput">Speed ms</label>
+        <input id="speedInput" type="number" min="50" step="50" value="250" />
+      </div>
+      <div>
+        <button id="loadBtn">Load</button>
+      </div>
+    </section>
+
+    <section class="main-grid">
+      <div class="card board-wrap">
+        <canvas id="board"></canvas>
+        <div id="boardMeta" class="mono"></div>
+      </div>
+
+      <div class="card panel">
+        <h2>Tick Diff</h2>
+        <pre id="tickDiff" class="mono"></pre>
+        <h2>Team Timeline</h2>
+        <pre id="timeline" class="mono"></pre>
+      </div>
+    </section>
+
+    <section class="card fork">
+      <h2>What-if Fork</h2>
+      <div class="fork-controls">
+        <button id="forkBtn">Fork From Tick</button>
+        <button id="forkStepBtn">Step x1</button>
+        <button id="forkStep10Btn">Step x10 (Auto Policy)</button>
+      </div>
+      <pre id="forkOut" class="mono"></pre>
+    </section>
+
+    <section class="card eval">
+      <h2>Batch Eval</h2>
+      <div class="fork-controls">
+        <input id="episodesInput" type="number" min="1" max="500" value="10" />
+        <select id="policySelect">
+          <option value="auto">auto</option>
+          <option value="easy">easy</option>
+          <option value="medium">medium</option>
+          <option value="hard">hard</option>
+          <option value="expert">expert</option>
+        </select>
+        <button id="evalBtn">Run Eval</button>
+      </div>
+      <pre id="evalOut" class="mono"></pre>
+    </section>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>

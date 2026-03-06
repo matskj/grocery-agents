@@ -1,0 +1,147 @@
+:root {
+  --bg: #f3efe7;
+  --card: #fffdf8;
+  --ink: #151515;
+  --sub: #5a544a;
+  --accent: #0f766e;
+  --accent-2: #f97316;
+  --line: #dad3c4;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  font-family: "Space Grotesk", "Segoe UI", sans-serif;
+  color: var(--ink);
+  background: radial-gradient(circle at 10% 0%, #ffe7cf 0, transparent 32%),
+              radial-gradient(circle at 100% 100%, #bfeae4 0, transparent 34%),
+              var(--bg);
+}
+
+.shell {
+  max-width: 1280px;
+  margin: 0 auto;
+  padding: 1rem;
+  display: grid;
+  gap: 1rem;
+}
+
+header h1 {
+  margin: 0;
+  font-size: 1.7rem;
+}
+
+header p {
+  margin: 0.35rem 0 0;
+  color: var(--sub);
+}
+
+.card {
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  box-shadow: 0 10px 24px rgba(0, 0, 0, 0.05);
+  padding: 0.9rem;
+}
+
+.controls {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(120px, 1fr));
+  gap: 0.7rem;
+  align-items: end;
+}
+
+label {
+  display: block;
+  font-size: 0.8rem;
+  color: var(--sub);
+  margin-bottom: 0.2rem;
+}
+
+input, select, button {
+  width: 100%;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  padding: 0.45rem 0.55rem;
+  font: inherit;
+}
+
+button {
+  cursor: pointer;
+  background: linear-gradient(90deg, var(--accent), #0f9f94);
+  color: white;
+  border: none;
+  font-weight: 600;
+}
+
+button:hover {
+  filter: brightness(0.95);
+}
+
+.buttons {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 0.4rem;
+}
+
+.buttons button:nth-child(2) {
+  background: linear-gradient(90deg, #0f766e, #f97316);
+}
+
+.buttons button:nth-child(3) {
+  background: linear-gradient(90deg, #f97316, #fb923c);
+}
+
+.main-grid {
+  display: grid;
+  grid-template-columns: 2fr 1fr;
+  gap: 1rem;
+}
+
+.board-wrap {
+  min-height: 480px;
+}
+
+#board {
+  width: 100%;
+  max-width: 860px;
+  background: #fff;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+}
+
+.panel h2,
+.fork h2,
+.eval h2 {
+  margin: 0.2rem 0 0.5rem;
+  font-size: 1rem;
+}
+
+.mono {
+  font-family: "IBM Plex Mono", Consolas, monospace;
+  white-space: pre-wrap;
+  margin: 0;
+  max-height: 300px;
+  overflow: auto;
+  font-size: 0.82rem;
+}
+
+.fork-controls {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(120px, 1fr));
+  gap: 0.6rem;
+  margin-bottom: 0.6rem;
+}
+
+.eval .fork-controls {
+  grid-template-columns: 120px 150px 130px;
+}
+
+@media (max-width: 980px) {
+  .main-grid { grid-template-columns: 1fr; }
+  .controls { grid-template-columns: 1fr 1fr; }
+  .buttons { grid-column: span 2; }
+  .fork-controls,
+  .eval .fork-controls { grid-template-columns: 1fr; }
+}

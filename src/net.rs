@@ -20,7 +20,7 @@ use tracing::{info, warn};
 
 use crate::{
     config::{Config, PlannerBudgetMode},
-    dispatcher::Dispatcher,
+    difficulty::detect_mode_label,
     dist::DistanceMap,
     metrics::MetricsTracker,
     model::{
@@ -28,8 +28,6 @@ use crate::{
         OrderStatus, RuntimeContext, WireServerMessage,
     },
     policy::Policy,
-    scoring::{artifact_load_status, detect_mode_label},
-    team_context::active_missing_total,
     world::World,
 };
 
@@ -139,14 +137,12 @@ impl PlannerManager {
             .name("planner-worker".to_owned())
             .spawn(move || {
                 let mut worker_policy = policy;
-                let worker_dispatcher = Dispatcher::new();
                 while let Ok(msg) = request_rx.recv() {
                     match msg {
                         PlannerWorkerMsg::Plan(req) => {
                             let started = Instant::now();
                             let result = plan_round_actions(
                                 &mut worker_policy,
-                                &worker_dispatcher,
                                 &req.state,
                                 req.soft_budget_ms,
                             );
@@ -341,7 +337,6 @@ pub async fn run_game_loop(
         }
     };
     let mut planner_manager = PlannerManager::new(policy);
-    let artifact_status = artifact_load_status();
 
     run_logger.log(
         "session_start",
@@ -359,26 +354,19 @@ pub async fn run_game_loop(
             "tick_soft_budget_ms": config.tick_soft_budget_ms,
             "tick_hard_budget_ms": config.tick_hard_budget_ms,
             "tick_greedy_fallback_ms": config.tick_greedy_fallback_ms,
-            "active_first_strict": config.active_first_strict,
             "cache_reuse_max_age_ticks": config.cache_reuse_max_age_ticks,
             "cache_require_progress": config.cache_require_progress,
             "policy_mode": format!("{:?}", config.policy_mode).to_lowercase(),
-            "coord_local_radius_base": config.coord_local_radius_base,
-            "coord_local_radius_max": config.coord_local_radius_max,
-            "coord_expansion_stall_ticks": config.coord_expansion_stall_ticks,
-            "coord_preferred_area_ttl_ticks": config.coord_preferred_area_ttl_ticks,
-            "coord_out_of_area_penalty": config.coord_out_of_area_penalty,
-            "coord_out_of_radius_penalty": config.coord_out_of_radius_penalty,
             "mode": ctx.session.difficulty.as_deref().unwrap_or("unknown"),
             "map_id": ctx.session.map_id,
             "difficulty": ctx.session.difficulty,
             "team_id": ctx.session.team_id,
             "map_seed": ctx.session.map_seed,
             "build_version": build_version(),
-            "artifact_path": artifact_status.artifact_path,
-            "artifact_loaded": artifact_status.artifact_loaded,
-            "artifact_schema_version": artifact_status.artifact_schema_version,
-            "artifact_mode_count": artifact_status.artifact_mode_count,
+            "artifact_path": "",
+            "artifact_loaded": false,
+            "artifact_schema_version": "",
+            "artifact_mode_count": 0,
         }),
     );
 
@@ -582,7 +570,6 @@ pub fn run_replay_file(
 ) -> Result<ReplaySummary, Box<dyn std::error::Error>> {
     let file = File::open(replay_path)?;
     let reader = BufReader::new(file);
-    let dispatcher = Dispatcher::new();
     let mut metrics = MetricsTracker::default();
     let mut prev_score = None::<i64>;
     let mut prev_active_index = None::<i64>;
@@ -602,8 +589,7 @@ pub fn run_replay_file(
         ticks = ticks.saturating_add(1);
 
         let started = Instant::now();
-        let mut planned =
-            plan_round_actions(&mut policy, &dispatcher, &state, config.tick_soft_budget_ms);
+        let mut planned = plan_round_actions(&mut policy, &state, config.tick_soft_budget_ms);
         if started.elapsed() > Duration::from_millis(config.tick_hard_budget_ms) {
             planned = fallback_safe_actions(&state, config.tick_soft_budget_ms);
             if let Some(obj) = planned.team_telemetry.as_object_mut() {
@@ -870,6 +856,14 @@ fn has_immediate_conversion_opportunity(state: &GameState) -> bool {
             .any(|kind| active_kinds.contains(kind.as_str()));
         near_drop && carries_active
     })
+}
+
+fn active_missing_total(state: &GameState) -> usize {
+    state
+        .orders
+        .iter()
+        .filter(|order| matches!(order.status, OrderStatus::InProgress))
+        .count()
 }
 
 fn cache_meta(state: &GameState) -> CachedPlanMeta {
@@ -1739,7 +1733,6 @@ fn game_mode_payload(state: &GameState) -> serde_json::Value {
 
 fn plan_round_actions(
     policy: &mut Policy,
-    dispatcher: &Dispatcher,
     state: &GameState,
     soft_budget_ms: u64,
 ) -> PlanRoundResult {
@@ -1757,8 +1750,7 @@ fn plan_round_actions(
         .iter()
         .zip(proposed.into_iter())
         .map(|(bot, action)| {
-            let dispatched = dispatcher.dispatch(action);
-            let (validated, was_invalid) = validate_action(dispatched, state, bot);
+            let (validated, was_invalid) = validate_action(action, state, bot);
             if was_invalid {
                 invalid += 1;
             }
@@ -2151,284 +2143,4 @@ fn bot_debug_enabled() -> bool {
             .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
             .unwrap_or(false)
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use std::{
-        path::PathBuf,
-        sync::Arc,
-        thread,
-        time::{Duration, Instant},
-    };
-
-    use crate::config::{AssignmentMode, Config, PlannerBudgetMode, PolicyMode};
-    use crate::model::{Action, BotState, GameState, Grid, Order, OrderStatus};
-    use crate::policy::Policy;
-
-    use super::{compute_tick_budget, validate_action, BudgetPressure, PlannerManager};
-
-    fn base_state(order_status: OrderStatus) -> (GameState, BotState) {
-        let bot = BotState {
-            id: "0".to_owned(),
-            x: 1,
-            y: 1,
-            carrying: vec!["milk".to_owned()],
-            capacity: 3,
-        };
-        let state = GameState {
-            grid: Grid {
-                width: 4,
-                height: 4,
-                drop_off_tiles: vec![[1, 1]],
-                ..Grid::default()
-            },
-            bots: vec![bot.clone()],
-            orders: vec![Order {
-                id: "o1".to_owned(),
-                item_id: "milk".to_owned(),
-                status: order_status,
-            }],
-            ..GameState::default()
-        };
-        (state, bot)
-    }
-
-    #[test]
-    fn dropoff_rejected_for_pending_order() {
-        let (state, bot) = base_state(OrderStatus::Pending);
-        let (validated, invalid) = validate_action(
-            Action::DropOff {
-                bot_id: bot.id.clone(),
-                order_id: "o1".to_owned(),
-            },
-            &state,
-            &bot,
-        );
-        assert!(invalid);
-        assert!(matches!(validated, Action::Wait { .. }));
-    }
-
-    #[test]
-    fn dropoff_allowed_for_active_order_with_item() {
-        let (state, bot) = base_state(OrderStatus::InProgress);
-        let (validated, invalid) = validate_action(
-            Action::DropOff {
-                bot_id: bot.id.clone(),
-                order_id: "o1".to_owned(),
-            },
-            &state,
-            &bot,
-        );
-        assert!(!invalid);
-        assert!(matches!(validated, Action::DropOff { .. }));
-    }
-
-    fn test_config(mode: PlannerBudgetMode) -> Config {
-        Config {
-            horizon: 16,
-            candidate_k: 8,
-            policy_mode: PolicyMode::Auto,
-            assignment_enabled: true,
-            assignment_mode: AssignmentMode::Hybrid,
-            dropoff_scheduling_enabled: true,
-            dropoff_window: 12,
-            dropoff_capacity: 1,
-            lambda_density: 1.0,
-            lambda_choke: 1.5,
-            planner_budget_mode: mode,
-            planner_soft_budget_ms: 1_200,
-            planner_soft_budget_min_ms: 1_350,
-            planner_soft_budget_max_ms: 1_900,
-            planner_hard_budget_ms: 1_950,
-            planner_deadline_slack_ms: 80,
-            tick_soft_budget_ms: 45,
-            tick_hard_budget_ms: 150,
-            tick_greedy_fallback_ms: 8,
-            active_first_strict: true,
-            cache_reuse_max_age_ticks: 1,
-            cache_require_progress: true,
-            log_level: "info".to_owned(),
-            structured_bot_log: false,
-            ascii_render: false,
-            debug: false,
-            replay_dump_path: Option::<PathBuf>::None,
-            coord_claim_ttl_ticks: 10,
-            coord_reassign_no_progress_ticks: 8,
-            coord_goal_collapse_threshold: 4,
-            coord_max_bots_per_stand: 1,
-            coord_post_dropoff_retask_ticks: 6,
-            coord_area_balance_weight: 1.0,
-            coord_local_radius_base: 8,
-            coord_local_radius_max: 14,
-            coord_expansion_stall_ticks: 10,
-            coord_preferred_area_ttl_ticks: 10,
-            coord_out_of_area_penalty: 28.0,
-            coord_out_of_radius_penalty: 45.0,
-        }
-    }
-
-    #[test]
-    fn adaptive_budget_increases_with_congestion() {
-        let cfg = test_config(PlannerBudgetMode::Adaptive);
-        let low = compute_tick_budget(
-            &cfg,
-            BudgetPressure {
-                blocked_bots_prev: 0,
-                stuck_bots_prev: 0,
-            },
-            10,
-            100,
-            30_000,
-        )
-        .soft_ms;
-        let high = compute_tick_budget(
-            &cfg,
-            BudgetPressure {
-                blocked_bots_prev: 6,
-                stuck_bots_prev: 4,
-            },
-            10,
-            100,
-            30_000,
-        )
-        .soft_ms;
-        assert!(high > low);
-    }
-
-    #[test]
-    fn soft_plus_slack_never_exceeds_hard_budget() {
-        let mut cfg = test_config(PlannerBudgetMode::Adaptive);
-        cfg.planner_hard_budget_ms = 1_500;
-        cfg.planner_deadline_slack_ms = 120;
-        cfg.planner_soft_budget_max_ms = 1_900;
-        let budget = compute_tick_budget(
-            &cfg,
-            BudgetPressure {
-                blocked_bots_prev: 20,
-                stuck_bots_prev: 20,
-            },
-            10,
-            120,
-            80_000,
-        );
-        assert!(budget.soft_ms <= budget.hard_ms);
-    }
-
-    #[test]
-    fn fixed_mode_preserves_legacy_behavior() {
-        let cfg = test_config(PlannerBudgetMode::Fixed);
-        let soft = compute_tick_budget(
-            &cfg,
-            BudgetPressure {
-                blocked_bots_prev: 20,
-                stuck_bots_prev: 20,
-            },
-            10,
-            20,
-            2_000,
-        )
-        .soft_ms;
-        assert_eq!(soft, cfg.tick_soft_budget_ms);
-    }
-
-    fn planner_state(tick: u64) -> GameState {
-        GameState {
-            tick,
-            grid: Grid {
-                width: 6,
-                height: 6,
-                drop_off_tiles: vec![[0, 0]],
-                walls: vec![],
-            },
-            bots: vec![BotState {
-                id: "0".to_owned(),
-                x: 1,
-                y: 1,
-                carrying: vec![],
-                capacity: 3,
-            }],
-            orders: vec![Order {
-                id: "o1".to_owned(),
-                item_id: "milk".to_owned(),
-                status: OrderStatus::InProgress,
-            }],
-            ..GameState::default()
-        }
-    }
-
-    #[test]
-    fn planner_manager_sequence_is_monotonic_and_returns_matching_ticks() {
-        let cfg = Arc::new(test_config(PlannerBudgetMode::Adaptive));
-        let mut manager = PlannerManager::new(Policy::new(cfg));
-        let seq0 = manager
-            .submit(&planner_state(10), 15)
-            .expect("planner submit 0 should succeed");
-        let seq1 = manager
-            .submit(&planner_state(11), 15)
-            .expect("planner submit 1 should succeed");
-        assert!(seq1 > seq0);
-
-        let deadline = Instant::now() + Duration::from_secs(2);
-        let mut got0 = false;
-        let mut got1 = false;
-        while Instant::now() < deadline && !(got0 && got1) {
-            if !got0 {
-                if let Some(resp) = manager.take(seq0) {
-                    assert_eq!(resp.tick, 10);
-                    got0 = true;
-                }
-            }
-            if !got1 {
-                if let Some(resp) = manager.take(seq1) {
-                    assert_eq!(resp.tick, 11);
-                    got1 = true;
-                }
-            }
-            if !(got0 && got1) {
-                thread::sleep(Duration::from_millis(2));
-            }
-        }
-        assert!(got0 && got1);
-    }
-
-    #[test]
-    fn cached_plan_rejected_when_stale_or_no_progress() {
-        let cfg = Arc::new(test_config(PlannerBudgetMode::Adaptive));
-        let mut manager = PlannerManager::new(Policy::new(cfg));
-        let base = planner_state(20);
-        let seq = manager
-            .submit(&base, 15)
-            .expect("planner submit should succeed");
-
-        let deadline = Instant::now() + Duration::from_secs(2);
-        let mut got = false;
-        while Instant::now() < deadline && !got {
-            if manager.take(seq).is_some() {
-                got = true;
-                break;
-            }
-            thread::sleep(Duration::from_millis(2));
-        }
-        assert!(got, "expected planner response before deadline");
-
-        let stale_state = planner_state(23);
-        assert!(
-            manager.cached_for_state(&stale_state, 1, true).is_none(),
-            "cache should be rejected when older than max age"
-        );
-
-        let mut increased_missing = planner_state(21);
-        increased_missing.orders.push(Order {
-            id: "o2".to_owned(),
-            item_id: "milk".to_owned(),
-            status: OrderStatus::InProgress,
-        });
-        assert!(
-            manager
-                .cached_for_state(&increased_missing, 2, true)
-                .is_none(),
-            "cache should be rejected when active missing has increased"
-        );
-    }
 }

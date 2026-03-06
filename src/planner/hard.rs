@@ -3,8 +3,9 @@ use std::collections::{HashMap, HashSet};
 use super::{
     common::{
         active_kind_counts, active_missing_total, bot_cell, center_corridor_penalty,
-        find_adjacent_item_for_kind, nearest_dropoff_cell, on_dropoff, pick_best_item_target,
-        preview_kind_counts, region_for_cell, try_dropoff_active,
+        find_adjacent_item_for_kind, move_to_nearest_dropoff_or_wait, on_dropoff,
+        pick_best_item_target, preview_kind_counts, region_for_cell, select_dropoff_anchor_bot,
+        set_move, set_pickup, set_wait, try_dropoff_active,
     },
     Intent, PlanResult, TickContext,
 };
@@ -88,7 +89,7 @@ impl HardPlanner {
             }
             let region_id = (idx as u16) % 4;
             let Some(from) = bot_cell(input.map, bot) else {
-                plan.intents.insert(bot.id.clone(), Intent::Wait);
+                set_wait(&mut plan, &bot.id);
                 continue;
             };
 
@@ -180,15 +181,12 @@ impl HardPlanner {
                     .map(|item| find_adjacent_item_for_kind(input.state, bot, &item.kind).is_some())
                     .unwrap_or(false)
                 {
-                    plan.intents
-                        .insert(bot.id.clone(), Intent::PickUp { item_id });
+                    set_pickup(&mut plan, &bot.id, &item_id);
                 } else {
-                    plan.goal_cell_by_bot.insert(bot.id.clone(), stand);
-                    plan.intents
-                        .insert(bot.id.clone(), Intent::MoveTo { cell: stand });
+                    set_move(&mut plan, &bot.id, stand);
                 }
             } else {
-                plan.intents.insert(bot.id.clone(), Intent::Wait);
+                set_wait(&mut plan, &bot.id);
             }
         }
 
@@ -211,32 +209,7 @@ impl HardPlanner {
     }
 
     fn pick_runner(&mut self, input: TickContext<'_>) -> String {
-        let mut choices = input
-            .state
-            .bots
-            .iter()
-            .filter_map(|bot| {
-                let from = bot_cell(input.map, bot)?;
-                let drop = nearest_dropoff_cell(input.map, input.dist, from)?;
-                Some((bot.id.clone(), input.dist.dist(from, drop)))
-            })
-            .collect::<Vec<_>>();
-        choices.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
-
-        if let Some(existing) = &self.runner_id {
-            if let Some((_, best)) = choices.first() {
-                if let Some((_, current)) = choices.iter().find(|(id, _)| id == existing) {
-                    if *current <= best.saturating_add(2) {
-                        return existing.clone();
-                    }
-                }
-            }
-        }
-
-        let picked = choices
-            .first()
-            .map(|(id, _)| id.clone())
-            .unwrap_or_else(|| input.state.bots[0].id.clone());
+        let picked = select_dropoff_anchor_bot(input, self.runner_id.as_deref(), 2);
         self.runner_id = Some(picked.clone());
         picked
     }
@@ -293,7 +266,7 @@ fn assign_runner(
     used_items: &mut HashSet<String>,
 ) {
     if preview_counts.is_empty() {
-        plan.intents.insert(runner.id.clone(), Intent::Wait);
+        set_wait(plan, &runner.id);
         return;
     }
 
@@ -303,12 +276,12 @@ fn assign_runner(
             .iter()
             .any(|kind| preview_counts.contains_key(kind))
     {
-        plan.intents.insert(runner.id.clone(), Intent::Wait);
+        set_wait(plan, &runner.id);
         return;
     }
 
     let Some(from) = bot_cell(input.map, runner) else {
-        plan.intents.insert(runner.id.clone(), Intent::Wait);
+        set_wait(plan, &runner.id);
         return;
     };
 
@@ -316,12 +289,7 @@ fn assign_runner(
     if runner.carrying.len() < runner.capacity {
         if let Some(item_id) = find_adjacent_item_for_kind(input.state, runner, &preview_kind) {
             used_items.insert(item_id.to_owned());
-            plan.intents.insert(
-                runner.id.clone(),
-                Intent::PickUp {
-                    item_id: item_id.to_owned(),
-                },
-            );
+            set_pickup(plan, &runner.id, item_id);
             return;
         }
     }
@@ -344,25 +312,12 @@ fn assign_runner(
     ) {
         if active_total <= 2 || input.dist.dist_to_dropoff(from) <= 4 {
             used_items.insert(target.item_id.to_owned());
-            plan.goal_cell_by_bot
-                .insert(runner.id.clone(), target.stand_cell);
-            plan.intents.insert(
-                runner.id.clone(),
-                Intent::MoveTo {
-                    cell: target.stand_cell,
-                },
-            );
+            set_move(plan, &runner.id, target.stand_cell);
             return;
         }
     }
 
-    if let Some(drop) = nearest_dropoff_cell(input.map, input.dist, from) {
-        plan.goal_cell_by_bot.insert(runner.id.clone(), drop);
-        plan.intents
-            .insert(runner.id.clone(), Intent::MoveTo { cell: drop });
-    } else {
-        plan.intents.insert(runner.id.clone(), Intent::Wait);
-    }
+    move_to_nearest_dropoff_or_wait(input, plan, runner);
 }
 
 fn estimate_eta(bot: &crate::model::BotState, plan: &PlanResult, input: TickContext<'_>) -> i32 {

@@ -6,7 +6,7 @@ use crate::{
     world::MapCache,
 };
 
-use super::Intent;
+use super::{Intent, PlanResult, TickContext};
 
 #[derive(Debug, Clone, Copy)]
 pub struct ItemTarget<'a> {
@@ -59,6 +59,39 @@ pub fn nearest_dropoff_cell(map: &MapCache, dist: &DistanceMap, from: u16) -> Op
         .iter()
         .copied()
         .min_by_key(|&drop| dist.dist(from, drop))
+}
+
+pub fn select_dropoff_anchor_bot(
+    input: TickContext<'_>,
+    current_bot_id: Option<&str>,
+    hysteresis: u16,
+) -> String {
+    let mut candidates = input
+        .state
+        .bots
+        .iter()
+        .filter_map(|bot| {
+            let from = bot_cell(input.map, bot)?;
+            let drop = nearest_dropoff_cell(input.map, input.dist, from)?;
+            Some((bot.id.clone(), input.dist.dist(from, drop)))
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+
+    if let Some(current) = current_bot_id {
+        if let Some((_, best_dist)) = candidates.first() {
+            if let Some((_, current_dist)) = candidates.iter().find(|(id, _)| id == current) {
+                if *current_dist <= best_dist.saturating_add(hysteresis) {
+                    return current.to_owned();
+                }
+            }
+        }
+    }
+
+    candidates
+        .first()
+        .map(|(id, _)| id.clone())
+        .unwrap_or_else(|| input.state.bots[0].id.clone())
 }
 
 pub fn first_active_order_for_kind<'a>(state: &'a GameState, kind: &str) -> Option<&'a str> {
@@ -248,6 +281,54 @@ pub fn intent_to_action(intent: &Intent, bot_id: &str, dxdy: Option<(i32, i32)>)
         Intent::Wait => Action::Wait {
             bot_id: bot_id.to_owned(),
         },
+    }
+}
+
+pub fn set_wait(plan: &mut PlanResult, bot_id: &str) {
+    plan.intents.insert(bot_id.to_owned(), Intent::Wait);
+}
+
+pub fn set_pickup(plan: &mut PlanResult, bot_id: &str, item_id: &str) {
+    plan.intents.insert(
+        bot_id.to_owned(),
+        Intent::PickUp {
+            item_id: item_id.to_owned(),
+        },
+    );
+}
+
+pub fn set_move(plan: &mut PlanResult, bot_id: &str, cell: u16) {
+    plan.goal_cell_by_bot.insert(bot_id.to_owned(), cell);
+    plan.intents
+        .insert(bot_id.to_owned(), Intent::MoveTo { cell });
+}
+
+pub fn assign_pickup_or_move(
+    plan: &mut PlanResult,
+    bot_id: &str,
+    adjacent_item_id: Option<&str>,
+    target_cell: u16,
+) {
+    if let Some(item_id) = adjacent_item_id {
+        set_pickup(plan, bot_id, item_id);
+    } else {
+        set_move(plan, bot_id, target_cell);
+    }
+}
+
+pub fn move_to_nearest_dropoff_or_wait(
+    input: TickContext<'_>,
+    plan: &mut PlanResult,
+    bot: &BotState,
+) {
+    let Some(from) = bot_cell(input.map, bot) else {
+        set_wait(plan, &bot.id);
+        return;
+    };
+    if let Some(drop) = nearest_dropoff_cell(input.map, input.dist, from) {
+        set_move(plan, &bot.id, drop);
+    } else {
+        set_wait(plan, &bot.id);
     }
 }
 

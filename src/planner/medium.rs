@@ -3,10 +3,11 @@ use std::collections::{HashMap, HashSet};
 use super::{
     common::{
         active_kind_counts, active_missing_total, bot_cell, center_corridor_penalty,
-        count_active_carried_team, find_adjacent_item_for_kind, nearest_dropoff_cell, on_dropoff,
-        pick_best_item_target, preview_kind_counts, try_dropoff_active,
+        count_active_carried_team, find_adjacent_item_for_kind, move_to_nearest_dropoff_or_wait,
+        nearest_dropoff_cell, on_dropoff, pick_best_item_target, preview_kind_counts,
+        select_dropoff_anchor_bot, set_move, set_pickup, set_wait, try_dropoff_active,
     },
-    Intent, PlanResult, TickContext,
+    PlanResult, TickContext,
 };
 
 #[derive(Debug, Default)]
@@ -149,12 +150,9 @@ impl MediumPlanner {
                     if input.state.items.iter().any(|i| i.id == item_id)
                         && find_adjacent_item_for_kind(input.state, bot, &kind).is_some()
                     {
-                        plan.intents
-                            .insert(bot_id.clone(), Intent::PickUp { item_id });
+                        set_pickup(&mut plan, &bot_id, &item_id);
                     } else {
-                        plan.goal_cell_by_bot.insert(bot_id.clone(), stand);
-                        plan.intents
-                            .insert(bot_id.clone(), Intent::MoveTo { cell: stand });
+                        set_move(&mut plan, &bot_id, stand);
                     }
                 }
                 if let Some(entry) = remaining_pick.get_mut(&kind) {
@@ -169,18 +167,13 @@ impl MediumPlanner {
             }
             if let Some(from) = bot_cell(input.map, bot) {
                 if preview_counts.is_empty() || bot.carrying.len() >= bot.capacity {
-                    plan.intents.insert(bot.id.clone(), Intent::Wait);
+                    set_wait(&mut plan, &bot.id);
                     continue;
                 }
                 let preview_kind = preview_counts.keys().next().cloned().unwrap_or_default();
                 if let Some(item_id) = find_adjacent_item_for_kind(input.state, bot, &preview_kind)
                 {
-                    plan.intents.insert(
-                        bot.id.clone(),
-                        Intent::PickUp {
-                            item_id: item_id.to_owned(),
-                        },
-                    );
+                    set_pickup(&mut plan, &bot.id, item_id);
                     continue;
                 }
                 if let Some(target) = pick_best_item_target(
@@ -191,20 +184,13 @@ impl MediumPlanner {
                     &preview_kind,
                     |_| 0.0,
                 ) {
-                    plan.goal_cell_by_bot
-                        .insert(bot.id.clone(), target.stand_cell);
-                    plan.intents.insert(
-                        bot.id.clone(),
-                        Intent::MoveTo {
-                            cell: target.stand_cell,
-                        },
-                    );
+                    set_move(&mut plan, &bot.id, target.stand_cell);
                     continue;
                 }
-                plan.intents.insert(bot.id.clone(), Intent::Wait);
+                set_wait(&mut plan, &bot.id);
                 continue;
             }
-            plan.intents.insert(bot.id.clone(), Intent::Wait);
+            set_wait(&mut plan, &bot.id);
         }
 
         // Finishers first when one active item is missing.
@@ -238,32 +224,7 @@ impl MediumPlanner {
     }
 
     fn pick_stager(&mut self, input: TickContext<'_>) -> String {
-        let mut candidates = input
-            .state
-            .bots
-            .iter()
-            .filter_map(|bot| {
-                let from = bot_cell(input.map, bot)?;
-                let drop = nearest_dropoff_cell(input.map, input.dist, from)?;
-                Some((bot.id.clone(), input.dist.dist(from, drop)))
-            })
-            .collect::<Vec<_>>();
-        candidates.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
-
-        if let Some(current) = &self.stager_id {
-            if let Some((_, best_dist)) = candidates.first() {
-                if let Some((_, current_dist)) = candidates.iter().find(|(id, _)| id == current) {
-                    if *current_dist <= best_dist.saturating_add(2) {
-                        return current.clone();
-                    }
-                }
-            }
-        }
-
-        let picked = candidates
-            .first()
-            .map(|(id, _)| id.clone())
-            .unwrap_or_else(|| input.state.bots[0].id.clone());
+        let picked = select_dropoff_anchor_bot(input, self.stager_id.as_deref(), 2);
         self.stager_id = Some(picked.clone());
         picked
     }
@@ -278,7 +239,7 @@ fn stage_preview(
     used_items: &mut HashSet<String>,
 ) {
     if preview_counts.is_empty() {
-        plan.intents.insert(bot.id.clone(), Intent::Wait);
+        set_wait(plan, &bot.id);
         return;
     }
 
@@ -288,24 +249,19 @@ fn stage_preview(
             .iter()
             .any(|kind| preview_counts.contains_key(kind))
     {
-        plan.intents.insert(bot.id.clone(), Intent::Wait);
+        set_wait(plan, &bot.id);
         return;
     }
 
     let Some(from) = bot_cell(input.map, bot) else {
-        plan.intents.insert(bot.id.clone(), Intent::Wait);
+        set_wait(plan, &bot.id);
         return;
     };
 
     let preview_kind = preview_counts.keys().next().cloned().unwrap_or_default();
     if bot.carrying.len() < bot.capacity {
         if let Some(item_id) = find_adjacent_item_for_kind(input.state, bot, &preview_kind) {
-            plan.intents.insert(
-                bot.id.clone(),
-                Intent::PickUp {
-                    item_id: item_id.to_owned(),
-                },
-            );
+            set_pickup(plan, &bot.id, item_id);
             used_items.insert(item_id.to_owned());
             return;
         }
@@ -326,27 +282,14 @@ fn stage_preview(
                     }
                 },
             ) {
-                plan.goal_cell_by_bot
-                    .insert(bot.id.clone(), target.stand_cell);
                 used_items.insert(target.item_id.to_owned());
-                plan.intents.insert(
-                    bot.id.clone(),
-                    Intent::MoveTo {
-                        cell: target.stand_cell,
-                    },
-                );
+                set_move(plan, &bot.id, target.stand_cell);
                 return;
             }
         }
     }
 
-    if let Some(drop) = nearest_dropoff_cell(input.map, input.dist, from) {
-        plan.goal_cell_by_bot.insert(bot.id.clone(), drop);
-        plan.intents
-            .insert(bot.id.clone(), Intent::MoveTo { cell: drop });
-    } else {
-        plan.intents.insert(bot.id.clone(), Intent::Wait);
-    }
+    move_to_nearest_dropoff_or_wait(input, plan, bot);
 }
 
 #[cfg(test)]

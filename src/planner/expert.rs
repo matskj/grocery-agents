@@ -3,8 +3,9 @@ use std::collections::{HashMap, HashSet};
 use super::{
     common::{
         active_kind_counts, active_missing_total, bot_cell, center_corridor_penalty,
-        find_adjacent_item_for_kind, nearest_dropoff_cell, on_dropoff, pick_best_item_target,
-        preview_kind_counts, region_for_cell, try_dropoff_active,
+        find_adjacent_item_for_kind, move_to_nearest_dropoff_or_wait, on_dropoff,
+        pick_best_item_target, preview_kind_counts, region_for_cell, set_move, set_pickup,
+        set_wait, try_dropoff_active,
     },
     Intent, PlanResult, TickContext,
 };
@@ -107,7 +108,7 @@ impl ExpertPlanner {
             let is_picker = picker_ids.contains(&bot.id);
 
             let Some(from) = bot_cell(input.map, bot) else {
-                plan.intents.insert(bot.id.clone(), Intent::Wait);
+                set_wait(&mut plan, &bot.id);
                 continue;
             };
 
@@ -232,12 +233,9 @@ impl ExpertPlanner {
             {
                 used_items.insert(item_id.clone());
                 if stand == from {
-                    plan.intents
-                        .insert(bot.id.clone(), Intent::PickUp { item_id });
+                    set_pickup(&mut plan, &bot.id, &item_id);
                 } else {
-                    plan.goal_cell_by_bot.insert(bot.id.clone(), stand);
-                    plan.intents
-                        .insert(bot.id.clone(), Intent::MoveTo { cell: stand });
+                    set_move(&mut plan, &bot.id, stand);
                 }
                 if let Some(entry) = remaining_active.get_mut(&kind) {
                     *entry = entry.saturating_sub(1);
@@ -246,13 +244,9 @@ impl ExpertPlanner {
                     preview_target = preview_target.saturating_sub(1);
                 }
             } else if is_buffer && on_dropoff(input.map, bot) {
-                plan.intents.insert(bot.id.clone(), Intent::Wait);
-            } else if let Some(drop) = nearest_dropoff_cell(input.map, input.dist, from) {
-                plan.goal_cell_by_bot.insert(bot.id.clone(), drop);
-                plan.intents
-                    .insert(bot.id.clone(), Intent::MoveTo { cell: drop });
+                set_wait(&mut plan, &bot.id);
             } else {
-                plan.intents.insert(bot.id.clone(), Intent::Wait);
+                move_to_nearest_dropoff_or_wait(input, &mut plan, bot);
             }
         }
 

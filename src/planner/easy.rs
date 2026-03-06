@@ -2,11 +2,12 @@ use std::collections::{HashMap, HashSet};
 
 use super::{
     common::{
-        active_kind_counts, bot_cell, carrying_kind_counts, detour_cost,
+        active_kind_counts, assign_pickup_or_move, bot_cell, carrying_kind_counts, detour_cost,
         find_adjacent_item_for_kind, first_preview_kind, item_targets_for_kind,
-        nearest_dropoff_cell, on_dropoff, pick_best_item_target, try_dropoff_active,
+        move_to_nearest_dropoff_or_wait, nearest_dropoff_cell, on_dropoff, pick_best_item_target,
+        set_pickup, set_wait, try_dropoff_active,
     },
-    Intent, PlanResult, TickContext,
+    PlanResult, TickContext,
 };
 
 #[derive(Debug, Default)]
@@ -30,7 +31,7 @@ impl EasyPlanner {
         }
 
         let Some(start) = bot_cell(input.map, bot) else {
-            plan.intents.insert(bot.id.clone(), Intent::Wait);
+            set_wait(&mut plan, &bot.id);
             return plan;
         };
 
@@ -44,13 +45,7 @@ impl EasyPlanner {
         let mut required_slots = expand_required_slots(&active_counts, &carrying_counts);
         if required_slots.is_empty() {
             if !on_dropoff(input.map, bot) {
-                if let Some(drop) = nearest_dropoff_cell(input.map, input.dist, start) {
-                    plan.goal_cell_by_bot.insert(bot.id.clone(), drop);
-                    plan.intents
-                        .insert(bot.id.clone(), Intent::MoveTo { cell: drop });
-                } else {
-                    plan.intents.insert(bot.id.clone(), Intent::Wait);
-                }
+                move_to_nearest_dropoff_or_wait(input, &mut plan, bot);
                 return plan;
             }
             plan_preview_only(input, &mut plan, start);
@@ -68,26 +63,19 @@ impl EasyPlanner {
         };
 
         if let Some(primary) = best_primary {
-            plan.goal_cell_by_bot
-                .insert(bot.id.clone(), primary.first_stand);
-
-            if bot.carrying.len() < bot.capacity
-                && is_adjacent_to_target(bot.x, bot.y, primary.first_item_x, primary.first_item_y)
-            {
-                plan.intents.insert(
-                    bot.id.clone(),
-                    Intent::PickUp {
-                        item_id: primary.first_item_id,
-                    },
-                );
-            } else {
-                plan.intents.insert(
-                    bot.id.clone(),
-                    Intent::MoveTo {
-                        cell: primary.first_stand,
-                    },
-                );
-            }
+            assign_pickup_or_move(
+                &mut plan,
+                &bot.id,
+                (bot.carrying.len() < bot.capacity
+                    && is_adjacent_to_target(
+                        bot.x,
+                        bot.y,
+                        primary.first_item_x,
+                        primary.first_item_y,
+                    ))
+                .then_some(primary.first_item_id.as_str()),
+                primary.first_stand,
+            );
 
             let can_fit_preview = active_needed < capacity_left;
             if can_fit_preview {
@@ -97,30 +85,20 @@ impl EasyPlanner {
                     primary.first_stand,
                     primary.dropoff,
                 ) {
-                    plan.goal_cell_by_bot.insert(bot.id.clone(), preview_stand);
-                    if bot.carrying.len() < bot.capacity
-                        && is_adjacent_to_target(bot.x, bot.y, preview_item.0, preview_item.1)
-                    {
-                        plan.intents.insert(
-                            bot.id.clone(),
-                            Intent::PickUp {
-                                item_id: preview_item.2,
-                            },
-                        );
-                    } else {
-                        plan.intents.insert(
-                            bot.id.clone(),
-                            Intent::MoveTo {
-                                cell: preview_stand,
-                            },
-                        );
-                    }
+                    assign_pickup_or_move(
+                        &mut plan,
+                        &bot.id,
+                        (bot.carrying.len() < bot.capacity
+                            && is_adjacent_to_target(bot.x, bot.y, preview_item.0, preview_item.1))
+                        .then_some(preview_item.2.as_str()),
+                        preview_stand,
+                    );
                 }
             }
             return plan;
         }
 
-        plan.intents.insert(bot.id.clone(), Intent::Wait);
+        set_wait(&mut plan, &bot.id);
         plan
     }
 }
@@ -140,32 +118,20 @@ fn plan_preview_only(input: TickContext<'_>, plan: &mut PlanResult, start: u16) 
         return;
     };
     let Some(kind) = first_preview_kind(input.state) else {
-        plan.intents.insert(bot.id.clone(), Intent::Wait);
+        set_wait(plan, &bot.id);
         return;
     };
     if let Some(item_id) = find_adjacent_item_for_kind(input.state, bot, kind) {
-        plan.intents.insert(
-            bot.id.clone(),
-            Intent::PickUp {
-                item_id: item_id.to_owned(),
-            },
-        );
+        set_pickup(plan, &bot.id, item_id);
         return;
     }
 
     if let Some(target) =
         pick_best_item_target(input.state, input.map, input.dist, start, kind, |_| 0.0)
     {
-        plan.goal_cell_by_bot
-            .insert(bot.id.clone(), target.stand_cell);
-        plan.intents.insert(
-            bot.id.clone(),
-            Intent::MoveTo {
-                cell: target.stand_cell,
-            },
-        );
+        assign_pickup_or_move(plan, &bot.id, None, target.stand_cell);
     } else {
-        plan.intents.insert(bot.id.clone(), Intent::Wait);
+        set_wait(plan, &bot.id);
     }
 }
 

@@ -1,6 +1,7 @@
 target/
 logs/
 data/
+.venv311-torch/
 **/__pycache__/
 *.pyc
 *.pyo

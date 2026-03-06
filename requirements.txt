@@ -1,9 +1,0 @@
-# Python dependencies for the offline training pipeline.
-# Runtime bot dependencies remain in Cargo.toml/Cargo.lock.
-numpy>=1.26
-pandas>=2.2
-pyarrow>=15.0
-# Optional but recommended for PMAT-lite pairwise ordering head training.
-torch>=2.2
-# Optional for auto-fetching fresh game websocket URLs from app.ainm.no.
-playwright>=1.52
